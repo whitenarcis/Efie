@@ -1,0 +1,48 @@
+[project]
+name = "efi"
+version = "0.1.0"
+description = "Эфи — AI-компаньон для Telegram (userbot), архитектурный гибрид Kuni и текущей реализации Эфи"
+requires-python = ">=3.11"
+readme = "README.md"
+dependencies = [
+    "pydantic>=2.6",
+    "pydantic-settings[toml]>=2.2",
+    "httpx>=0.27",
+    "aiosqlite>=0.20",
+    "aiofiles>=23.2",
+    "pyrogram>=2.0",
+    "tgcrypto>=1.2.5",  # ускоряет MTProto-шифрование Pyrogram; необязательна, но настоятельно рекомендуется
+    "numpy>=1.26",
+    "watchfiles>=0.21",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.9",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+efi = "scripts.run:main"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"

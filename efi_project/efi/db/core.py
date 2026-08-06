@@ -1,0 +1,140 @@
+"""
+efi/db/core.py
+
+Единый менеджер подключений aiosqlite для всего приложения: WAL-режим,
+busy_timeout (защита от SQLITE_BUSY при параллельных Worker'ах, пишущих в
+одну БД), ретраи на этапе получения соединения и однократный прогон миграций.
+
+Известный баг (см. память проекта): retry-логика вокруг получения соединения
+ломается, если `try/except` вокруг acquire охватывает и сам `yield` внутри
+`@asynccontextmanager` — тогда исключение, брошенное КОДОМ ВНУТРИ `async with`
+блока (то есть бизнес-логикой вызывающей стороны, а не проблемой соединения),
+Python бросает обратно в генератор ИМЕННО в точке yield, и такой except
+ошибочно трактует чужую ошибку как сбой соединения, требующий повторной
+попытки. Здесь ретраи строго ограничены фазой ПОЛУЧЕНИЯ соединения
+(`_acquire`, вызывается ДО yield); вокруг самого `yield` — только `finally`,
+без единого `except`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import aiofiles.os
+import aiosqlite
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_BUSY_TIMEOUT_MS = 5_000
+_DEFAULT_ACQUIRE_RETRIES = 3
+_DEFAULT_ACQUIRE_RETRY_DELAY_SECONDS = 0.2
+
+#: Одна миграция — идемпотентная функция, применяющая свою часть схемы к соединению.
+Migration = Callable[[aiosqlite.Connection], Awaitable[None]]
+
+
+class Database:
+    """
+    Владеет путём к файлу БД и списком миграций; отдаёт короткоживущие
+    соединения через `connection()`. В WAL-режиме aiosqlite/SQLite спокойно
+    выдерживает несколько параллельных соединений к одному файлу (один
+    писатель + произвольное число читателей без взаимной блокировки), поэтому
+    каждый вызывающий код открывает своё соединение, а не делит одно на всех.
+    """
+
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        migrations: list[Migration] | None = None,
+        busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS,
+        acquire_retries: int = _DEFAULT_ACQUIRE_RETRIES,
+        acquire_retry_delay_seconds: float = _DEFAULT_ACQUIRE_RETRY_DELAY_SECONDS,
+    ) -> None:
+        self._db_path = db_path
+        self._migrations = migrations or []
+        self._busy_timeout_ms = busy_timeout_ms
+        self._acquire_retries = acquire_retries
+        self._acquire_retry_delay_seconds = acquire_retry_delay_seconds
+        self._migrations_lock = asyncio.Lock()
+        self._migrations_applied = False
+
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[aiosqlite.Connection]:
+        """
+        Выдаёт готовое к работе соединение (WAL/busy_timeout выставлены,
+        миграции уже применены). Ретраи acquire — целиком до `yield`; тело
+        вызывающего `async with`-блока не может спровоцировать повторную
+        попытку получения соединения, даже если само бросит исключение.
+        """
+        conn = await self._acquire()
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    async def _acquire(self) -> aiosqlite.Connection:
+        last_error: Exception | None = None
+        for attempt in range(1, self._acquire_retries + 1):
+            try:
+                conn = await self._open_and_prepare()
+            except aiosqlite.OperationalError as exc:
+                last_error = exc
+                logger.warning(
+                    "db: acquire attempt %d/%d failed (%s), retrying in %.2fs",
+                    attempt, self._acquire_retries, exc, self._acquire_retry_delay_seconds,
+                )
+                await asyncio.sleep(self._acquire_retry_delay_seconds)
+                continue
+            await self._ensure_migrations(conn)
+            return conn
+        assert last_error is not None  # цикл всегда либо возвращает, либо оставляет last_error перед выходом
+        raise last_error
+
+    async def _open_and_prepare(self) -> aiosqlite.Connection:
+        await aiofiles.os.makedirs(self._db_path.parent, exist_ok=True)
+        conn = await aiosqlite.connect(self._db_path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+        await conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    async def _ensure_migrations(self, conn: aiosqlite.Connection) -> None:
+        if self._migrations_applied:
+            return
+        async with self._migrations_lock:
+            if self._migrations_applied:  # кто-то успел применить, пока мы ждали лок
+                return
+            for migration in self._migrations:
+                await migration(conn)
+            await conn.commit()
+            self._migrations_applied = True
+            logger.info("db: applied %d migration(s) to %s", len(self._migrations), self._db_path)
+
+    # -- удобные шорткаты для одиночных запросов ---------------------------
+
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        """INSERT/UPDATE/DELETE в одну операцию, с commit, без явного `async with`."""
+        async with self.connection() as conn:
+            await conn.execute(sql, params)
+            await conn.commit()
+
+    async def fetch_all(self, sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
+        """SELECT, возвращающий все строки, в одну операцию."""
+        async with self.connection() as conn:
+            async with conn.execute(sql, params) as cursor:
+                return list(await cursor.fetchall())
+
+    async def fetch_one(self, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
+        """SELECT, возвращающий одну (или ни одной) строку, в одну операцию."""
+        async with self.connection() as conn:
+            async with conn.execute(sql, params) as cursor:
+                return await cursor.fetchone()
+
+
+__all__ = ["Database", "Migration"]
