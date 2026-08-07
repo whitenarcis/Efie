@@ -1,0 +1,19 @@
+{
+  "output": {
+    "filePath": "repomix-output.txt",
+    "style": "xml",
+    "removeComments": true,
+    "removeEmptyLines": true
+  },
+  "ignore": {
+    "customPatterns": [
+      "**/__pycache__/**",
+      "**/*.pyc",
+      "**/.git/**",
+      "**/data/**",
+      "**/cache/**",
+      "**/logs/**",
+      "**/tests/**"
+    ]
+  }
+}

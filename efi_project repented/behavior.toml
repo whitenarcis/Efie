@@ -1,0 +1,84 @@
+# behavior.toml.example
+#
+# Скопируйте в behavior.toml и заполните секреты (api_hash, api_key и т.п.).
+# behavior.toml не коммитится — храните реальные ключи только локально или в
+# переменных окружения (EFI_*, см. efi/config/schema.py).
+#
+# Приоритет источников конфигурации: явные значения при создании Settings() >
+# переменные окружения (EFI_*) > этот файл > значения по умолчанию в схеме.
+
+environment = "production"
+debug = false
+character_name = "Эфи"
+
+# Личность персонажа для системного промпта. Можно оставить пустым и вместо
+# этого положить templates/personality.md — он имеет приоритет и умеет
+# hot-reload (см. efi/prompts/loader.py и efi/prompts/builder.py).
+personality_prompt = """
+Опиши здесь характер, манеру речи и ключевые черты личности.
+"""
+
+[telegram]
+api_id = 38386496
+api_hash = "REPLACEME"
+owner_id = 2129889949
+allowed_chats = [2129889949, -2060387666, -2041871692, -4404120219]
+lockdown_mode = "owner_only"      # none | contacts_only | owner_only
+check_chats_on_startup = true
+can_join_chats = false
+can_leave_chats = true
+
+# Основной провайдер инфраструктуры — OmniRoute; три роли (MAIN/FAST/VISION)
+# покрывают задачи разной "тяжести". См. efi/config/schema.py::LLMRolesSettings.
+
+[llm_roles.main]
+degrade_to = "fast"
+
+[llm_roles.main.primary]
+base_url = "https://omnigoy.mooo.com/v1"
+api_key = "REPLACEME"
+model = "ollamacloud/gemma4:31b"
+timeout_seconds = 30.0
+
+[llm_roles.main.fallback]
+base_url = "https://omnigoy.mooo.com/v1"
+api_key = "REPLACEME"
+model = "ollamacloud/nemotron-3-super"
+timeout_seconds = 30.0
+
+[llm_roles.fast.primary]
+base_url = "https://omnigoy.mooo.com/v1"
+api_key = "REPLACEME"
+model = "ollamacloud/minimax-m3"
+timeout_seconds = 30.0
+
+[llm_roles.vision.primary]
+base_url = "https://api.groq.com/openai/v1"
+api_key = "REPLACEME"
+model = "qwen/qwen3.6-27b"
+timeout_seconds = 60.0
+
+[memory]
+plagiarism_threshold = 0.97
+min_relatedness = 0.80
+max_rag_results = 10
+# diary_dir можно не задавать — по умолчанию берётся paths.diary_dir
+
+[humanizer]
+typing_wpm_min = 120
+typing_wpm_max = 150
+typing_thinking_pause_min_seconds = 1.0
+typing_thinking_pause_max_seconds = 2.2
+typing_delay_min_seconds = 1.8
+typing_delay_max_seconds = 7.0
+typo_probability = 0.15
+typo_min_text_length = 10
+anti_repeat_trigger_max = 0.95
+anti_repeat_trigger_avg = 0.85
+anti_repeat_max_history = 32
+max_messages_per_burst = 5
+
+# Раскладка соседних клавиш для опечаток — необязательно, есть встроенный
+# дефолт (ЙЦУКЕН+QWERTY) в efi/humanizer/typos.py. Пример переопределения:
+# [humanizer.keyboard_neighbors]
+# а = ["к", "е", "в", "п", "с", "м"]
