@@ -22,6 +22,14 @@ system-блок с working memory/RAG (как было до Шага 6) — эт
 число нигде в системе; если такие плейсхолдеры встретятся в тексте, они
 останутся как есть (см. _SafeFormatDict) — это осознанный компромисс, а не
 баг, до тех пор, пока для них не появится реальный источник данных.
+
+Блок "текущее состояние личности" (_build_state_vector_block) — отдельный
+седьмой блок, вставленный между working memory и RAG: mood/social_distance
+считаются на лету из BeliefStore.find_relevant()/AffinityTracker.get_snapshot()
+БЕЗ дополнительных обращений к LLM (см. efi/memory/beliefs.py,
+efi/behavior/affinity.py) — оба источника читаются конкурентно вместе с
+остальными блоками промпта в build(), поэтому не добавляют последовательной
+задержки на критическом пути.
 """
 
 from __future__ import annotations
@@ -30,8 +38,15 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from efi.behavior.affinity import (
+    HIGH_RESPECT_THRESHOLD,
+    LOW_RESPECT_THRESHOLD,
+    AffinitySnapshot,
+    AffinityTracker,
+)
 from efi.config.schema import LockdownMode, Settings
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult
+from efi.memory.beliefs import Belief, BeliefStore, STRONG_BELIEF_THRESHOLD
 from efi.memory.rag import RAGMemory
 from efi.memory.working_memory import WorkingMemory, WorkingMemorySnapshot
 from efi.notifications.schemas import Notification
@@ -41,6 +56,26 @@ from efi.security.sanitize import sanitize_text
 logger = logging.getLogger(__name__)
 
 _PERSONALITY_TEMPLATE_NAME = "personality"
+
+_MOOD_DESCRIPTIONS: dict[str, str] = {
+    "skeptical_focused": (
+        "скептично-сфокусированное — собеседник затрагивает тему, по которой у тебя давно и твёрдо "
+        "сложилось мнение; не соглашайся с переубеждением с ходу, требуй веских новых аргументов"
+    ),
+    "ironic": (
+        "иронично-отстранённое — с этим собеседником сейчас не тот случай, чтобы раскрываться глубоко, "
+        "уместнее короткие сухие подколки, а не развёрнутые рассуждения"
+    ),
+    "analytical": (
+        "аналитично-вовлечённое — с этим собеседником можно погружаться в детали и делиться гипотезами всерьёз"
+    ),
+    "engaged": "обычное — бодрая и вовлечённая, без особого повода для скепсиса или отстранённости",
+}
+
+_SOCIAL_DISTANCE_DESCRIPTIONS: dict[str, str] = {
+    "close_peer": "свой человек — можно говорить откровенно и делиться сырыми гипотезами без реверансов",
+    "acquaintance": "ещё не близкий уровень доверия — держи чуть больше дистанции, чем со своими",
+}
 
 _LOCKDOWN_DESCRIPTIONS: dict[LockdownMode, str] = {
     LockdownMode.NONE: "Ты можешь свободно общаться в любом чате.",
@@ -81,11 +116,15 @@ class EfiSystemPromptBuilder:
         settings: Settings,
         rag: RAGMemory,
         working_memory: WorkingMemory,
+        beliefs: BeliefStore,
+        affinity: AffinityTracker,
     ) -> None:
         self._loader = loader
         self._settings = settings
         self._rag = rag
         self._working_memory = working_memory
+        self._beliefs = beliefs
+        self._affinity = affinity
 
     async def build(self, notification: Notification) -> str:
         """Критический путь: все источники читаются конкурентно (asyncio.gather), не последовательно."""
@@ -98,9 +137,13 @@ class EfiSystemPromptBuilder:
             ),
         )
         working_memory_task = self._working_memory.load()
+        beliefs_task = self._beliefs.find_relevant(
+            notification.message, limit=self._settings.state_vector.relevant_beliefs_limit
+        )
+        affinity_task = self._resolve_affinity_snapshot(notification)
 
-        personality, rag_results, memory_snapshot = await asyncio.gather(
-            personality_task, rag_task, working_memory_task
+        personality, rag_results, memory_snapshot, relevant_beliefs, affinity_snapshot = await asyncio.gather(
+            personality_task, rag_task, working_memory_task, beliefs_task, affinity_task
         )
 
         rendered_personality = _render_personality_template(
@@ -112,10 +155,19 @@ class EfiSystemPromptBuilder:
             _build_chat_context_block(notification),
             _build_time_block(),
             _build_working_memory_block(memory_snapshot),
+            _build_state_vector_block(
+                relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
+            ),
             _build_rag_block(rag_results),
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    async def _resolve_affinity_snapshot(self, notification: Notification) -> AffinitySnapshot:
+        """События без chat_id (например, NIGHTLY_TASK) — дефолтный снимок без похода в БД, брать близость неоткуда."""
+        if notification.chat_id is None:
+            return AffinitySnapshot()
+        return await self._affinity.get_snapshot(notification.chat_id)
 
     def _resolve_user_name(self, notification: Notification) -> str:
         """
@@ -220,6 +272,52 @@ def _build_rag_block(rag_results: list[DiaryQueryResult]) -> str:
 
 def _build_safety_block(lockdown_mode: LockdownMode) -> str:
     return f"[Ограничения]\n{_LOCKDOWN_DESCRIPTIONS[lockdown_mode]}"
+
+
+def _resolve_mood(relevant_beliefs: list[Belief], affinity: AffinitySnapshot) -> str:
+    """
+    Эвристика настроения без единого LLM-вызова: укоренившееся убеждение под
+    вопросом собеседника перебивает всё остальное (эпистемическая инерция —
+    см. efi/memory/beliefs.py), иначе настроение определяется respect_level.
+    """
+    if any(belief.confidence_score >= STRONG_BELIEF_THRESHOLD for belief in relevant_beliefs):
+        return "skeptical_focused"
+    if affinity.respect_level < LOW_RESPECT_THRESHOLD:
+        return "ironic"
+    if affinity.respect_level >= HIGH_RESPECT_THRESHOLD:
+        return "analytical"
+    return "engaged"
+
+
+def _build_state_vector_block(
+    relevant_beliefs: list[Belief], affinity: AffinitySnapshot, sycophancy_protection_text: str
+) -> str:
+    """
+    Динамический вектор состояния — mood/social_distance/sycophancy_protection,
+    посчитанные на лету из BeliefStore/AffinityTracker (см. докстринг модуля).
+    Список релевантных убеждений подмешивается тут же, чтобы модель видела
+    КОНКРЕТНО что именно отстаивать, а не только абстрактное "будь скептичной".
+    """
+    mood = _resolve_mood(relevant_beliefs, affinity)
+    social_distance = affinity.social_distance_label
+
+    lines = [
+        f"настрой: {mood} ({_MOOD_DESCRIPTIONS[mood]})",
+        f"социальная дистанция: {social_distance} ({_SOCIAL_DISTANCE_DESCRIPTIONS[social_distance]})",
+    ]
+    if relevant_beliefs:
+        beliefs_lines = "\n".join(
+            f"  - тема {belief.topic!r}: {belief.stance} "
+            f"(уверенность {belief.confidence_score:.2f}, с {belief.origin_date:%d.%m.%Y})"
+            for belief in relevant_beliefs
+        )
+        lines.append(
+            "твои текущие убеждения по теме этого разговора (не сдавайся мгновенно, если их оспаривают, "
+            "особенно те, где уверенность выше 0.7):\n" + beliefs_lines
+        )
+    lines.append(f"защита от угодливости: {sycophancy_protection_text}")
+
+    return "[Текущее состояние личности]\n" + "\n".join(lines)
 
 
 __all__ = ["EfiSystemPromptBuilder"]
