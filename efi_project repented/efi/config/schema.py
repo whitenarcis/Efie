@@ -347,7 +347,11 @@ class HumanizerSettings(BaseModel):
     typing_delay_max_seconds: float = Field(default=7.0, gt=0.0, description="Верхний предел суммарной задержки ответа")
 
     # --- Опечатки ---
-    typo_probability: float = Field(default=0.15, ge=0.0, le=1.0, description="Шанс опечатки на сообщение")
+    typo_probability: float = Field(
+        default=0.04, ge=0.0, le=1.0,
+        description="Шанс алгоритмической опечатки на кусок сообщения (пропуск/сосед по клавише/перестановка "
+        "соседних букв — см. efi/humanizer/typos.py); рекомендованный диапазон 3-5%",
+    )
     typo_min_text_length: int = Field(default=10, ge=0, description="Не портим опечаткой слишком короткие сообщения")
     typo_self_correct_probability: float = Field(
         default=0.5, ge=0.0, le=1.0,
@@ -532,6 +536,42 @@ class LifeEngineSettings(BaseModel):
     )
 
 
+class BusyEngineSettings(BaseModel):
+    """
+    Параметры симуляции занятости (efi.behavior.busy_engine.BusyEngine):
+    диапазон базовой задержки перед тем, как Worker вообще "заметит"
+    уведомление, плюс поправки на то, что Эфи занята фоновым исследованием
+    (efi.behavior.life_engine.BackgroundLifeWorker.is_researching), устала
+    (WorkingMemorySnapshot.energy) или отвечает близкому человеку
+    (efi.behavior.affinity.AffinityTracker).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    base_delay_min_seconds: float = Field(default=2.0, ge=0.0, description="Нижняя граница базовой ignore_delay")
+    base_delay_max_seconds: float = Field(default=20.0, gt=0.0, description="Верхняя граница базовой ignore_delay")
+    research_busy_multiplier: float = Field(
+        default=2.5, gt=1.0,
+        description="Во сколько раз растягивается верхняя граница базовой задержки, пока идёт фоновое исследование",
+    )
+    low_energy_extra_seconds: float = Field(
+        default=25.0, ge=0.0, description="Максимальная добавка к задержке при энергии, стремящейся к 0"
+    )
+    high_affinity_discount_seconds: float = Field(
+        default=8.0, ge=0.0, description="Максимальная скидка с задержки при близости/уважении, стремящихся к 1"
+    )
+    min_delay_seconds: float = Field(default=0.5, ge=0.0, description="Нижний потолок итоговой ignore_delay")
+    max_delay_seconds: float = Field(default=90.0, gt=0.0, description="Верхний потолок итоговой ignore_delay")
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> "BusyEngineSettings":
+        if self.base_delay_min_seconds > self.base_delay_max_seconds:
+            raise ValueError("base_delay_min_seconds не может быть больше base_delay_max_seconds")
+        if self.min_delay_seconds > self.max_delay_seconds:
+            raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
+        return self
+
+
 class Settings(BaseSettings):
     """
     Корневой объект конфигурации приложения.
@@ -567,6 +607,7 @@ class Settings(BaseSettings):
     state_vector: StateVectorSettings = Field(default_factory=StateVectorSettings)
     stt: SttSettings = Field(default_factory=SttSettings)
     life_engine: LifeEngineSettings = Field(default_factory=LifeEngineSettings)
+    busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -626,6 +667,7 @@ __all__ = [
     "StateVectorSettings",
     "SttSettings",
     "LifeEngineSettings",
+    "BusyEngineSettings",
     "Settings",
     "get_settings",
 ]

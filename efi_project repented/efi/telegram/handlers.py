@@ -27,6 +27,13 @@ efi/telegram/handlers.py
        в SilenceMonitor, контекст чата (личка/группа — см. _build_chat_context)
        кладётся в payload, чтобы SystemPromptBuilder мог сообщить модели,
        что она сейчас не в приватной переписке один на один.
+
+Сообщение НЕ отмечается прочитанным здесь, при получении, — эта
+ответственность целиком у efi.notifications.worker.Worker: "прочитано" (и,
+как следствие, онлайн-присутствие в Telegram) должно появиться только после
+`ignore_delay` (efi.behavior.busy_engine.BusyEngine), симулирующей, что Эфи
+не сразу взяла телефон. Если бы этот модуль отмечал прочитанным сразу на
+приёме — вся симуляция занятости была бы видна невооружённым глазом.
 """
 
 from __future__ import annotations
@@ -35,7 +42,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
@@ -72,12 +79,6 @@ class _PendingMessage:
     message: PyrogramMessage
     text: str
     payload: dict[str, Any] = field(default_factory=dict)
-
-
-class ReadReceiptSender(Protocol):
-    """Абстракция отметки чата прочитанным. Конкретная реализация — efi.telegram.client.TelegramClientWrapper."""
-
-    async def mark_as_read(self, chat_id: int) -> None: ...
 
 
 class TelegramEventHandlers:
@@ -126,7 +127,6 @@ class TelegramEventHandlers:
         curiosity_recorder: Any | None = None,
         organic_ping_recorder: Any | None = None,
         stt: GroqSTT | None = None,
-        read_receipt_sender: ReadReceiptSender | None = None,
     ) -> None:
         self._manager = manager
         self._telegram_settings = telegram_settings
@@ -137,7 +137,6 @@ class TelegramEventHandlers:
         self._curiosity_recorder = curiosity_recorder
         self._organic_ping_recorder = organic_ping_recorder
         self._stt = stt
-        self._read_receipt_sender = read_receipt_sender
         self._debouncer: MessageDebouncer[_PendingMessage] = MessageDebouncer(
             self._flush_debounced,
             typing_tracker=typing_tracker,
@@ -295,6 +294,9 @@ class TelegramEventHandlers:
         постановка в NotificationManager происходит позже, в
         _flush_debounced(), когда пройдёт пауза тишины (или сработает
         потолок max_wait_seconds).
+
+        Намеренно НЕ отмечает чат прочитанным — см. докстринг модуля,
+        это делает efi.notifications.worker.Worker уже после ignore_delay.
         """
         if self._activity_recorder is not None:
             self._activity_recorder.record_activity(access_info.chat_id)
@@ -307,9 +309,6 @@ class TelegramEventHandlers:
 
         if self._organic_ping_recorder is not None:
             await self._organic_ping_recorder.handle_reply(access_info.chat_id)
-
-        if self._read_receipt_sender is not None:
-            await self._read_receipt_sender.mark_as_read(access_info.chat_id)
 
         await self._debouncer.add(
             access_info.chat_id,

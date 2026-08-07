@@ -7,10 +7,20 @@ efi/humanizer/message_splitting.py
 всегда отправлять один длинный монолитный текст. Живой человек в мессенджере
 почти никогда не пишет один сплошной абзац на пять предложений — он рвёт
 мысль на несколько сообщений подряд.
+
+`first_chunk_typing_delay` — компенсация времени генерации LLM (обычно
+5-10 секунд) для ПЕРВОГО баббла цепочки: пока модель думает, Worker уже
+транслирует статус TYPING (см. efi/notifications/worker.py), так что реальное
+время ожидания ответа собеседником УЖЕ засчитывается как "печатает". Если
+генерация заняла дольше, чем заняла бы естественная печать первого куска —
+дополнительная искусственная пауза не нужна, кусок уходит сразу. Для
+последующих кусков цепочки (после "///") это не применяется — они всегда
+идут через обычный calculate_typing_delay (efi/humanizer/typing_simulation.py).
 """
 
 from __future__ import annotations
 
+import random
 import re
 
 from efi.config.schema import HumanizerSettings
@@ -73,4 +83,21 @@ def _cap_message_count(parts: list[str], max_count: int) -> list[str]:
     return [*head, tail]
 
 
-__all__ = ["split_into_messages"]
+def first_chunk_typing_delay(chunk: str, settings: HumanizerSettings, *, llm_generation_time: float) -> float:
+    """
+    Идеальное время печати первого куска (`target_delay = len(chunk) / chars_per_sec`,
+    БЕЗ паузы "на подумать" — этот момент уже покрыт временем самой генерации
+    LLM, в отличие от calculate_typing_delay для остальных кусков), за
+    вычетом того, что уже "напечатано" за время ожидания ответа модели.
+
+    Возвращает 0.0, если `llm_generation_time` не меньше идеального времени
+    печати — тогда первый баббл уходит сразу после получения ответа, без
+    наложения ещё одной искусственной паузы поверх уже прошедшего ожидания.
+    """
+    cps_min, cps_max = settings.characters_per_second_range()
+    chars_per_second = random.uniform(cps_min, cps_max)
+    target_delay = len(chunk) / chars_per_second if chars_per_second > 0 else 0.0
+    return max(target_delay - llm_generation_time, 0.0)
+
+
+__all__ = ["split_into_messages", "first_chunk_typing_delay"]

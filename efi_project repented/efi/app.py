@@ -22,6 +22,7 @@ from datetime import time as dt_time
 from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
+from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.curiosity import CuriosityTracker
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
@@ -164,6 +165,7 @@ class EfiApp:
             self._organic_ping,
             check_interval_seconds=settings.life_engine.check_interval_seconds,
         )
+        self._busy_engine = BusyEngine(self._working_memory, self._affinity, self._life_engine, settings.busy_engine)
 
         # -- telegram --------------------------------------------------------
         self._pyrogram_client = Client(
@@ -189,7 +191,6 @@ class EfiApp:
             curiosity_recorder=self._curiosity,
             organic_ping_recorder=self._organic_ping,
             stt=self._stt,
-            read_receipt_sender=self._telegram_client,
         )
 
         # -- реестр инструментов -------------------------------------------------
@@ -254,8 +255,9 @@ class EfiApp:
                 tool_registry=self._tool_registry,
                 history=self._history,
                 system_prompt_builder=self._prompt_builder,
+                busy_engine=self._busy_engine,
                 main_role=TaskRole.MAIN,
-                fallback_notifier=self._telegram_client,
+                telegram=self._telegram_client,
                 history_limit=self._settings.memory.history_limit,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))

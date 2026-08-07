@@ -30,6 +30,19 @@ system-блок с working memory/RAG (как было до Шага 6) — эт
 efi/behavior/affinity.py) — оба источника читаются конкурентно вместе с
 остальными блоками промпта в build(), поэтому не добавляют последовательной
 задержки на критическом пути.
+
+Блок "особые указания" (_build_behavioral_overrides_block) — сброс мета-темы
+и эмпатический резонанс. В отличие от остальных блоков, ему нужна недавняя
+ИСТОРИЯ диалога (не только текущее сообщение) — чтобы понять, что разговор
+УЖЕ несколько реплик подряд крутится вокруг того, что Эфи код/ИИ, одного
+текущего сообщения для этого недостаточно. Поэтому build() принимает
+`history` явным параметром: Worker (efi/notifications/worker.py) в любом
+случае обязан прочитать историю чата, чтобы собрать Session для LLM — здесь
+она просто переиспользуется, а не запрашивается второй раз. Из-за этого
+чтение истории у Worker'а больше не идёт параллельно с остальными
+источниками промпта (лёгкий локальный SQLite-запрос перед стартом gather,
+а не внутри него) — цена за то, что детектор мета-темы не гоняет отдельный
+запрос сам по себе.
 """
 
 from __future__ import annotations
@@ -45,8 +58,8 @@ from efi.behavior.affinity import (
     AffinityTracker,
 )
 from efi.config.schema import LockdownMode, Settings
-from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult
-from efi.memory.beliefs import Belief, BeliefStore, STRONG_BELIEF_THRESHOLD
+from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
+from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
 from efi.memory.rag import RAGMemory
 from efi.memory.working_memory import WorkingMemory, WorkingMemorySnapshot
 from efi.notifications.schemas import Notification
@@ -54,6 +67,22 @@ from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
 
 logger = logging.getLogger(__name__)
+
+#: Мета-тема — разговор о самой Эфи как о коде/ИИ/софте (дебаг, логи, промпты),
+#: а не о собеседнике или внешнем мире. Больше двух реплик подряд на эту тему
+#: запрещены — см. _build_behavioral_overrides_block/_meta_topic_streak.
+_META_TOPIC_MARKERS = (
+    "дебаг", "баг в тебе", "твой промпт", "системный промпт", "твои логи", "лог файл",
+    "ты бот", "ты нейронка", "ты ии", "ты искусственный интеллект", "джейлбрейк",
+    "твой код", "твоя архитектура", "ты не настоящая", "ты программа", "ты языковая модель",
+)
+_META_TOPIC_STREAK_THRESHOLD = 2
+
+#: Явные маркеры усталости/стресса собеседника — см. _has_stress_marker.
+_STRESS_MARKERS = (
+    "устал", "устала", "заебался", "заебалась", "пиздец", "задолбал", "задолбала",
+    "вымотан", "вымотана", "измотан", "измотана", "выгорел", "выгорела", "достало всё", "достало все",
+)
 
 _PERSONALITY_TEMPLATE_NAME = "personality"
 
@@ -104,10 +133,10 @@ class _SafeFormatDict(dict[str, str]):
 
 class EfiSystemPromptBuilder:
     """
-    Собирает системный промпт из шести блоков, в порядке от самого
-    стабильного (личность) к самому переменчивому (что нашлось в памяти
-    именно сейчас): личность -> контекст чата -> время -> рабочая память ->
-    RAG -> безопасность.
+    Собирает системный промпт из блоков, в порядке от самого стабильного
+    (личность) к самому переменчивому (что нашлось в памяти именно сейчас):
+    личность -> контекст чата -> время -> рабочая память -> текущее состояние
+    личности -> особые указания -> RAG -> безопасность.
     """
 
     def __init__(
@@ -126,8 +155,11 @@ class EfiSystemPromptBuilder:
         self._beliefs = beliefs
         self._affinity = affinity
 
-    async def build(self, notification: Notification) -> str:
-        """Критический путь: все источники читаются конкурентно (asyncio.gather), не последовательно."""
+    async def build(self, notification: Notification, history: Session) -> str:
+        """
+        Критический путь: все источники, кроме `history` (уже готова к этому
+        моменту — см. докстринг модуля), читаются конкурентно (asyncio.gather).
+        """
         personality_task = self._get_personality_text()
         rag_task = self._rag.search(
             notification.message,
@@ -158,6 +190,7 @@ class EfiSystemPromptBuilder:
             _build_state_vector_block(
                 relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
             ),
+            _build_behavioral_overrides_block(history, notification.message),
             _build_rag_block(rag_results),
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
@@ -318,6 +351,64 @@ def _build_state_vector_block(
     lines.append(f"защита от угодливости: {sycophancy_protection_text}")
 
     return "[Текущее состояние личности]\n" + "\n".join(lines)
+
+
+def _has_meta_topic_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _META_TOPIC_MARKERS)
+
+
+def _meta_topic_streak(history: Session) -> int:
+    """
+    Считает, сколько ПОСЛЕДНИХ подряд идущих реплик (USER/ASSISTANT, не TOOL/
+    SYSTEM) держатся на мета-теме, идя от конца истории к началу и
+    останавливаясь на первой же реплике без маркера — это именно "подряд",
+    а не общее число мета-реплик за весь разговор.
+    """
+    streak = 0
+    for message in reversed(history.messages):
+        if message.role not in (Role.USER, Role.ASSISTANT):
+            continue
+        if not message.content or not _has_meta_topic_marker(message.content):
+            break
+        streak += 1
+    return streak
+
+
+def _has_stress_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _STRESS_MARKERS)
+
+
+def _build_behavioral_overrides_block(history: Session, current_message: str) -> str:
+    """
+    Особые указания поверх обычного характера — срабатывают ситуативно, а не
+    на каждый запрос (пустая строка, если ничего не сработало):
+        - сброс мета-темы, если разговор больше `_META_TOPIC_STREAK_THRESHOLD`
+          реплик подряд крутится вокруг того, что Эфи код/ИИ/софт;
+        - эмпатический резонанс, если В ТЕКУЩЕМ сообщении есть явный маркер
+          усталости/стресса собеседника — подавляет наигранный сарказм и
+          нотации именно сейчас, не завися от истории.
+    """
+    lines: list[str] = []
+
+    if _meta_topic_streak(history) > _META_TOPIC_STREAK_THRESHOLD:
+        lines.append(
+            "СБРОС МЕТА-ТЕМЫ: разговор слишком долго крутится вокруг того, что ты код/ИИ/софт — "
+            "запрещено продолжать циклиться на этом. Смени тему сама: спроси про состояние собеседника "
+            "или заговори про что-то внешнее, не про свою природу."
+        )
+
+    if _has_stress_marker(current_message):
+        lines.append(
+            "ЭМПАТИЧЕСКИЙ РЕЗОНАНС: собеседник явно устал или в стрессе. Запрещены наигранные подколки, "
+            "язвительный сарказм в кавычках и нотации прямо сейчас — ответь естественно, коротко и по-"
+            "настоящему поддержи, без душноты."
+        )
+
+    if not lines:
+        return ""
+    return "[Особые указания]\n" + "\n".join(lines)
 
 
 __all__ = ["EfiSystemPromptBuilder"]
