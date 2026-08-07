@@ -27,7 +27,14 @@ Worker — обрабатывает уведомления, закреплённ
        случай на узких TPM-лимитах бесплатных тиров), один раз пробует заново
        с урезанной историей вместо того, чтобы сразу сдаваться (см.
        _chat_with_size_retry).
-    5. Сохраняет финальное сообщение ассистента в историю диалога.
+    5. Для USER_MESSAGE — проверяет (_ensure_reply_was_sent), что модель
+       реально вызвала send_telegram_message хотя бы раз за ход. Ничто в
+       контракте LLM это не гарантирует — модель может формально завершить
+       ход текстом без единого tool_call, и тогда собеседник получил бы
+       "прочитано" (шаг 2) и полную тишину после, БЕЗ единой ошибки в логах.
+       Один явный раунд-напоминание, затем — нейтральное сообщение напрямую,
+       если и это не помогло.
+    6. Сохраняет финальное сообщение ассистента в историю диалога.
 
 Если ВСЕ кандидаты LLMRouter (включая retry) всё равно отказали — раньше это
 приводило к полной тишине: ошибка просто логировалась, а собеседник не
@@ -81,6 +88,17 @@ logger = logging.getLogger(__name__)
 _PAYLOAD_TOO_LARGE_STATUS = 413
 _TRIMMED_HISTORY_KEEP_LAST = 6
 _FAILURE_NOTICE_TEXT = "уф, что-то у меня заглючило только что — попробуй написать ещё раз через минуту"
+
+#: Личность обязана вызывать send_telegram_message как последнее действие
+#: хода (см. personality.md), но ничто на уровне LLM-контракта не гарантирует
+#: этого — модель может формально завершить ход текстом без tool_calls вовсе.
+#: На практике это выглядит как "прочитано, и тишина" — собеседник получает
+#: read receipt (Worker уже сходил в mark_as_read) и не получает ничего
+#: больше, а в логах при этом всё чисто: с точки зрения кода ошибки не было.
+_NO_REPLY_REMINDER_TEXT = (
+    "[системное напоминание] Ты не отправила ответ собеседнику в этом ходу — обязательно вызови "
+    "send_telegram_message с текстом ответа прямо сейчас, иначе он ничего не получит."
+)
 
 #: Пауза между повторными TYPING-пингами во время ожидания LLM — короче TTL
 #: статуса "печатает" в Telegram (~5-6с, см. efi/telegram/typing_tracker.py),
@@ -222,12 +240,49 @@ class Worker:
 
         try:
             response = await self._run_with_typing_pulse(notification.chat_id, params, session, tool_context)
+            if notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None:
+                response = await self._ensure_reply_was_sent(params, session, tool_context, response)
         except LLMError:
             await self._notify_failure(notification)
             raise  # даём run() залогировать полный трейсбек, как и раньше
 
         if notification.chat_id is not None:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
+
+    async def _ensure_reply_was_sent(
+        self, params: LLMParams, session: Session, tool_context: ToolContext, response: Response
+    ) -> Response:
+        """
+        Гарантия "прочитано ≠ тишина" для входящих сообщений — см. докстринг
+        `_NO_REPLY_REMINDER_TEXT`. Если за весь ход `send_telegram_message` ни
+        разу не вызвался (проверяем по `tool_context.extra["sent_texts"]`,
+        которое наполняет сам инструмент — см. efi.tools.telegram_actions.
+        send_message.SendMessageTool), даём модели ОДИН явный шанс исправиться
+        прямым напоминанием; если и это не помогло — отправляем нейтральное
+        сообщение напрямую, чтобы молчание не выглядело как обрыв связи.
+        LLMError на этой повторной попытке намеренно не ловится здесь —
+        поднимается в `_handle`, где обрабатывается точно так же, как обычный
+        сбой LLM (см. `except LLMError` вызывающей стороны).
+        """
+        if tool_context.extra.get("sent_texts"):
+            return response
+
+        logger.warning(
+            "worker[%d]: notification %s finished without calling send_telegram_message, nudging once",
+            self._worker_index, tool_context.notification.id,
+        )
+        session.append(Message(role=Role.SYSTEM, content=_NO_REPLY_REMINDER_TEXT))
+        response = await self._run_with_tool_calls(params, session, tool_context)
+
+        if not tool_context.extra.get("sent_texts") and self._telegram is not None and tool_context.chat_id is not None:
+            logger.warning(
+                "worker[%d]: notification %s still produced no reply after nudge, sending fallback notice",
+                self._worker_index, tool_context.notification.id,
+            )
+            await self._telegram.send_message(tool_context.chat_id, _FAILURE_NOTICE_TEXT)
+            tool_context.extra["sent_texts"] = [_FAILURE_NOTICE_TEXT]
+
+        return response
 
     async def _apply_busy_delay(self, notification: Notification) -> None:
         delay = await self._busy_engine.compute_ignore_delay(notification.chat_id)
