@@ -169,7 +169,35 @@ class AffinityTracker:
         current = await self.get_snapshot(chat_id)
         kind = classify_message(text)
         affinity_delta, respect_delta = _DELTAS[kind]
+        updated = await self._shift(chat_id, current, affinity_delta, respect_delta)
+        logger.debug(
+            "affinity: chat_id=%s kind=%s affinity=%.3f respect_level=%.3f",
+            chat_id, kind.value, updated.affinity, updated.respect_level,
+        )
+        return updated
 
+    async def apply_boost(
+        self, chat_id: int, *, affinity_delta: float = 0.0, respect_delta: float = 0.0
+    ) -> AffinitySnapshot:
+        """
+        Сдвигает affinity/respect_level на явно заданную величину, В ОБХОД
+        classify_message — для сигналов, которые несут больше информации, чем
+        обычная реплика (например efi.behavior.organic_ping.OrganicPingGenerator:
+        собеседник ОТВЕТИЛ на находку, которую Эфи сама принесла по своей
+        инициативе — это более сильный сигнал вовлечённости, чем рядовое
+        сообщение, и его не стоит сводить к той же грубой эвристике).
+        """
+        current = await self.get_snapshot(chat_id)
+        updated = await self._shift(chat_id, current, affinity_delta, respect_delta)
+        logger.debug(
+            "affinity: chat_id=%s boost affinity=%.3f respect_level=%.3f",
+            chat_id, updated.affinity, updated.respect_level,
+        )
+        return updated
+
+    async def _shift(
+        self, chat_id: int, current: AffinitySnapshot, affinity_delta: float, respect_delta: float
+    ) -> AffinitySnapshot:
         updated = AffinitySnapshot(
             affinity=_clamp(current.affinity + affinity_delta),
             respect_level=_clamp(current.respect_level + respect_delta),
@@ -187,10 +215,6 @@ class AffinityTracker:
                 updated_at = excluded.updated_at
             """,
             (chat_id, updated.affinity, updated.respect_level, now),
-        )
-        logger.debug(
-            "affinity: chat_id=%s kind=%s affinity=%.3f respect_level=%.3f",
-            chat_id, kind.value, updated.affinity, updated.respect_level,
         )
         return updated
 
