@@ -172,6 +172,18 @@ class Worker:
         )
         session = _finalize_session(history, notification)
 
+        if notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None:
+            # Реплика собеседника — единственное, что делает историю ИСТОРИЕЙ
+            # ДИАЛОГА, а не монологом Эфи с самой собой: раньше сюда попадал
+            # только response.message (см. ниже), а сообщение пользователя
+            # так и оставалось только в одноразовой Session ЭТОГО вызова и
+            # никогда не сохранялось в БД. get_recent() в следующий раз
+            # отдавал бы историю из одних только прошлых ответов Эфи — модель
+            # буквально продолжала бы саму себя, что выглядит как спор с
+            # призраком. Пишем ДО обращения к LLM: реплика человека должна
+            # остаться в истории, даже если сам запрос к LLM ниже провалится.
+            await self._history.append(notification.chat_id, session.messages[-1])
+
         if (
             notification.type is NotificationType.USER_MESSAGE
             and notification.chat_id is not None
