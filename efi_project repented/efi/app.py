@@ -22,6 +22,9 @@ from datetime import time as dt_time
 from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
+from efi.behavior.curiosity import CuriosityTracker
+from efi.behavior.life_engine import BackgroundLifeWorker
+from efi.behavior.organic_ping import OrganicPingGenerator
 from efi.behavior.researcher import BackgroundResearcher
 from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
 from efi.behavior.silence_monitor import SilenceMonitor
@@ -31,6 +34,7 @@ from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
 from efi.memory.diary import Diary
@@ -108,19 +112,24 @@ class EfiApp:
         self._history = SqliteHistoryRepository(self._database)
         self._consolidator = DiaryConsolidator(self._diary, self._llm_router, self._rag)
 
-        # -- субъектность (граф убеждений + близость/уважение) ------------------
-        # Оба — только Database как зависимость, поэтому конструируются здесь,
-        # ДО EfiSystemPromptBuilder (которому оба нужны) и ДО телеграм-обработчиков
-        # (которым нужен AffinityTracker как affinity_recorder).
+        # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
+        # Все три — только Database как зависимость, поэтому конструируются
+        # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
+        # ДО телеграм-обработчиков (которым нужны все три как *_recorder).
         self._beliefs = BeliefStore(self._database)
         self._affinity = AffinityTracker(self._database)
+        self._curiosity = CuriosityTracker(self._database)
 
-        # -- инструменты, нужные фоновому исследователю (см. ниже) -------------
-        # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher
-        # должен быть готов ДО SpontaneousPingScheduler (тому нужен его
-        # consume_incubated_thought как incubated_thought_provider).
+        # -- инструменты, нужные фоновым исследователям (см. ниже) -------------
+        # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher/
+        # BackgroundLifeWorker должны быть готовы ДО SpontaneousPingScheduler
+        # (тому нужен consume_incubated_thought как incubated_thought_provider)
+        # и до телеграм-обработчиков (которым нужен GroqSTT).
         self._web_search_tool = WebSearchTool()
         self._weather_tool = GetWeatherTool()
+        self._stt = (
+            GroqSTT(settings.stt.groq_api_key.get_secret_value()) if settings.stt.groq_api_key is not None else None
+        )
 
         # -- промпты -----------------------------------------------------
         templates_dir = settings.paths.base_dir / "efi" / "prompts" / "templates"
@@ -141,6 +150,19 @@ class EfiApp:
             self._notification_manager,
             self._active_chat_candidates,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
+        )
+        self._organic_ping = OrganicPingGenerator(
+            self._notification_manager,
+            self._affinity,
+            importance_threshold=settings.life_engine.ping_importance_threshold,
+        )
+        self._life_engine = BackgroundLifeWorker(
+            self._curiosity,
+            self._web_search_tool,
+            self._rag,
+            self._llm_router,
+            self._organic_ping,
+            check_interval_seconds=settings.life_engine.check_interval_seconds,
         )
 
         # -- telegram --------------------------------------------------------
@@ -164,6 +186,9 @@ class EfiApp:
             self._typing_tracker,
             activity_recorder=self._silence_monitor,
             affinity_recorder=self._affinity,
+            curiosity_recorder=self._curiosity,
+            organic_ping_recorder=self._organic_ping,
+            stt=self._stt,
             read_receipt_sender=self._telegram_client,
         )
 
@@ -241,6 +266,7 @@ class EfiApp:
                 asyncio.create_task(self._silence_monitor.run(), name="silence_monitor"),
                 asyncio.create_task(self._spontaneous_ping.run(), name="spontaneous_ping"),
                 asyncio.create_task(self._researcher.run(), name="background_researcher"),
+                asyncio.create_task(self._life_engine.run(), name="life_engine"),
                 asyncio.create_task(self._prompt_loader.watch(), name="prompt_loader_watch"),
                 asyncio.create_task(self._run_consolidation_loop(), name="diary_consolidation"),
             ]
@@ -335,6 +361,8 @@ class EfiApp:
         await self._llm_router.aclose()
         await self._web_search_tool.aclose()
         await self._weather_tool.aclose()
+        if self._stt is not None:
+            await self._stt.aclose()
 
         logger.info("app: stopped")
 

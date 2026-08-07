@@ -70,6 +70,18 @@ CREATE TABLE IF NOT EXISTS chat_affinity (
 );
 """
 
+_CURIOSITY_SEEDS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS curiosity_seeds (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    topic           TEXT NOT NULL,
+    source_chat_id  INTEGER,                          -- NULL, если тема пришла не из конкретного чата
+    weight          REAL NOT NULL DEFAULT 0.5,
+    created_at      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending'    -- pending | researched
+);
+CREATE INDEX IF NOT EXISTS idx_curiosity_seeds_status_weight ON curiosity_seeds (status, weight DESC);
+"""
+
 
 async def _migration_001_messages(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_MESSAGES_SCHEMA)
@@ -91,6 +103,10 @@ async def _migration_005_chat_affinity(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_CHAT_AFFINITY_SCHEMA)
 
 
+async def _migration_006_curiosity_seeds(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_CURIOSITY_SEEDS_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -98,6 +114,7 @@ MIGRATIONS = [
     _migration_003_proactive_tasks,
     _migration_004_beliefs,
     _migration_005_chat_affinity,
+    _migration_006_curiosity_seeds,
 ]
 
 __all__ = ["MIGRATIONS"]

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from efi.behavior.affinity import (
     AffinitySnapshot,
     AffinityTracker,
@@ -100,3 +102,28 @@ async def test_snapshot_values_stay_within_bounds(tmp_path: Path) -> None:
     snapshot = await tracker.get_snapshot(1)
     assert 0.0 <= snapshot.affinity <= 1.0
     assert 0.0 <= snapshot.respect_level <= 1.0
+
+
+async def test_apply_boost_shifts_values_by_explicit_delta(tmp_path: Path) -> None:
+    tracker = _make_tracker(tmp_path)
+    before = await tracker.get_snapshot(1)
+    after = await tracker.apply_boost(1, affinity_delta=0.1, respect_delta=0.2)
+    assert after.affinity == pytest.approx(before.affinity + 0.1)
+    assert after.respect_level == pytest.approx(before.respect_level + 0.2)
+
+
+async def test_apply_boost_clamps_to_bounds(tmp_path: Path) -> None:
+    tracker = _make_tracker(tmp_path)
+    after = await tracker.apply_boost(1, affinity_delta=5.0, respect_delta=-5.0)
+    assert after.affinity == 1.0
+    assert after.respect_level == 0.0
+
+
+async def test_apply_boost_persists_across_tracker_instances(tmp_path: Path) -> None:
+    db_path = tmp_path / "shared.db"
+    tracker = AffinityTracker(Database(db_path, migrations=MIGRATIONS))
+    await tracker.apply_boost(7, affinity_delta=0.2, respect_delta=0.2)
+
+    fresh_tracker = AffinityTracker(Database(db_path, migrations=MIGRATIONS))
+    snapshot = await fresh_tracker.get_snapshot(7)
+    assert snapshot.affinity == pytest.approx(AffinitySnapshot().affinity + 0.2)

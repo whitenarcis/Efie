@@ -495,6 +495,43 @@ class StateVectorSettings(BaseModel):
     )
 
 
+class SttSettings(BaseModel):
+    """
+    Настройки распознавания речи. `groq_api_key` — необязательное поле:
+    если не задано, efi.telegram.handlers.TelegramEventHandlers.GroqSTT
+    просто не конструируется в app.py, и голосовые/видео-кружки идут по
+    прежнему пути через LLMRouter (роль VISION) — та же логика "готово, но
+    подключается только при наличии конфигурации", что и у
+    GenerateImageTool/GenerateVoiceTool (см. efi/app.py).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    groq_api_key: SecretStr | None = Field(
+        default=None,
+        description="API-ключ Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT, whisper-large-v3)",
+    )
+
+
+class LifeEngineSettings(BaseModel):
+    """
+    Параметры движка фоновой автономии (efi.behavior.life_engine.BackgroundLifeWorker):
+    как часто проверять семена любопытства (efi.behavior.curiosity.CuriosityTracker)
+    и с какого веса находка считается достаточно важной, чтобы Эфи сама
+    написала о ней (efi.behavior.organic_ping.OrganicPingGenerator).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    check_interval_seconds: float = Field(
+        default=1800.0, gt=0.0, description="Как часто проверять pending-семена любопытства (раз в N минут)"
+    )
+    ping_importance_threshold: float = Field(
+        default=0.6, ge=0.0, le=1.0,
+        description="Минимальный вес семени, при котором находка достаточно важна для органического пинга",
+    )
+
+
 class Settings(BaseSettings):
     """
     Корневой объект конфигурации приложения.
@@ -528,6 +565,8 @@ class Settings(BaseSettings):
     memory: MemorySettings = Field(default_factory=MemorySettings)
     humanizer: HumanizerSettings = Field(default_factory=HumanizerSettings)
     state_vector: StateVectorSettings = Field(default_factory=StateVectorSettings)
+    stt: SttSettings = Field(default_factory=SttSettings)
+    life_engine: LifeEngineSettings = Field(default_factory=LifeEngineSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -585,6 +624,8 @@ __all__ = [
     "MemorySettings",
     "HumanizerSettings",
     "StateVectorSettings",
+    "SttSettings",
+    "LifeEngineSettings",
     "Settings",
     "get_settings",
 ]
