@@ -17,6 +17,18 @@ Cooldown ключуется по (base_url, model), а не по провайд�
 на практике вывод — per-model cooldown работает надёжнее, чем per-provider,
 потому что одна перегруженная модель на OmniRoute не должна блокировать
 остальные модели, доступные через тот же base_url.
+
+Общий потолок на ВЕСЬ перебор кандидатов одной роли (`chat`/`embedding`/
+`transcribe_audio`/`describe_image`, через `_attempt_with_fallback`) — сумма
+`timeout_seconds` всех кандидатов цепочки роли (+небольшой буфер), а не
+фиксированная константа: без него цепочка из нескольких кандидатов
+(primary -> fallback -> degrade_to) могла копить таймауты один за другим
+(например, 30с + 30с + 30с) и превращать один ответ Эфи в минуты ожидания
+собеседником — именно так и произошло на практике: и primary, и fallback
+роли MAIN словили LLMTimeoutError подряд. Бюджет считается ДИНАМИЧЕСКИ по
+уже настроенным `EndpointConfig.timeout_seconds` (а не берётся с потолка),
+поэтому не конфликтует с ролями, где отдельный кандидат намеренно ждёт
+дольше (например, VISION с timeout_seconds=60 в behavior.toml).
 """
 
 from __future__ import annotations
@@ -24,14 +36,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Self, TypeVar
 
 from efi.config.schema import EndpointConfig, RoleRoute, TaskRole
 from efi.llm.base import LLMProvider
-from efi.llm.errors import LLMAuthError, LLMError, LLMRateLimitError
+from efi.llm.errors import LLMAuthError, LLMError, LLMRateLimitError, LLMTimeoutError
 from efi.llm.providers.openai_compatible import OpenAICompatibleProvider
 from efi.llm.schemas import AudioTranscription, EmbeddingVector, LLMParams, Response, Session
 
@@ -59,6 +71,7 @@ class LLMRouter:
         default_cooldown_seconds: float = 60.0,
         rate_limit_cooldown_seconds: float = 90.0,
         auth_cooldown_seconds: float = 600.0,
+        role_timeout_buffer_seconds: float = 5.0,
     ) -> None:
         missing_roles = set(TaskRole) - set(routes)
         if missing_roles:
@@ -70,6 +83,7 @@ class LLMRouter:
         self._default_cooldown_seconds = default_cooldown_seconds
         self._rate_limit_cooldown_seconds = rate_limit_cooldown_seconds
         self._auth_cooldown_seconds = auth_cooldown_seconds
+        self._role_timeout_buffer_seconds = role_timeout_buffer_seconds
 
         self._cooldowns: dict[_EndpointKey, float] = {}  # endpoint_key -> time.monotonic() дедлайна
         self._providers: dict[_EndpointKey, LLMProvider] = {}
@@ -154,12 +168,30 @@ class LLMRouter:
         """
         Общий алгоритм fallback для операций, которые либо полностью успешны,
         либо полностью проваливаются (chat/embedding/transcribe_audio/
-        describe_image — но НЕ chat_streaming, см. её докстринг): перебирает
-        кандидатов роли по порядку (см. _candidates), на LLMError переключается
-        на следующего, помечая неудачного кандидата в cooldown.
+        describe_image — но НЕ chat_streaming, см. её докстринг), зажатый в
+        общий бюджет времени на всю цепочку кандидатов (см. докстринг модуля).
+        """
+        candidates = self._candidates(role)
+        budget = sum(endpoint.timeout_seconds for endpoint in candidates) + self._role_timeout_buffer_seconds
+        try:
+            return await asyncio.wait_for(self._attempt_candidates(candidates, operation), timeout=budget)
+        except TimeoutError as exc:
+            raise LLMTimeoutError(
+                f"role {role.value}: exceeded overall budget of {budget:.0f}s across {len(candidates)} candidate(s)",
+                provider=role.value,
+            ) from exc
+
+    async def _attempt_candidates(
+        self,
+        candidates: list[EndpointConfig],
+        operation: Callable[[LLMProvider, EndpointConfig], Awaitable[_T]],
+    ) -> _T:
+        """
+        Перебирает уже готовый список кандидатов (см. _candidates): на
+        LLMError переключается на следующего, помечая его в cooldown.
         """
         last_error: LLMError | None = None
-        for endpoint in self._candidates(role):
+        for endpoint in candidates:
             provider = self._provider_for(endpoint)
             try:
                 result = await operation(provider, endpoint)
@@ -169,7 +201,8 @@ class LLMRouter:
                 continue
             self._mark_success(endpoint)
             return result
-        raise last_error or LLMError(f"no endpoints configured for role {role.value}")
+        assert last_error is not None  # candidates гарантированно непусто — см. _candidates
+        raise last_error
 
     async def aclose(self) -> None:
         """Закрывает все созданные провайдеры (и их httpx-клиенты)."""

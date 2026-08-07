@@ -37,20 +37,20 @@ degrade_to = "fast"
 [llm_roles.main.primary]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
-model = "ollamacloud/gemma4:31b"
-timeout_seconds = 30.0
+model = "ollamacloud/nemotron-3-super"
+timeout_seconds = 15.0
 
 [llm_roles.main.fallback]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
-model = "ollamacloud/nemotron-3-super"
-timeout_seconds = 30.0
+model = "ollamacloud/gemma4:31b"
+timeout_seconds = 15.0
 
 [llm_roles.fast.primary]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
 model = "ollamacloud/minimax-m3"
-timeout_seconds = 30.0
+timeout_seconds = 15.0
 
 [llm_roles.vision.primary]
 base_url = "https://api.groq.com/openai/v1"
