@@ -150,10 +150,29 @@ async def test_user_message_persists_both_sides_of_the_conversation() -> None:
     """
     Регрессия на критический баг: раньше в историю попадал только ответ Эфи,
     реплика собеседника не сохранялась вовсе — следующий запрос видел бы
-    историю из одних её собственных сообщений (монолог, не диалог).
+    историю из одних её собственных сообщений (монолог, не диалог). Роутер
+    здесь реально вызывает send_telegram_message (см.
+    _ScriptedToolCallingLLMRouter) — plain-текстовый ответ без tool_calls
+    теперь сам по себе ловится _ensure_reply_was_sent (см. тесты ниже) и не
+    подходит для проверки именно порядка/состава персистентной истории.
     """
     events: list[str] = []
-    worker, _telegram, _busy_engine, history = _make_worker(events)
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    busy_engine = _FakeBusyEngine(0.0)
+    history = _FakeHistoryRepository()
+    tool_registry = ToolRegistry()
+    tool_registry.register(SendMessageTool(telegram))
+    worker = Worker(
+        0,
+        manager,
+        llm_router=_ScriptedToolCallingLLMRouter(events, actual_reply_text="привет"),  # type: ignore[arg-type]
+        tool_registry=tool_registry,
+        history=history,
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
     notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет, как дела?")
 
     await worker._handle(notification)
@@ -286,6 +305,109 @@ async def test_history_persists_actually_sent_text_not_the_trailing_empty_round(
     assert assistant_message.role is Role.ASSISTANT
     assert assistant_message.content == "привет, у меня всё хорошо!"
     assert assistant_message.content != ""
+
+
+class _NeverCallsSendMessageRouter:
+    """Модель, которая раз за разом отвечает текстом, ни разу не вызывая send_telegram_message."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
+        self._events.append("llm_chat")
+        return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content="думаю про себя"))])
+
+
+async def test_ensure_reply_sends_fallback_when_model_never_calls_send_message() -> None:
+    """
+    Регрессия: "прочитано, и тишина" без единой ошибки в логах — модель
+    формально завершает ход текстом без tool_calls, ничего не долетает до
+    собеседника, а Worker раньше считал это нормальным завершением обработки.
+    """
+    events: list[str] = []
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    busy_engine = _FakeBusyEngine(0.0)
+    history = _FakeHistoryRepository()
+    tool_registry = ToolRegistry()
+    tool_registry.register(SendMessageTool(telegram))
+    worker = Worker(
+        0,
+        manager,
+        llm_router=_NeverCallsSendMessageRouter(events),  # type: ignore[arg-type]
+        tool_registry=tool_registry,
+        history=history,
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    await worker._handle(notification)
+
+    assert events.count("llm_chat") == 2  # исходный раунд + один явный "нудж"
+    assert events.count("send_message") == 1  # fallback ушёл напрямую, в обход инструмента
+    assert len(history.appended) == 2
+    _chat_id, assistant_message = history.appended[1]
+    assert assistant_message.role is Role.ASSISTANT
+    assert assistant_message.content == _FAILURE_NOTICE_TEXT
+
+
+class _RepliesOnlyAfterNudgeRouter:
+    """Забывает отправить ответ в первом раунде, но реагирует на системное напоминание."""
+
+    def __init__(self, events: list[str], *, actual_reply_text: str) -> None:
+        self._events = events
+        self._actual_reply_text = actual_reply_text
+        self._call_count = 0
+
+    async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
+        self._events.append("llm_chat")
+        self._call_count += 1
+        if self._call_count == 1:
+            return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content="забыла ответить"))])
+        if self._call_count == 2:
+            tool_call = ToolCall(
+                id="call_1",
+                type="function",
+                function=ToolCallFunction(
+                    name="send_telegram_message",
+                    arguments=f'{{"text": "{self._actual_reply_text}"}}',
+                ),
+            )
+            return Response(
+                choices=[Choice(message=Message(role=Role.ASSISTANT, content="", tool_calls=[tool_call]))]
+            )
+        return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content=""))])
+
+
+async def test_ensure_reply_recovers_after_a_single_nudge() -> None:
+    """Если модель одумывается после напоминания — до fallback-сообщения дело не доходит."""
+    events: list[str] = []
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    busy_engine = _FakeBusyEngine(0.0)
+    history = _FakeHistoryRepository()
+    tool_registry = ToolRegistry()
+    tool_registry.register(SendMessageTool(telegram))
+    worker = Worker(
+        0,
+        manager,
+        llm_router=_RepliesOnlyAfterNudgeRouter(events, actual_reply_text="ой прости, вот мой ответ"),  # type: ignore[arg-type]
+        tool_registry=tool_registry,
+        history=history,
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    await worker._handle(notification)
+
+    assert events.count("send_message") == 1
+    _chat_id, assistant_message = history.appended[1]
+    assert assistant_message.content == "ой прости, вот мой ответ"
+    assert assistant_message.content != _FAILURE_NOTICE_TEXT
 
 
 async def test_llm_generation_time_is_recorded_only_with_tool_calls() -> None:
