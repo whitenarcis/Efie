@@ -544,24 +544,30 @@ class BusyEngineSettings(BaseModel):
     (efi.behavior.life_engine.BackgroundLifeWorker.is_researching), устала
     (WorkingMemorySnapshot.energy) или отвечает близкому человеку
     (efi.behavior.affinity.AffinityTracker).
+
+    Дефолты намеренно скромные: эта задержка встаёт ДО обращения к LLM (см.
+    efi/notifications/worker.py), а сама LLM (особенно при деградации между
+    несколькими кандидатами роли — efi/llm/router.py) уже может занять
+    десятки секунд. Заметная "занятость" не должна складываться с и без того
+    небыстрым ответом провайдера в минуты ожидания.
     """
 
     model_config = ConfigDict(frozen=True)
 
-    base_delay_min_seconds: float = Field(default=2.0, ge=0.0, description="Нижняя граница базовой ignore_delay")
-    base_delay_max_seconds: float = Field(default=20.0, gt=0.0, description="Верхняя граница базовой ignore_delay")
+    base_delay_min_seconds: float = Field(default=1.0, ge=0.0, description="Нижняя граница базовой ignore_delay")
+    base_delay_max_seconds: float = Field(default=8.0, gt=0.0, description="Верхняя граница базовой ignore_delay")
     research_busy_multiplier: float = Field(
-        default=2.5, gt=1.0,
+        default=1.5, gt=1.0,
         description="Во сколько раз растягивается верхняя граница базовой задержки, пока идёт фоновое исследование",
     )
     low_energy_extra_seconds: float = Field(
-        default=25.0, ge=0.0, description="Максимальная добавка к задержке при энергии, стремящейся к 0"
+        default=10.0, ge=0.0, description="Максимальная добавка к задержке при энергии, стремящейся к 0"
     )
     high_affinity_discount_seconds: float = Field(
-        default=8.0, ge=0.0, description="Максимальная скидка с задержки при близости/уважении, стремящихся к 1"
+        default=5.0, ge=0.0, description="Максимальная скидка с задержки при близости/уважении, стремящихся к 1"
     )
     min_delay_seconds: float = Field(default=0.5, ge=0.0, description="Нижний потолок итоговой ignore_delay")
-    max_delay_seconds: float = Field(default=90.0, gt=0.0, description="Верхний потолок итоговой ignore_delay")
+    max_delay_seconds: float = Field(default=25.0, gt=0.0, description="Верхний потолок итоговой ignore_delay")
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> "BusyEngineSettings":
