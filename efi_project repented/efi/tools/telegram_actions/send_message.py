@@ -18,6 +18,14 @@ efi/tools/telegram_actions/send_message.py
 Дополнительно уведомляет SilenceMonitor об исходящей активности — иначе
 собственные сообщения Эфи не засчитывались бы как "активность" в чате, и
 монитор тишины мог бы запинговать чат сразу после того, как она сама в нём написала.
+
+`context.extra["llm_generation_time"]` (если есть — кладёт туда
+efi.notifications.worker.Worker._run_with_tool_calls) прокидывается в
+send_message как есть: сколько реально заняла генерация ответа LLM до этого
+момента, чтобы TelegramClientWrapper мог зачесть это время как "печать"
+первого баббла (efi/humanizer/message_splitting.py::first_chunk_typing_delay)
+вместо того, чтобы наслаивать ещё одну искусственную паузу поверх уже
+прошедшего ожидания.
 """
 
 from __future__ import annotations
@@ -34,7 +42,14 @@ logger = logging.getLogger(__name__)
 class MessageSender(Protocol):
     """Абстракция отправки сообщения. Конкретная реализация — efi.telegram.client.TelegramClientWrapper."""
 
-    async def send_message(self, chat_id: int, text: str, *, reply_to_message_id: int | None = None) -> None: ...
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        llm_generation_time: float | None = None,
+    ) -> None: ...
 
 
 class ActivityRecorder(Protocol):
@@ -102,7 +117,13 @@ class SendMessageTool(Tool):
             )
 
         reply_to_message_id = self._resolve_reply_target(arguments, context)
-        await self._sender.send_message(context.chat_id, text, reply_to_message_id=reply_to_message_id)
+        llm_generation_time = context.extra.get("llm_generation_time")
+        await self._sender.send_message(
+            context.chat_id,
+            text,
+            reply_to_message_id=reply_to_message_id,
+            llm_generation_time=llm_generation_time,
+        )
 
         if self._anti_repeat is not None:
             self._anti_repeat.record(context.chat_id, text)

@@ -49,6 +49,11 @@ class WorkingMemorySnapshot(BaseModel):
 
     emotional_state: str = ""
     physical_state: str = ""
+    energy: float = Field(
+        default=0.7, ge=0.0, le=1.0,
+        description="Текущий уровень бодрости (0..1) — вход для efi.behavior.busy_engine.BusyEngine "
+        "(низкая энергия удлиняет ignore_delay перед ответом).",
+    )
     items: list[WorkingMemoryItem] = Field(default_factory=list)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -121,13 +126,16 @@ class WorkingMemory:
         *,
         emotional_state: str | None = None,
         physical_state: str | None = None,
+        energy: float | None = None,
     ) -> WorkingMemorySnapshot:
-        """Обновляет эмоциональное и/или физическое состояние персонажа."""
+        """Обновляет эмоциональное/физическое состояние и/или уровень энергии персонажа."""
         snapshot = await self.load()
         if emotional_state is not None:
             snapshot.emotional_state = emotional_state
         if physical_state is not None:
             snapshot.physical_state = physical_state
+        if energy is not None:
+            snapshot.energy = max(0.0, min(energy, 1.0))
         return await self.save(snapshot)
 
     async def add_item(self, text: str) -> WorkingMemoryItem:

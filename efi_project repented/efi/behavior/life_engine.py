@@ -96,6 +96,17 @@ class BackgroundLifeWorker:
         self._organic_ping = organic_ping
         self._check_interval_seconds = check_interval_seconds
         self._finding_role = finding_role
+        self._is_researching = False
+
+    @property
+    def is_researching(self) -> bool:
+        """
+        True на всё время `_research()` (веб-поиск + формулировка находки) —
+        вход для efi.behavior.busy_engine.BusyEngine: пока Эфи занята фоновым
+        исследованием, ignore_delay перед реакцией на входящее сообщение
+        увеличивается, она "не сразу отвлекается на телефон".
+        """
+        return self._is_researching
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
@@ -113,7 +124,12 @@ class BackgroundLifeWorker:
         if seed is None:
             return
 
-        thought = await self._research(seed)
+        self._is_researching = True
+        try:
+            thought = await self._research(seed)
+        finally:
+            self._is_researching = False
+
         # Помечаем researched СРАЗУ после попытки, независимо от её исхода —
         # неудачный поиск/LLM-сбой не должен держать семя pending вечно и
         # блокировать собой всё более весомые семена, появившиеся позже.

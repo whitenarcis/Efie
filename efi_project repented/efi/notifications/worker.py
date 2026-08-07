@@ -8,53 +8,67 @@ Worker — обрабатывает уведомления, закреплённ
 для того же chat_id физически лежит в ЕГО ЖЕ подочереди и просто ждёт своей
 очереди — никакой другой Worker его в это время не подхватит.
 
-На каждое уведомление Worker:
-    1. Собирает Session: история диалога (HistoryRepository) + текст события
-       (сперва прогнанный через security.sanitize — это внешний ввод).
-    2. Просит полный системный промпт у SystemPromptBuilder (личность, время,
-       working memory, RAG, ограничения безопасности — Worker в это не
-       вникает, см. efi/prompts/builder.py).
-    3. Прогоняет цикл tool-calling через LLMRouter, пока модель не даст
-       финальный ответ без tool_calls (см. _run_with_tool_calls). Если запрос
-       падает как "слишком большой" (413 — реальный случай на узких TPM-лимитах
-       бесплатных тиров), один раз пробует заново с урезанной историей вместо
-       того, чтобы сразу сдаваться (см. _chat_with_size_retry).
-    4. Сохраняет финальное сообщение ассистента в историю диалога.
+На каждое уведомление Worker (порядок ВАЖЕН — см. efi/behavior/busy_engine.py):
+    1. Считает и выжидает `ignore_delay` (BusyEngine) — симуляция занятости.
+       До этого момента Worker НЕ делает ни одного обращения к Telegram, ни
+       видимого (typing/read), ни любого другого — значит, Telegram не
+       покажет клиента "в сети", а сообщение остаётся "не прочитано".
+    2. Для USER_MESSAGE — заходит в чат (mark_as_read): именно в ЭТОТ момент
+       появляется статус "прочитано" и, как следствие, онлайн-присутствие —
+       не раньше.
+    3. Собирает Session (история + текст события, прогнанный через
+       security.sanitize) и просит системный промпт у SystemPromptBuilder
+       (личность, время, working memory, RAG, ограничения безопасности,
+       мета-тема/эмпатия — Worker в это не вникает, см. efi/prompts/builder.py).
+    4. Прогоняет цикл tool-calling через LLMRouter (см. _run_with_tool_calls),
+       транслируя TYPING все время ожидания ответа модели (см. _typing_pulse) —
+       живой статус "печатает" вместо тишины между "прочитано" и первым
+       сообщением. Если запрос падает как "слишком большой" (413 — реальный
+       случай на узких TPM-лимитах бесплатных тиров), один раз пробует заново
+       с урезанной историей вместо того, чтобы сразу сдаваться (см.
+       _chat_with_size_retry).
+    5. Сохраняет финальное сообщение ассистента в историю диалога.
 
 Если ВСЕ кандидаты LLMRouter (включая retry) всё равно отказали — раньше это
 приводило к полной тишине: ошибка просто логировалась, а собеседник не
 получал вообще ничего и не понимал, что случилось. Теперь, если передан
-`fallback_notifier`, Worker отправляет короткое нейтральное сообщение о сбое
+`telegram`, Worker отправляет короткое нейтральное сообщение о сбое
 напрямую (в обход LLM, который как раз и недоступен).
 
 С Шага 6 Worker больше не знает про RAGMemory/WorkingMemory напрямую — эта
 логика переехала в SystemPromptBuilder (efi/prompts/builder.py). Worker
-остаётся ответственным только за оркестрацию: историю, санитайзинг входа и
-цикл tool-calling — и не заботится о содержании промпта.
+остаётся ответственным только за оркестрацию: занятость, историю,
+санитайзинг входа и цикл tool-calling — и не заботится о содержании промпта.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Protocol
 
+from efi.behavior.busy_engine import BusyEngine
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Response, Role, Session
 from efi.notifications.manager import NotificationManager
-from efi.notifications.schemas import Notification
+from efi.notifications.schemas import Notification, NotificationType
 from efi.security.sanitize import sanitize_text
 from efi.tools.base import ToolContext
 from efi.tools.registry import ToolRegistry
-from efi.tools.telegram_actions.send_message import MessageSender
 
 logger = logging.getLogger(__name__)
 
 _PAYLOAD_TOO_LARGE_STATUS = 413
 _TRIMMED_HISTORY_KEEP_LAST = 6
 _FAILURE_NOTICE_TEXT = "уф, что-то у меня заглючило только что — попробуй написать ещё раз через минуту"
+
+#: Пауза между повторными TYPING-пингами во время ожидания LLM — короче TTL
+#: статуса "печатает" в Telegram (~5-6с, см. efi/telegram/typing_tracker.py),
+#: чтобы статус не успевал погаснуть между пингами.
+_TYPING_PULSE_INTERVAL_SECONDS = 4.0
 
 
 class HistoryRepository(Protocol):
@@ -68,7 +82,30 @@ class HistoryRepository(Protocol):
 class SystemPromptBuilder(Protocol):
     """Абстракция сборки системного промпта. Конкретная реализация — efi.prompts.builder.EfiSystemPromptBuilder."""
 
-    async def build(self, notification: Notification) -> str: ...
+    async def build(self, notification: Notification, history: Session) -> str: ...
+
+
+class TelegramNotifier(Protocol):
+    """
+    Всё, что Worker'у нужно от телеграм-слоя. Конкретная реализация —
+    efi.telegram.client.TelegramClientWrapper (уже реализует все три метода).
+    Объединено в один Protocol, а не три отдельных: у Worker'а нет сценария,
+    где были бы доступны одни методы этой связки без других — это одна и та
+    же "видимая" поверхность одного и того же Telegram-клиента.
+    """
+
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        llm_generation_time: float | None = None,
+    ) -> None: ...
+
+    async def mark_as_read(self, chat_id: int) -> None: ...
+
+    async def send_typing_action(self, chat_id: int) -> None: ...
 
 
 class Worker:
@@ -83,10 +120,11 @@ class Worker:
         tool_registry: ToolRegistry,
         history: HistoryRepository,
         system_prompt_builder: SystemPromptBuilder,
+        busy_engine: BusyEngine,
         main_role: TaskRole = TaskRole.MAIN,
         max_tool_call_rounds: int = 8,
         history_limit: int = 20,
-        fallback_notifier: MessageSender | None = None,
+        telegram: TelegramNotifier | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -94,10 +132,11 @@ class Worker:
         self._tool_registry = tool_registry
         self._history = history
         self._system_prompt_builder = system_prompt_builder
+        self._busy_engine = busy_engine
         self._main_role = main_role
         self._max_tool_call_rounds = max_tool_call_rounds
         self._history_limit = history_limit
-        self._fallback_notifier = fallback_notifier
+        self._telegram = telegram
 
     async def run(self) -> None:
         """
@@ -124,12 +163,26 @@ class Worker:
             raise
 
     async def _handle(self, notification: Notification) -> None:
-        # Системный промпт (личность + время + working memory + RAG +
-        # ограничения) и история диалога зависят от разных источников и не
-        # блокируют друг друга — читаем конкурентно.
-        session_task = self._build_session(notification)
-        system_prompt_task = self._system_prompt_builder.build(notification)
-        session, system_prompt = await asyncio.gather(session_task, system_prompt_task)
+        await self._apply_busy_delay(notification)
+
+        history = (
+            await self._history.get_recent(notification.chat_id, limit=self._history_limit)
+            if notification.chat_id is not None
+            else Session()
+        )
+        session = _finalize_session(history, notification)
+
+        if (
+            notification.type is NotificationType.USER_MESSAGE
+            and notification.chat_id is not None
+            and self._telegram is not None
+        ):
+            # "Заход в чат" — именно тут, а не раньше: до этого момента
+            # Worker не совершил ни одного видимого телеграм-действия (см.
+            # докстринг модуля и efi/behavior/busy_engine.py).
+            await self._telegram.mark_as_read(notification.chat_id)
+
+        system_prompt = await self._system_prompt_builder.build(notification, history)
 
         tool_context = ToolContext(notification=notification)
         params = LLMParams(
@@ -139,7 +192,7 @@ class Worker:
         )
 
         try:
-            response = await self._run_with_tool_calls(params, session, tool_context)
+            response = await self._run_with_typing_pulse(notification.chat_id, params, session, tool_context)
         except LLMError:
             await self._notify_failure(notification)
             raise  # даём run() залогировать полный трейсбек, как и раньше
@@ -147,34 +200,59 @@ class Worker:
         if notification.chat_id is not None:
             await self._history.append(notification.chat_id, response.message)
 
+    async def _apply_busy_delay(self, notification: Notification) -> None:
+        delay = await self._busy_engine.compute_ignore_delay(notification.chat_id)
+        if delay <= 0:
+            return
+        logger.debug(
+            "worker[%d]: ignoring notification %s for %.1fs (busy simulation)",
+            self._worker_index, notification.id, delay,
+        )
+        await asyncio.sleep(delay)
+
     async def _notify_failure(self, notification: Notification) -> None:
-        """Короткое нейтральное уведомление о сбое напрямую — иначе собеседник просто не получает ничего и не понимает, что случилось."""
-        if self._fallback_notifier is None or notification.chat_id is None:
+        """
+        Короткое нейтральное уведомление о сбое напрямую — иначе собеседник
+        ничего не получает и не понимает, в чём дело.
+        """
+        if self._telegram is None or notification.chat_id is None:
             return
         try:
-            await self._fallback_notifier.send_message(notification.chat_id, _FAILURE_NOTICE_TEXT)
+            await self._telegram.send_message(notification.chat_id, _FAILURE_NOTICE_TEXT)
         except Exception:
             logger.exception(
                 "worker[%d]: failed to send fallback failure notice to chat_id=%s",
                 self._worker_index, notification.chat_id,
             )
 
-    async def _build_session(self, notification: Notification) -> Session:
+    async def _run_with_typing_pulse(
+        self, chat_id: int | None, params: LLMParams, session: Session, tool_context: ToolContext
+    ) -> Response:
         """
-        История чата + текущее сообщение события. `notification.message` —
-        внешний ввод (то, что написал собеседник, или сформулированный текст
-        триггера) и прогоняется через sanitize_text ПЕРЕД тем, как попасть в
-        Session — единственная точка, где сырой внешний текст превращается в
-        USER-сообщение LLM.
+        Оборачивает цикл tool-calling фоновым "пульсом" TYPING, пока Worker
+        ждёт LLM (см. _typing_pulse) — без этого собеседник видел бы просто
+        тишину между "прочитано" и первым сообщением, что менее естественно,
+        чем живой статус "печатает".
         """
-        history = (
-            await self._history.get_recent(notification.chat_id, limit=self._history_limit)
-            if notification.chat_id is not None
-            else Session()
-        )
-        session = history.model_copy(deep=True)
-        session.append(Message(role=Role.USER, content=sanitize_text(notification.message)))
-        return session
+        if chat_id is None or self._telegram is None:
+            return await self._run_with_tool_calls(params, session, tool_context)
+
+        pulse_task = asyncio.create_task(self._typing_pulse(chat_id))
+        try:
+            return await self._run_with_tool_calls(params, session, tool_context)
+        finally:
+            pulse_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await pulse_task
+
+    async def _typing_pulse(self, chat_id: int) -> None:
+        assert self._telegram is not None  # проверено вызывающей стороной (_run_with_typing_pulse)
+        try:
+            while True:
+                await self._telegram.send_typing_action(chat_id)
+                await asyncio.sleep(_TYPING_PULSE_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            raise
 
     async def _run_with_tool_calls(self, params: LLMParams, session: Session, tool_context: ToolContext) -> Response:
         """
@@ -183,7 +261,17 @@ class Worker:
         TOOL-сообщения -> повторить, пока модель не даст финальный ответ без
         tool_calls. `max_tool_call_rounds` — защита от зацикливания (модель
         может застрять, бесконечно вызывая инструменты).
+
+        Перед исполнением каждого раунда tool-вызовов кладёт накопленное
+        время генерации в `tool_context.extra["llm_generation_time"]` — это
+        читает efi.tools.telegram_actions.send_message.SendMessageTool, чтобы
+        зачесть уже прошедшее ожидание LLM как время печати первого баббла
+        (см. efi/humanizer/message_splitting.py::first_chunk_typing_delay).
+        `tool_context.extra` — обычный dict, мутация на месте безопасна:
+        ToolContext заморожен только на уровне переприсваивания полей, не
+        содержимого изменяемых полей (см. efi/tools/base.py).
         """
+        start_time = asyncio.get_running_loop().time()
         response: Response | None = None
         for _round_number in range(self._max_tool_call_rounds):
             response = await self._chat_with_size_retry(params, session)
@@ -193,6 +281,7 @@ class Worker:
             if not message.has_tool_calls:
                 return response
 
+            tool_context.extra["llm_generation_time"] = asyncio.get_running_loop().time() - start_time
             for tool_call in message.tool_calls:
                 result_text = await self._tool_registry.execute(tool_call, tool_context)
                 session.append(Message(role=Role.TOOL, content=result_text, tool_call_id=tool_call.id))
@@ -229,4 +318,17 @@ class Worker:
             return await self._llm_router.chat(self._main_role, params, session)
 
 
-__all__ = ["Worker", "HistoryRepository", "SystemPromptBuilder"]
+def _finalize_session(history: Session, notification: Notification) -> Session:
+    """
+    История чата + текущее сообщение события. `notification.message` —
+    внешний ввод (то, что написал собеседник, или сформулированный текст
+    триггера) и прогоняется через sanitize_text ПЕРЕД тем, как попасть в
+    Session — единственная точка, где сырой внешний текст превращается в
+    USER-сообщение LLM.
+    """
+    session = history.model_copy(deep=True)
+    session.append(Message(role=Role.USER, content=sanitize_text(notification.message)))
+    return session
+
+
+__all__ = ["Worker", "HistoryRepository", "SystemPromptBuilder", "TelegramNotifier"]
