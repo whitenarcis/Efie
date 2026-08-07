@@ -35,6 +35,23 @@ Worker — обрабатывает уведомления, закреплённ
 `telegram`, Worker отправляет короткое нейтральное сообщение о сбое
 напрямую (в обход LLM, который как раз и недоступен).
 
+ВАЖНО про сохранение шага 5: `response.message` — это последний ответ LLM в
+цикле tool-calling, а не обязательно то, что реально увидел собеседник.
+Личность обязана вызывать send_telegram_message как ПОСЛЕДНЕЕ действие хода
+(см. personality.md) — значит, реальный текст ответа уходит в аргументе
+ЭТОГО вызова, а раунд после него (после TOOL-результата "Message sent
+successfully") часто возвращает пустой/служебный `content`, потому что
+модель уже "сказала своё" через инструмент. Если бы Worker сохранял в
+историю именно `response.message.content` не глядя, персистентная память
+хранила бы не то, что Эфи реально сказала, а обрывок технического
+финального хода — со временем разговор для самой Эфи выглядел бы так,
+будто она в основном отвечала пустотой. Поэтому `_handle` собирает
+`tool_context.extra["sent_texts"]` (см. efi.tools.telegram_actions.
+send_message.SendMessageTool) — тексты всех реально отправленных сообщений
+за этот ход — и сохраняет ИХ как содержимое ASSISTANT-сообщения истории,
+откатываясь на `response.message` только если инструмент отправки вообще
+не вызывался (например, будущий тип уведомления без обязательной отправки).
+
 С Шага 6 Worker больше не знает про RAGMemory/WorkingMemory напрямую — эта
 логика переехала в SystemPromptBuilder (efi/prompts/builder.py). Worker
 остаётся ответственным только за оркестрацию: занятость, историю,
@@ -210,7 +227,7 @@ class Worker:
             raise  # даём run() залогировать полный трейсбек, как и раньше
 
         if notification.chat_id is not None:
-            await self._history.append(notification.chat_id, response.message)
+            await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
 
     async def _apply_busy_delay(self, notification: Notification) -> None:
         delay = await self._busy_engine.compute_ignore_delay(notification.chat_id)
@@ -226,6 +243,12 @@ class Worker:
         """
         Короткое нейтральное уведомление о сбое напрямую — иначе собеседник
         ничего не получает и не понимает, в чём дело.
+
+        Персистим его в историю точно так же, как обычный ответ (см.
+        _message_to_persist): иначе следующий запрос в этом чате не будет
+        знать, что Эфи вообще что-то говорила про сбой — с точки зрения
+        истории собеседник получил бы сообщение "из ниоткуда", а сама Эфи
+        в следующий раз не будет помнить, что уже извинялась.
         """
         if self._telegram is None or notification.chat_id is None:
             return
@@ -236,6 +259,10 @@ class Worker:
                 "worker[%d]: failed to send fallback failure notice to chat_id=%s",
                 self._worker_index, notification.chat_id,
             )
+            return
+        await self._history.append(
+            notification.chat_id, Message(role=Role.ASSISTANT, content=_FAILURE_NOTICE_TEXT)
+        )
 
     async def _run_with_typing_pulse(
         self, chat_id: int | None, params: LLMParams, session: Session, tool_context: ToolContext
@@ -328,6 +355,23 @@ class Worker:
             )
             session.messages[:] = session.messages[-_TRIMMED_HISTORY_KEEP_LAST:]
             return await self._llm_router.chat(self._main_role, params, session)
+
+
+def _message_to_persist(response: Response, tool_context: ToolContext) -> Message:
+    """
+    Что реально сохранить в персистентную историю как реплику Эфи — см.
+    докстринг модуля про `response.message` vs `sent_texts`. Если за этот ход
+    хоть раз успешно сработал send_telegram_message, история должна помнить
+    ИМЕННО отправленный текст (в порядке отправки, если бабблов было
+    несколько), а не последний служебный ход LLM после этого. Если инструмент
+    ни разу не вызывался (например, модель ответила текстом без вызова —
+    такой ответ до собеседника не долетел, но сохранить хоть что-то лучше,
+    чем ничего) — откатываемся на response.message как раньше.
+    """
+    sent_texts = tool_context.extra.get("sent_texts")
+    if not sent_texts:
+        return response.message
+    return Message(role=Role.ASSISTANT, content="\n".join(sent_texts))
 
 
 def _finalize_session(history: Session, notification: Notification) -> Session:

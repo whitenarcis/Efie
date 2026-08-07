@@ -26,6 +26,17 @@ send_message как есть: сколько реально заняла ген�
 первого баббла (efi/humanizer/message_splitting.py::first_chunk_typing_delay)
 вместо того, чтобы наслаивать ещё одну искусственную паузу поверх уже
 прошедшего ожидания.
+
+Каждый успешно отправленный текст ЕЩЁ И накапливается в
+`context.extra["sent_texts"]` — это единственное место, где реально видно,
+что модель сказала собеседнику. Личность обязана вызывать этот инструмент
+как ПОСЛЕДНЕЕ действие хода (см. personality.md), поэтому финальный ответ
+LLM в цикле tool-calling (после TOOL-результата этого вызова) часто пустой
+или служебный ("готово") — если сохранять в историю именно его (как было
+раньше), персистентная память вообще не видела бы реального текста ответа
+Эфи. efi.notifications.worker.Worker читает `sent_texts` после цикла
+tool-calling и сохраняет ИХ, а не последнее сырое сообщение модели — см.
+Worker._handle.
 """
 
 from __future__ import annotations
@@ -129,6 +140,7 @@ class SendMessageTool(Tool):
             self._anti_repeat.record(context.chat_id, text)
         if self._activity_recorder is not None:
             self._activity_recorder.record_activity(context.chat_id)
+        context.extra.setdefault("sent_texts", []).append(text)
 
         logger.info("send_message: sent %d chars to chat_id=%s", len(text), context.chat_id)
         return "Message sent successfully. Warning: you have sent a message. Consider not spamming with repeated calls."

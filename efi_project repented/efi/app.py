@@ -57,9 +57,11 @@ from efi.tools.chat_management.leave_chat import LeaveChatTool
 from efi.tools.chat_management.search_chats import SearchChatsTool
 from efi.tools.memory_tools.ask_diary import AskDiaryTool
 from efi.tools.memory_tools.manage_belief import UpdateBeliefTool
+from efi.tools.memory_tools.manage_promises import CompletePromiseTool, RememberPromiseTool
 from efi.tools.memory_tools.recall_fact import RecallFactTool
 from efi.tools.memory_tools.remember_diary_entry import RememberDiaryEntryTool
 from efi.tools.memory_tools.remember_fact import RememberFactTool
+from efi.tools.memory_tools.update_self_state import UpdateSelfStateTool
 from efi.tools.registry import ToolRegistry
 from efi.tools.system_tools.device import GetBatteryStatusTool, TriggerVibrationTool
 from efi.tools.telegram_actions.edit_message import EditMessageTool
@@ -204,6 +206,9 @@ class EfiApp:
             RecallFactTool(self._facts),
             RememberDiaryEntryTool(self._rag),
             UpdateBeliefTool(self._beliefs),
+            UpdateSelfStateTool(self._working_memory),
+            RememberPromiseTool(self._working_memory),
+            CompletePromiseTool(self._working_memory),
             SendMessageTool(
                 self._telegram_client,
                 anti_repeat=self._anti_repeat,

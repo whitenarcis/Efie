@@ -14,12 +14,13 @@ import pytest
 
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMServerError
-from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session
+from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session, ToolCall, ToolCallFunction
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
-from efi.notifications.worker import Worker
+from efi.notifications.worker import _FAILURE_NOTICE_TEXT, Worker
 from efi.tools.base import ToolContext
 from efi.tools.registry import ToolRegistry
+from efi.tools.telegram_actions.send_message import SendMessageTool
 
 
 class _FakeBusyEngine:
@@ -167,7 +168,13 @@ async def test_user_message_persists_both_sides_of_the_conversation() -> None:
 
 
 async def test_user_turn_is_persisted_even_when_llm_fails() -> None:
-    """Реплика собеседника не должна теряться, даже если сам запрос к LLM в итоге упал."""
+    """
+    Реплика собеседника не должна теряться, даже если сам запрос к LLM в
+    итоге упал — и точно так же не должен теряться fallback-текст о сбое,
+    который Worker отправляет напрямую (в обход LLM): следующий запрос в
+    этом чате должен видеть, что Эфи уже что-то сказала про сбой, а не
+    находить в истории провал без объяснения.
+    """
     events: list[str] = []
     failing_router = _FakeLLMRouter(events, error=LLMServerError("boom", provider="test"))
     worker, _telegram, _busy_engine, history = _make_worker(events, llm_router=failing_router)
@@ -176,11 +183,13 @@ async def test_user_turn_is_persisted_even_when_llm_fails() -> None:
     with pytest.raises(LLMServerError):
         await worker._handle(notification)
 
-    assert len(history.appended) == 1
-    chat_id, message = history.appended[0]
-    assert chat_id == 42
-    assert message.role is Role.USER
-    assert message.content == "привет"
+    assert len(history.appended) == 2
+    (chat_id_1, user_message), (chat_id_2, failure_message) = history.appended
+    assert chat_id_1 == chat_id_2 == 42
+    assert user_message.role is Role.USER
+    assert user_message.content == "привет"
+    assert failure_message.role is Role.ASSISTANT
+    assert failure_message.content == _FAILURE_NOTICE_TEXT
 
 
 async def test_non_user_message_does_not_fabricate_a_user_turn() -> None:
@@ -194,6 +203,89 @@ async def test_non_user_message_does_not_fabricate_a_user_turn() -> None:
     assert len(history.appended) == 1
     _chat_id, message = history.appended[0]
     assert message.role is Role.ASSISTANT
+
+
+class _ScriptedToolCallingLLMRouter:
+    """
+    Симулирует реальную двухраундовую механику tool-calling: раунд 1 несёт
+    и черновик ответа в content, и вызов send_telegram_message; раунд 2 —
+    пустой служебный ход БЕЗ tool_calls (типичный для многих моделей после
+    TOOL-результата "Message sent successfully").
+    """
+
+    def __init__(self, events: list[str], *, actual_reply_text: str) -> None:
+        self._events = events
+        self._actual_reply_text = actual_reply_text
+        self._round = 0
+
+    async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
+        self._events.append("llm_chat")
+        self._round += 1
+        if self._round == 1:
+            tool_call = ToolCall(
+                id="call_1",
+                type="function",
+                function=ToolCallFunction(
+                    name="send_telegram_message",
+                    arguments=f'{{"text": "{self._actual_reply_text}"}}',
+                ),
+            )
+            return Response(
+                choices=[
+                    Choice(
+                        message=Message(
+                            role=Role.ASSISTANT,
+                            content="<response>черновик, не отправлено напрямую</response>",
+                            tool_calls=[tool_call],
+                        )
+                    )
+                ]
+            )
+        # Раунд 2: модель уже "сказала своё" через инструмент — многие модели
+        # возвращают пустой/служебный content здесь, без новых tool_calls.
+        return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content=""))])
+
+
+async def test_history_persists_actually_sent_text_not_the_trailing_empty_round() -> None:
+    """
+    Регрессия: раньше Worker сохранял в историю response.message последнего
+    раунда цикла tool-calling — а не текст, который реально ушёл собеседнику
+    через send_telegram_message. Личность обязана вызывать этот инструмент
+    как ПОСЛЕДНИМ действием хода (см. personality.md), поэтому раунд ПОСЛЕ
+    вызова инструмента часто пустой — и раньше именно эта пустота попадала
+    в персистентную историю вместо реального ответа.
+    """
+    events: list[str] = []
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    busy_engine = _FakeBusyEngine(0.0)
+    history = _FakeHistoryRepository()
+
+    tool_registry = ToolRegistry()
+    tool_registry.register(SendMessageTool(telegram))
+
+    llm_router = _ScriptedToolCallingLLMRouter(events, actual_reply_text="привет, у меня всё хорошо!")
+
+    worker = Worker(
+        0,
+        manager,
+        llm_router=llm_router,  # type: ignore[arg-type]
+        tool_registry=tool_registry,
+        history=history,
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="как дела?")
+
+    await worker._handle(notification)
+
+    assert len(history.appended) == 2
+    (_chat_id, user_message), (_chat_id2, assistant_message) = history.appended
+    assert user_message.role is Role.USER
+    assert assistant_message.role is Role.ASSISTANT
+    assert assistant_message.content == "привет, у меня всё хорошо!"
+    assert assistant_message.content != ""
 
 
 async def test_llm_generation_time_is_recorded_only_with_tool_calls() -> None:

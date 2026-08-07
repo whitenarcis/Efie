@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import aiofiles.os
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from pyrogram.handlers import MessageHandler
@@ -174,11 +175,14 @@ class TelegramEventHandlers:
 
         caption = message.caption or ""
         downloaded_path = await self._download_media(client, message)
-        description = (
-            await describe_photo(self._router, downloaded_path)
-            if downloaded_path is not None
-            else "[фото — не удалось загрузить файл]"
-        )
+        try:
+            description = (
+                await describe_photo(self._router, downloaded_path)
+                if downloaded_path is not None
+                else "[фото — не удалось загрузить файл]"
+            )
+        finally:
+            await self._cleanup_media(downloaded_path)
         text = f"[прислал(а) фото] {description}"
         if caption:
             text += f" (подпись: {caption})"
@@ -190,11 +194,14 @@ class TelegramEventHandlers:
             return
 
         downloaded_path = await self._download_media(client, message)
-        transcript = await self._transcribe_audio(
-            downloaded_path,
-            fallback_transcriber=transcribe_voice_message,
-            missing_file_placeholder="[голосовое сообщение — не удалось загрузить файл]",
-        )
+        try:
+            transcript = await self._transcribe_audio(
+                downloaded_path,
+                fallback_transcriber=transcribe_voice_message,
+                missing_file_placeholder="[голосовое сообщение — не удалось загрузить файл]",
+            )
+        finally:
+            await self._cleanup_media(downloaded_path)
         await self._dispatch_user_message(
             access_info, message, text=f"[прислал(а) голосовое] {transcript}", payload={"media_type": "voice"}
         )
@@ -205,11 +212,14 @@ class TelegramEventHandlers:
             return
 
         downloaded_path = await self._download_media(client, message)
-        transcript = await self._transcribe_audio(
-            downloaded_path,
-            fallback_transcriber=transcribe_video_note,
-            missing_file_placeholder="[видео-кружок — не удалось загрузить файл]",
-        )
+        try:
+            transcript = await self._transcribe_audio(
+                downloaded_path,
+                fallback_transcriber=transcribe_video_note,
+                missing_file_placeholder="[видео-кружок — не удалось загрузить файл]",
+            )
+        finally:
+            await self._cleanup_media(downloaded_path)
         await self._dispatch_user_message(
             access_info, message, text=f"[прислал(а) видео-кружок] {transcript}", payload={"media_type": "video_note"}
         )
@@ -250,6 +260,22 @@ class TelegramEventHandlers:
             logger.exception("telegram: failed to download media for message_id=%s", message.id)
             return None
         return Path(result) if result else None
+
+    async def _cleanup_media(self, path: Path | None) -> None:
+        """
+        Удаляет временный скачанный файл после того, как он превращён в
+        текст (описание/транскрипция) — без этого media_cache_dir растёт без
+        ограничения на весь срок жизни процесса (юзербот работает
+        постоянно, а не как разовый скрипт): каждое фото/голосовое/видео-
+        кружок оседало бы на диске навсегда. Не критичная функциональность —
+        сбой удаления не должен ронять обработку сообщения.
+        """
+        if path is None:
+            return
+        try:
+            await aiofiles.os.remove(path)
+        except OSError:
+            logger.debug("telegram: failed to remove cached media file %s", path, exc_info=True)
 
     async def _authorize(self, client: Client, message: PyrogramMessage) -> ChatAccessInfo | None:
         """
