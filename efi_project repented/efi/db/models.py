@@ -52,6 +52,24 @@ CREATE INDEX IF NOT EXISTS idx_proactive_tasks_status_scheduled_at ON proactive_
 CREATE INDEX IF NOT EXISTS idx_proactive_tasks_chat_id ON proactive_tasks (chat_id);
 """
 
+_BELIEFS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS beliefs (
+    topic             TEXT PRIMARY KEY,
+    stance            TEXT NOT NULL,
+    confidence_score  REAL NOT NULL DEFAULT 0.5,
+    origin_date       TEXT NOT NULL
+);
+"""
+
+_CHAT_AFFINITY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_affinity (
+    chat_id       INTEGER PRIMARY KEY,
+    affinity      REAL NOT NULL DEFAULT 0.5,
+    respect_level REAL NOT NULL DEFAULT 0.5,
+    updated_at    TEXT NOT NULL
+);
+"""
+
 
 async def _migration_001_messages(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_MESSAGES_SCHEMA)
@@ -65,11 +83,21 @@ async def _migration_003_proactive_tasks(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_PROACTIVE_TASKS_SCHEMA)
 
 
+async def _migration_004_beliefs(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_BELIEFS_SCHEMA)
+
+
+async def _migration_005_chat_affinity(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_CHAT_AFFINITY_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
     _migration_002_facts,
     _migration_003_proactive_tasks,
+    _migration_004_beliefs,
+    _migration_005_chat_affinity,
 ]
 
 __all__ = ["MIGRATIONS"]

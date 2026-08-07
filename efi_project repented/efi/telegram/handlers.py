@@ -75,6 +75,13 @@ class TelegramEventHandlers:
     efi.behavior.silence_monitor.SilenceMonitor); передана через дак-тайпинг
     (нужен только метод `record_activity(chat_id: int)`), чтобы этот модуль
     не зависел от efi.behavior напрямую.
+
+    `affinity_recorder` — аналогичная необязательная зависимость (обычно
+    efi.behavior.affinity.AffinityTracker; нужен асинхронный метод
+    `record_message(chat_id: int, text: str)`), которым текст реплики
+    классифицируется и сдвигает близость/уважение к чату ДО того, как
+    Worker соберёт по ней системный промпт — иначе сдвиг применился бы
+    постфактум, уже после ответа на это же сообщение.
     """
 
     def __init__(
@@ -87,6 +94,7 @@ class TelegramEventHandlers:
         typing_tracker: TypingTracker | None,
         *,
         activity_recorder: Any | None = None,
+        affinity_recorder: Any | None = None,
         read_receipt_sender: ReadReceiptSender | None = None,
     ) -> None:
         self._manager = manager
@@ -94,6 +102,7 @@ class TelegramEventHandlers:
         self._router = router
         self._media_cache_dir = media_cache_dir
         self._activity_recorder = activity_recorder
+        self._affinity_recorder = affinity_recorder
         self._read_receipt_sender = read_receipt_sender
         self._debouncer: MessageDebouncer[_PendingMessage] = MessageDebouncer(
             self._flush_debounced,
@@ -194,6 +203,9 @@ class TelegramEventHandlers:
 
         if self._activity_recorder is not None:
             self._activity_recorder.record_activity(access_info.chat_id)
+
+        if self._affinity_recorder is not None:
+            await self._affinity_recorder.record_message(access_info.chat_id, text)
 
         if self._read_receipt_sender is not None:
             await self._read_receipt_sender.mark_as_read(access_info.chat_id)

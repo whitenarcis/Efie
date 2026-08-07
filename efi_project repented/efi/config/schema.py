@@ -469,6 +469,32 @@ class MemorySettings(BaseModel):
         return self.diary_dir if self.diary_dir is not None else paths.diary_dir
 
 
+class StateVectorSettings(BaseModel):
+    """
+    Параметры динамического блока текущего состояния личности в системном
+    промпте (efi.prompts.builder._build_state_vector_block). mood и
+    social_distance считаются на лету из efi.memory.beliefs.BeliefStore и
+    efi.behavior.affinity.AffinityTracker — здесь настраивается только текст
+    жёсткой инструкции подавления угодливости, который остаётся неизменным
+    вне зависимости от конкретного mood/social_distance.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    sycophancy_protection_text: str = Field(
+        default=(
+            "Тебе строго запрещено соглашаться с собеседником просто чтобы не спорить, льстить или "
+            "подстраивать мнение под его ожидания. Если ты не согласна — так и скажи, прямо, даже если "
+            "это неприятно. Мгновенная капитуляция в споре без новых веских аргументов — провал "
+            "характера, а не вежливость."
+        ),
+        description="Жёсткая инструкция подавления угодливости — попадает в блок текущего состояния промпта",
+    )
+    relevant_beliefs_limit: int = Field(
+        default=3, ge=1, description="Сколько релевантных убеждений максимум подмешивать в блок состояния"
+    )
+
+
 class Settings(BaseSettings):
     """
     Корневой объект конфигурации приложения.
@@ -501,6 +527,7 @@ class Settings(BaseSettings):
     llm_roles: LLMRolesSettings
     memory: MemorySettings = Field(default_factory=MemorySettings)
     humanizer: HumanizerSettings = Field(default_factory=HumanizerSettings)
+    state_vector: StateVectorSettings = Field(default_factory=StateVectorSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -557,6 +584,7 @@ __all__ = [
     "LLMRolesSettings",
     "MemorySettings",
     "HumanizerSettings",
+    "StateVectorSettings",
     "Settings",
     "get_settings",
 ]

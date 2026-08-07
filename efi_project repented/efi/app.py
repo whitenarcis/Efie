@@ -21,6 +21,8 @@ from datetime import time as dt_time
 
 from pyrogram import Client
 
+from efi.behavior.affinity import AffinityTracker
+from efi.behavior.researcher import BackgroundResearcher
 from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
 from efi.behavior.silence_monitor import SilenceMonitor
 from efi.behavior.spontaneous_ping import SpontaneousPingScheduler
@@ -29,6 +31,7 @@ from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
@@ -48,6 +51,7 @@ from efi.tools.chat_management.join_chat import JoinChatTool
 from efi.tools.chat_management.leave_chat import LeaveChatTool
 from efi.tools.chat_management.search_chats import SearchChatsTool
 from efi.tools.memory_tools.ask_diary import AskDiaryTool
+from efi.tools.memory_tools.manage_belief import UpdateBeliefTool
 from efi.tools.memory_tools.recall_fact import RecallFactTool
 from efi.tools.memory_tools.remember_diary_entry import RememberDiaryEntryTool
 from efi.tools.memory_tools.remember_fact import RememberFactTool
@@ -104,17 +108,40 @@ class EfiApp:
         self._history = SqliteHistoryRepository(self._database)
         self._consolidator = DiaryConsolidator(self._diary, self._llm_router, self._rag)
 
+        # -- субъектность (граф убеждений + близость/уважение) ------------------
+        # Оба — только Database как зависимость, поэтому конструируются здесь,
+        # ДО EfiSystemPromptBuilder (которому оба нужны) и ДО телеграм-обработчиков
+        # (которым нужен AffinityTracker как affinity_recorder).
+        self._beliefs = BeliefStore(self._database)
+        self._affinity = AffinityTracker(self._database)
+
+        # -- инструменты, нужные фоновому исследователю (см. ниже) -------------
+        # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher
+        # должен быть готов ДО SpontaneousPingScheduler (тому нужен его
+        # consume_incubated_thought как incubated_thought_provider).
+        self._web_search_tool = WebSearchTool()
+        self._weather_tool = GetWeatherTool()
+
         # -- промпты -----------------------------------------------------
         templates_dir = settings.paths.base_dir / "efi" / "prompts" / "templates"
         self._prompt_loader = PromptLoader(templates_dir)
-        self._prompt_builder = EfiSystemPromptBuilder(self._prompt_loader, settings, self._rag, self._working_memory)
+        self._prompt_builder = EfiSystemPromptBuilder(
+            self._prompt_loader, settings, self._rag, self._working_memory, self._beliefs, self._affinity
+        )
 
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
         self._silence_monitor = SilenceMonitor(self._notification_manager)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
-        self._spontaneous_ping = SpontaneousPingScheduler(self._notification_manager, self._active_chat_candidates)
+        self._researcher = BackgroundResearcher(
+            templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
+        )
+        self._spontaneous_ping = SpontaneousPingScheduler(
+            self._notification_manager,
+            self._active_chat_candidates,
+            incubated_thought_provider=self._researcher.consume_incubated_thought,
+        )
 
         # -- telegram --------------------------------------------------------
         self._pyrogram_client = Client(
@@ -136,12 +163,11 @@ class EfiApp:
             settings.humanizer,
             self._typing_tracker,
             activity_recorder=self._silence_monitor,
+            affinity_recorder=self._affinity,
             read_receipt_sender=self._telegram_client,
         )
 
-        # -- инструменты -------------------------------------------------
-        self._web_search_tool = WebSearchTool()
-        self._weather_tool = GetWeatherTool()
+        # -- реестр инструментов -------------------------------------------------
         self._tool_registry = ToolRegistry()
         self._tool_registry.register_all(self._build_tools())
 
@@ -151,6 +177,7 @@ class EfiApp:
             RememberFactTool(self._facts),
             RecallFactTool(self._facts),
             RememberDiaryEntryTool(self._rag),
+            UpdateBeliefTool(self._beliefs),
             SendMessageTool(
                 self._telegram_client,
                 anti_repeat=self._anti_repeat,
@@ -213,6 +240,7 @@ class EfiApp:
                 asyncio.create_task(self._scheduler.run(), name="scheduler"),
                 asyncio.create_task(self._silence_monitor.run(), name="silence_monitor"),
                 asyncio.create_task(self._spontaneous_ping.run(), name="spontaneous_ping"),
+                asyncio.create_task(self._researcher.run(), name="background_researcher"),
                 asyncio.create_task(self._prompt_loader.watch(), name="prompt_loader_watch"),
                 asyncio.create_task(self._run_consolidation_loop(), name="diary_consolidation"),
             ]

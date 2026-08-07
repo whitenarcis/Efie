@@ -82,3 +82,12 @@ max_messages_per_burst = 5
 # дефолт (ЙЦУКЕН+QWERTY) в efi/humanizer/typos.py. Пример переопределения:
 # [humanizer.keyboard_neighbors]
 # а = ["к", "е", "в", "п", "с", "м"]
+
+# Блок текущего состояния личности (mood/social_distance/sycophancy_protection,
+# см. efi/prompts/builder.py) — необязательная секция, есть дефолты. Здесь
+# настраивается только жёсткая инструкция подавления угодливости; mood и
+# social_distance считаются на лету из efi/memory/beliefs.py и
+# efi/behavior/affinity.py.
+# [state_vector]
+# sycophancy_protection_text = "..."
+# relevant_beliefs_limit = 3
