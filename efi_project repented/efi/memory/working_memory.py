@@ -164,6 +164,30 @@ class WorkingMemory:
             snapshot.items[index].done = True
             await self.save(snapshot)
 
+    async def find_and_mark_done(self, text_query: str) -> WorkingMemoryItem | None:
+        """
+        Находит первый ОТКРЫТЫЙ пункт, чей текст содержит `text_query`
+        (регистронезависимая подстрока), и помечает его выполненным.
+        Возвращает найденный пункт, либо None, если подходящего не нашлось.
+
+        Текстовый поиск, а не индекс — предназначен для вызова инструментом
+        модели (efi.tools.memory_tools.manage_promises.CompletePromiseTool),
+        которой удобнее сослаться на обещание по смыслу, чем помнить его
+        порядковый номер в списке; для короткого списка из нескольких
+        открытых пунктов точного/подстрочного совпадения достаточно — тот же
+        компромисс "дёшево и без ML", что и у memory/tfidf_fallback.py.
+        """
+        query = text_query.strip().lower()
+        if not query:
+            return None
+        snapshot = await self.load()
+        for item in snapshot.items:
+            if not item.done and query in item.text.lower():
+                item.done = True
+                await self.save(snapshot)
+                return item
+        return None
+
     async def prune(self) -> int:
         """
         Убирает завершённые пункты и те, что не обновлялись дольше `horizon`
