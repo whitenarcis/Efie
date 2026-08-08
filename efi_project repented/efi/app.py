@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
 from typing import Any
 
@@ -46,6 +46,7 @@ from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
 from efi.memory.local_embeddings import LocalEmbeddingEngine
 from efi.memory.people import PeopleStore
+from efi.memory.pulse import MemoryPulse
 from efi.memory.rag import RAGMemory
 from efi.memory.social_memory import SocialInteractionStore
 from efi.memory.tfidf_fallback import TfidfFallbackIndex
@@ -154,13 +155,33 @@ class EfiApp:
         self._social_memory = SocialInteractionStore(self._database, rag=self._rag)
         # Жизненный цикл диалога с посторонними (владелец vs остальные).
         self._lifecycle = ConversationLifecycle(self._database, owner_id=settings.telegram.owner_id)
+        # Пульс памяти — превращает прожитое в воспоминания по ходу дня, а не
+        # раз в сутки ночью. Зависит и от консолидатора, и от журнала внешнего
+        # опыта (тот подмешивается в разбор эпизода), поэтому конструируется
+        # после обоих. См. докстринг efi/memory/pulse.py.
+        pulse_settings = settings.memory_pulse
+        self._memory_pulse = MemoryPulse(
+            self._consolidator,
+            self._history,
+            self._facts,
+            experience=self._social_memory,
+            check_interval_seconds=pulse_settings.check_interval_seconds,
+            episode_idle_seconds=pulse_settings.episode_idle_seconds,
+            max_messages_before_flush=pulse_settings.max_messages_before_flush,
+            min_messages=pulse_settings.min_messages,
+            lookback=timedelta(hours=pulse_settings.lookback_hours),
+        )
 
         # -- инструменты, нужные фоновым исследователям (см. ниже) -------------
         # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher/
         # BackgroundLifeWorker должны быть готовы ДО SpontaneousPingScheduler
         # (тому нужен consume_incubated_thought как incubated_thought_provider)
         # и до телеграм-обработчиков (которым нужен GroqSTT).
-        self._web_search_tool = WebSearchTool()
+        # journal=social_memory: каждый поход в интернет откладывается в
+        # память сразу. Без этого веб-поиск внутри разговора не сохранялся
+        # НИГДЕ — результаты приходят модели TOOL-сообщением, а оно в таблицу
+        # `messages` не пишется (см. SocialInteractionKind.WEB_LOOKUP).
+        self._web_search_tool = WebSearchTool(journal=self._social_memory)
         self._weather_tool = GetWeatherTool()
         # Ключ Groq для STT не дублируется отдельным полем в конфиге — берётся
         # из уже настроенных LLM-эндпоинтов, если явного переопределения нет
@@ -363,6 +384,9 @@ class EfiApp:
             ]
         )
 
+        if self._settings.memory_pulse.enabled:
+            self._background_tasks.append(self._spawn_supervised(self._memory_pulse.run(), name="memory_pulse"))
+
         logger.info("app: started (%d workers, %d background services)", len(self._worker_tasks), len(self._background_tasks))
 
     def _spawn_supervised(self, coro: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
@@ -390,15 +414,19 @@ class EfiApp:
 
     async def _run_consolidation_loop(self) -> None:
         """
-        Программная (не диалоговая) консолидация памяти: автоматическое
-        пополнение дневника из недавней переписки (novelize_recent_history —
-        без него Diary никогда не заполняется сам по себе), dedup
-        существующих записей + сжатие старых записей в мемуары через LLM
-        (см. efi/memory/consolidation.py). Идёт своим отдельным ежедневным
-        расписанием, НЕ через NotificationManager — это обслуживание данных,
-        а не разговорный ответ модели. Дополняет, а не заменяет
-        "nightly_consolidation" ScheduledJob (та даёт личности повод
+        Ночное обслуживание корпуса памяти: подбор хвостов новеллизации,
+        dedup существующих записей + сжатие старых записей в мемуары через
+        LLM (см. efi/memory/consolidation.py). Идёт своим отдельным
+        ежедневным расписанием, НЕ через NotificationManager — это
+        обслуживание данных, а не разговорный ответ модели. Дополняет, а не
+        заменяет "nightly_consolidation" ScheduledJob (та даёт личности повод
         отрефлексировать день в разговорном формате).
+
+        Новеллизация здесь БОЛЬШЕ НЕ ОСНОВНОЙ путь пополнения дневника: по
+        ходу дня её делает efi.memory.pulse.MemoryPulse, эпизодами, сразу
+        после того, как разговор закончился. Ночью остаётся только то, до
+        чего пульс не добрался — чаты, где эпизод так и не закрылся, и, если
+        пульс выключен настройкой, вообще всё за сутки (прежнее поведение).
         """
         try:
             while True:
@@ -407,7 +435,17 @@ class EfiApp:
                 # Новеллизация — ПЕРВОЙ: она создаёт новые записи из дня, а
                 # dedup ниже заодно подчистит и их, если что-то похожее уже
                 # было записано вручную через remember_diary_entry за день.
-                novelized = await self._consolidator.novelize_recent_history(history=self._history, facts=self._facts)
+                # Под общим локом с пульсом: оба пути двигают одну и ту же
+                # отметку last_novelized_at, и без взаимного исключения могли
+                # бы прочитать её одновременно и разобрать одно окно дважды.
+                async with self._memory_pulse.novelization_lock:
+                    novelized = await self._consolidator.novelize_recent_history(
+                        history=self._history,
+                        facts=self._facts,
+                        lookback=timedelta(days=self._settings.memory.novelization_lookback_days),
+                        min_messages=self._settings.memory.novelization_min_messages,
+                        experience=self._social_memory,
+                    )
                 logger.info("app: nightly novelization saved %d new diary entries", novelized)
 
                 removed = await self._consolidator.deduplicate(
