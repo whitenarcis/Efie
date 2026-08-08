@@ -51,6 +51,19 @@ _FINDING_SYSTEM_PROMPT = (
     "так, будто поделилась бы этим в переписке. Не пиши 'по данным поиска' и не перечисляй источники."
 )
 
+#: Второй, отдельный запрос по тем же результатам поиска — ЛИЧНОЕ отношение к
+#: прочитанному. Это то, что превращает дневник из склада выжимок в дневник
+#: прожитого опыта: не только "что узнала", но и "что я об этом думаю и
+#: почувствовала". Без него запись фонового исследования читалась как
+#: справочная карточка, а сама Эфи не могла сослаться на своё впечатление в
+#: разговоре ("я тут вычитала, и меня это, честно, взбесило").
+_REACTION_SYSTEM_PROMPT = (
+    "Ты только что читала материалы в интернете по теме и сделала для себя вывод. Напиши ОДНО короткое "
+    "предложение от первого лица — своё ЛИЧНОЕ отношение к прочитанному: что зацепило, удивило, "
+    "разозлило, показалось бредом или, наоборот, восхитило. Это строчка в твой личный дневник, а не "
+    "оценка для кого-то. Никаких 'важно отметить' и прочей аналитики — только живая реакция."
+)
+
 
 @dataclass(slots=True, frozen=True)
 class InformedThought:
@@ -61,6 +74,10 @@ class InformedThought:
     source_chat_id: int | None
     finding: str
     weight: float
+    #: Личное отношение к прочитанному (см. _REACTION_SYSTEM_PROMPT). Пустая
+    #: строка — штатный случай: реакцию не удалось получить, а находка сама
+    #: по себе всё равно ценна и должна дойти до дневника и до пинга.
+    reaction: str = ""
 
 
 class OrganicPingSink(Protocol):
@@ -87,7 +104,7 @@ class BackgroundLifeWorker:
         organic_ping: OrganicPingSink,
         *,
         check_interval_seconds: float = 1800.0,
-        finding_role: TaskRole = TaskRole.FAST,
+        finding_role: TaskRole = TaskRole.BACKGROUND,
     ) -> None:
         self._curiosity = curiosity
         self._web_search = web_search
@@ -137,9 +154,7 @@ class BackgroundLifeWorker:
         if thought is None:
             return
 
-        entry = await self._rag.remember(
-            f"{AUTONOMOUS_THOUGHT_TAG} {thought.topic}: {thought.finding}", confidence=_FINDING_CONFIDENCE
-        )
+        entry = await self._rag.remember(_render_diary_entry(thought), confidence=_FINDING_CONFIDENCE)
         if entry is not None:
             logger.info("life_engine: researched seed #%s (%r) -> diary entry %s", seed.id, seed.topic, entry.id)
 
@@ -155,23 +170,61 @@ class BackgroundLifeWorker:
         if finding is None:
             return None
 
+        # Личное отношение — вторым запросом, УЖЕ после того, как находка
+        # получена: если этот запрос не удастся, находка всё равно уцелеет
+        # (reaction останется пустой), а не потеряется вместе с ним.
+        reaction = await self._formulate_reaction(seed.topic, search_text, finding)
+
         return InformedThought(
             seed_id=seed.id,
             topic=seed.topic,
             source_chat_id=seed.source_chat_id,
             finding=finding,
             weight=seed.weight,
+            reaction=reaction or "",
         )
 
     async def _formulate_finding(self, topic: str, search_text: str) -> str | None:
-        params = LLMParams(model="", system_prompt=_FINDING_SYSTEM_PROMPT, max_output_tokens=256)
-        session = Session(messages=[Message(role=Role.USER, content=f"Тема: {topic}\n\n{search_text}")])
+        return await self._ask(
+            _FINDING_SYSTEM_PROMPT, f"Тема: {topic}\n\n{search_text}", what="finding", topic=topic
+        )
+
+    async def _formulate_reaction(self, topic: str, search_text: str, finding: str) -> str | None:
+        return await self._ask(
+            _REACTION_SYSTEM_PROMPT,
+            f"Тема: {topic}\n\nЧто ты вычитала:\n{search_text}\n\nТвой вывод: {finding}",
+            what="reaction",
+            topic=topic,
+            max_output_tokens=128,
+        )
+
+    async def _ask(
+        self, system_prompt: str, user_content: str, *, what: str, topic: str, max_output_tokens: int = 256
+    ) -> str | None:
+        """Один короткий запрос к фоновой роли; сбой — не исключение наружу, а None (цикл жизни не должен падать)."""
+        params = LLMParams(model="", system_prompt=system_prompt, max_output_tokens=max_output_tokens)
+        session = Session(messages=[Message(role=Role.USER, content=user_content)])
         try:
             response = await self._router.chat(self._finding_role, params, session)
         except LLMError as exc:
-            logger.warning("life_engine: finding formulation for %r failed: %s", topic, exc)
+            logger.warning("life_engine: %s formulation for %r failed: %s", what, topic, exc)
             return None
         return response.text.strip() or None
+
+
+def _render_diary_entry(thought: InformedThought) -> str:
+    """
+    Запись в дневник о прожитом фоновом опыте, а не выжимка из статьи.
+
+    Формат намеренно повествовательный ("читала про X ... поняла ... и меня
+    это ..."), потому что эта же запись потом находится RAG-поиском и
+    подмешивается в системный промпт: из неё Эфи должна суметь сослаться на
+    свой опыт живой фразой ("я тут вычитала про X"), а не зачитать карточку.
+    """
+    parts = [f"{AUTONOMOUS_THOUGHT_TAG} Читала сегодня про {thought.topic}. {thought.finding}"]
+    if thought.reaction:
+        parts.append(thought.reaction)
+    return " ".join(parts)
 
 
 def _make_research_context(topic: str) -> ToolContext:

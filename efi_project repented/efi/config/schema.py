@@ -81,6 +81,10 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = _PACKAGE_ROOT.parent
 _DEFAULT_TOML_PATH = PROJECT_ROOT / "behavior.toml"
 
+#: По этой подстроке в base_url эндпоинта опознаётся Groq — чтобы переиспользовать
+#: уже настроенный ключ для STT вместо дублирования секрета (Settings.resolve_groq_api_key).
+_GROQ_HOST_MARKER = "api.groq.com"
+
 # Маркеры внешнего хранилища Android, которое Termux иногда монтирует в режиме,
 # не поддерживающем sqlite journal/WAL-файлы (известная проблема: readonly database).
 _TERMUX_READONLY_MARKERS = ("/sdcard", "/mnt/sdcard", "/storage/emulated")
@@ -253,16 +257,29 @@ class TaskRole(str, Enum):
     """
     Роль задачи, под которую подбирается модель.
 
-    Основной провайдер инфраструктуры — OmniRoute; три роли ниже разделяют
-    задачи разной "тяжести" и стоимости, чтобы не гонять всё через одну модель:
+    РЕГЛАМЕНТ РОЛЕЙ (строгий — не смешивать):
+        MAIN       — ТОЛЬКО живой диалог в чате. Единственная роль на
+                     критическом пути ответа собеседнику, поэтому под неё
+                     ставится самая БЫСТРАЯ пригодная модель, а не самая
+                     "умная": человек ждёт ответа в реальном времени.
+        FAST       — быстрые служебные вызовы вне критического пути
+                     (эмбеддинги-фолбэк, короткая классификация).
+        BACKGROUND — фоновая жизнь Эфи: новеллизация дневника, извлечение
+                     фактов, гипотезы фоновых исследований, находки
+                     BackgroundLifeWorker, проактивные проверки. Никто не
+                     ждёт этих ответов в чате, поэтому здесь допустимы
+                     большие таймауты и более медленные модели.
+        VISION     — отдельная мультимодальная модель: описание картинок,
+                     транскрипция голосовых/видео-кружков.
     """
 
-    #: Тяжёлая модель для диалога и формирования личности Эфи.
+    #: Живой диалог в чате — и больше ничего (см. регламент выше).
     MAIN = "main"
-    #: Лёгкая/быстрая модель для роутинга интентов, фоновой суммаризации, работы с памятью/дневником
-    #: (например, Groq, либо облегчённая модель на том же OmniRoute).
+    #: Быстрые служебные вызовы вне критического пути ответа.
     FAST = "fast"
-    #: Модель для обработки медиа (vision) или прочих служебных задач.
+    #: Фоновая жизнь: дневник, факты, исследования, проактивные проверки.
+    BACKGROUND = "background"
+    #: Мультимодальная модель: картинки, голосовые, видео-кружки.
     VISION = "vision"
 
 
@@ -287,14 +304,22 @@ class RoleRoute(BaseModel):
 
 class LLMRolesSettings(BaseModel):
     """
-    Конфигурация всех трёх ролей LLM разом — единая точка входа для сборки LLMRouter.
+    Конфигурация всех ролей LLM разом — единая точка входа для сборки LLMRouter.
+    Разделение задач по ролям — см. регламент в докстринге `TaskRole`.
 
     Типичная схема при основном провайдере OmniRoute:
-        main.primary    -> OmniRoute, тяжёлая модель личности
-        main.fallback   -> Groq (или облегчённая модель OmniRoute) на случай 429/5xx
-        main.degrade_to -> TaskRole.FAST, как крайний случай
-        fast.primary    -> Groq — быстрый роутинг/суммаризация/работа с дневником
-        vision.primary  -> OmniRoute (или другой провайдер) с vision-моделью
+        main.primary       -> самая БЫСТРАЯ пригодная модель (живой диалог)
+        main.fallback      -> запасная модель на случай 429/5xx/таймаута
+        main.degrade_to    -> TaskRole.FAST, как крайний случай
+        fast.primary       -> быстрая служебная модель
+        background.primary -> модель фоновой жизни (дневник/факты/исследования)
+        vision.primary     -> мультимодальная модель
+
+    `background` необязателен: если он не задан, роль BACKGROUND использует
+    маршрут FAST. Так регламент ролей остаётся строгим на уровне кода (фоновые
+    потребители всегда просят именно BACKGROUND и физически не могут занять
+    канал живого диалога), но конфигурация не обязана заводить отдельный
+    эндпоинт, пока в этом нет нужды.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -302,12 +327,14 @@ class LLMRolesSettings(BaseModel):
     main: RoleRoute
     fast: RoleRoute
     vision: RoleRoute
+    background: RoleRoute | None = None
 
     def as_routes(self) -> dict[TaskRole, RoleRoute]:
         """Приводит конфигурацию к виду, который принимает конструктор `LLMRouter`."""
         return {
             TaskRole.MAIN: self.main,
             TaskRole.FAST: self.fast,
+            TaskRole.BACKGROUND: self.background if self.background is not None else self.fast,
             TaskRole.VISION: self.vision,
         }
 
@@ -517,19 +544,26 @@ class StateVectorSettings(BaseModel):
 
 class SttSettings(BaseModel):
     """
-    Настройки распознавания речи. `groq_api_key` — необязательное поле:
-    если не задано, efi.telegram.handlers.TelegramEventHandlers.GroqSTT
-    просто не конструируется в app.py, и голосовые/видео-кружки идут по
-    прежнему пути через LLMRouter (роль VISION) — та же логика "готово, но
-    подключается только при наличии конфигурации", что и у
-    GenerateImageTool/GenerateVoiceTool (см. efi/app.py).
+    Настройки распознавания речи.
+
+    `groq_api_key` — необязательное поле-ПЕРЕОПРЕДЕЛЕНИЕ. Обычно задавать его
+    не нужно: ключ Groq, как правило, уже прописан в behavior.toml как
+    api_key одного из LLM-эндпоинтов (роль VISION часто и есть Groq), и
+    дублировать один и тот же секрет во второй раз — лишний источник
+    расхождений (поменял в одном месте, забыл в другом → STT молча
+    перестал работать). Settings.resolve_groq_api_key() сначала смотрит
+    сюда, а если пусто — сам находит ключ среди уже настроенных
+    LLM-эндпоинтов, указывающих на api.groq.com.
     """
 
     model_config = ConfigDict(frozen=True)
 
     groq_api_key: SecretStr | None = Field(
         default=None,
-        description="API-ключ Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT, whisper-large-v3)",
+        description=(
+            "Явное переопределение ключа Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT, "
+            "whisper-large-v3). Обычно не нужно — ключ подхватывается из llm_roles, см. resolve_groq_api_key()"
+        ),
     )
 
 
@@ -698,6 +732,25 @@ class Settings(BaseSettings):
     def build_router(self, **router_kwargs: Any) -> "LLMRouter":
         """Шорткат: `settings.build_router()` эквивалентно `settings.llm_roles.build_router()`."""
         return self.llm_roles.build_router(**router_kwargs)
+
+    def resolve_groq_api_key(self) -> SecretStr | None:
+        """
+        Ключ Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT).
+
+        Приоритет: явное переопределение `stt.groq_api_key`, иначе — первый
+        ключ среди уже настроенных LLM-эндпоинтов, чей base_url указывает на
+        Groq. Так один и тот же секрет не нужно дублировать в конфиге дважды
+        (см. докстринг SttSettings): достаточно того, что он уже прописан
+        как api_key нужного эндпоинта в llm_roles.
+        """
+        if self.stt.groq_api_key is not None:
+            return self.stt.groq_api_key
+
+        for route in self.llm_roles.as_routes().values():
+            for endpoint in (route.primary, route.fallback):
+                if endpoint is not None and _GROQ_HOST_MARKER in endpoint.base_url:
+                    return endpoint.api_key
+        return None
 
 
 @lru_cache(maxsize=1)

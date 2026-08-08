@@ -45,6 +45,7 @@ import logging
 from typing import Any, Protocol
 
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.telegram.client import UnknownChatError
 from efi.tools.base import Tool, ToolContext
 
 logger = logging.getLogger(__name__)
@@ -129,12 +130,20 @@ class SendMessageTool(Tool):
 
         reply_to_message_id = self._resolve_reply_target(arguments, context)
         llm_generation_time = context.extra.get("llm_generation_time")
-        await self._sender.send_message(
-            context.chat_id,
-            text,
-            reply_to_message_id=reply_to_message_id,
-            llm_generation_time=llm_generation_time,
-        )
+        try:
+            await self._sender.send_message(
+                context.chat_id,
+                text,
+                reply_to_message_id=reply_to_message_id,
+                llm_generation_time=llm_generation_time,
+            )
+        except UnknownChatError:
+            # Штатная ситуация, а не сбой: этот аккаунт не видит такой чат
+            # (никогда в нём не был, его удалили, Эфи оттуда вышли). Раньше
+            # сюда прилетал сырой KeyError из недр Pyrogram и ToolRegistry
+            # печатал полный трейсбек как ERROR на каждой попытке пинга.
+            logger.warning("send_message: chat_id=%s is unreachable, dropping the message", context.chat_id)
+            return "error: this chat is not reachable — do not retry sending here"
 
         if self._anti_repeat is not None:
             self._anti_repeat.record(context.chat_id, text)

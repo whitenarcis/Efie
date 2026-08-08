@@ -83,6 +83,23 @@ CREATE INDEX IF NOT EXISTS idx_curiosity_seeds_status_weight ON curiosity_seeds 
 """
 
 
+_PEOPLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS people (
+    user_id        INTEGER PRIMARY KEY,               -- Telegram user_id, а не chat_id
+    display_name   TEXT NOT NULL DEFAULT '',
+    affinity       REAL NOT NULL DEFAULT 0.5,
+    respect_level  REAL NOT NULL DEFAULT 0.5,
+    message_count  INTEGER NOT NULL DEFAULT 0,
+    first_seen_at  TEXT NOT NULL,
+    last_seen_at   TEXT NOT NULL,
+    last_chat_id   INTEGER,                           -- где видела в последний раз
+    last_chat_title TEXT,                             -- NULL для лички
+    impression     TEXT NOT NULL DEFAULT ''           -- сформированное отношение, свободный текст
+);
+CREATE INDEX IF NOT EXISTS idx_people_last_seen ON people (last_seen_at DESC);
+"""
+
+
 async def _migration_001_messages(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_MESSAGES_SCHEMA)
 
@@ -107,6 +124,10 @@ async def _migration_006_curiosity_seeds(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_CURIOSITY_SEEDS_SCHEMA)
 
 
+async def _migration_007_people(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_PEOPLE_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -115,6 +136,7 @@ MIGRATIONS = [
     _migration_004_beliefs,
     _migration_005_chat_affinity,
     _migration_006_curiosity_seeds,
+    _migration_007_people,
 ]
 
 __all__ = ["MIGRATIONS"]

@@ -26,6 +26,7 @@ from pathlib import Path
 
 from pyrogram import Client
 from pyrogram.enums import ChatAction
+from pyrogram.errors import RPCError
 from pyrogram.types import Message as PyrogramMessage
 
 from efi.config.schema import HumanizerSettings
@@ -36,6 +37,23 @@ from efi.humanizer.typos import inject_typo
 logger = logging.getLogger(__name__)
 
 _SELF_CORRECT_DELAY_RANGE = (0.8, 2.5)
+
+
+class UnknownChatError(RuntimeError):
+    """
+    Чат недоступен этому аккаунту: Pyrogram не смог резолвить peer даже
+    после прогрева через get_chat (см. TelegramClientWrapper.ensure_peer_known).
+
+    Отдельный доменный тип, а не сырой KeyError/PeerIdInvalid из недр
+    Pyrogram: efi.tools.registry.ToolRegistry логирует любое исключение
+    инструмента полным трейсбеком как ERROR, из-за чего штатная ситуация
+    "этот чат нам недоступен" выглядела в логах как краш. По этому типу
+    вызывающая сторона может отличить её от настоящей ошибки.
+    """
+
+    def __init__(self, chat_id: int) -> None:
+        super().__init__(f"chat_id={chat_id} is unknown or unreachable for this account")
+        self.chat_id = chat_id
 
 
 class TelegramClientWrapper:
@@ -60,6 +78,37 @@ class TelegramClientWrapper:
     async def start(self) -> None:
         await self._client.start()
         logger.info("telegram: client started")
+
+    async def ensure_peer_known(self, chat_id: int) -> bool:
+        """
+        Гарантирует, что Pyrogram умеет резолвить `chat_id` в peer, и
+        возвращает, удалось ли это.
+
+        Зачем: Pyrogram резолвит chat_id через СВОЙ локальный storage сессии.
+        Для чата, который этот аккаунт ещё не "видел" в текущей сессии,
+        resolve_peer падает `KeyError: 'ID not found: ...'` (или
+        PeerIdInvalid) — а поскольку это происходит внутри send_message,
+        наружу летел сырой трейсбек через tool_registry ("tool
+        send_telegram_message raised during execute()"). Один вызов
+        get_chat() прогревает кэш пиров и снимает проблему на все
+        последующие обращения к этому чату.
+
+        Ошибку НЕ пробрасывает: недоступный чат (бота выкинули из группы,
+        чат удалён) — штатная ситуация, вызывающая сторона по False сама
+        решит, что делать, вместо разбора исключений Pyrogram.
+        """
+        try:
+            await self._client.resolve_peer(chat_id)
+            return True
+        except (KeyError, ValueError, RPCError):
+            logger.debug("telegram: peer for chat_id=%s is not cached yet, warming it up via get_chat", chat_id)
+
+        try:
+            await self._client.get_chat(chat_id)
+        except (KeyError, ValueError, RPCError) as exc:
+            logger.warning("telegram: chat_id=%s is not reachable for this account (%s)", chat_id, exc)
+            return False
+        return True
 
     async def stop(self) -> None:
         await self._client.stop()
@@ -107,6 +156,12 @@ class TelegramClientWrapper:
         if not chunks:
             logger.debug("telegram: send_message called with empty text for chat_id=%s, nothing to send", chat_id)
             return
+
+        # Прогреваем peer ДО симуляции печати: иначе весь typing/WPM-цикл
+        # отрабатывал бы впустую, а падение случалось бы уже на самой
+        # отправке — сырым KeyError наружу через ToolRegistry.
+        if not await self.ensure_peer_known(chat_id):
+            raise UnknownChatError(chat_id)
 
         for index, chunk in enumerate(chunks):
             humanized_chunk = inject_typo(chunk, self._humanizer_settings)

@@ -31,26 +31,42 @@ can_leave_chats = true
 # Основной провайдер инфраструктуры — OmniRoute; три роли (MAIN/FAST/VISION)
 # покрывают задачи разной "тяжести". См. efi/config/schema.py::LLMRolesSettings.
 
+# MAIN — ТОЛЬКО живой диалог в чате. Gemma здесь первой сознательно: она
+# заметно быстрее отвечает, а задержка ответа собеседнику критичнее качества
+# фоновой аналитики. nemotron оставлен резервом (он регулярно упирался в
+# таймаут 15с, из-за чего ответ уходил на второй круг по цепочке).
 [llm_roles.main]
 degrade_to = "fast"
 
 [llm_roles.main.primary]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "REPLACEME"
-model = "ollamacloud/nemotron-3-super"
+model = "ollamacloud/gemma4:31b"
 timeout_seconds = 15.0
 
 [llm_roles.main.fallback]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "REPLACEME"
-model = "ollamacloud/gemma4:31b"
+model = "ollamacloud/nemotron-3-super"
 timeout_seconds = 15.0
 
+# FAST — быстрые служебные вызовы вне критического пути ответа.
 [llm_roles.fast.primary]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "REPLACEME"
 model = "ollamacloud/minimax-m3"
 timeout_seconds = 15.0
+
+# BACKGROUND — фоновая жизнь: новеллизация дневника, извлечение фактов,
+# гипотезы/находки фоновых исследований, проактивные проверки. Секция
+# необязательная: если её не задать, роль автоматически использует маршрут
+# FAST (см. LLMRolesSettings.as_routes). Здесь таймаут заведомо больше —
+# эти задачи никого не заставляют ждать в чате.
+[llm_roles.background.primary]
+base_url = "https://omnigoy.mooo.com/v1"
+api_key = "REPLACEME"
+model = "ollamacloud/minimax-m3"
+timeout_seconds = 45.0
 
 [llm_roles.vision.primary]
 base_url = "https://api.groq.com/openai/v1"

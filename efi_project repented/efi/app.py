@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Coroutine
 from datetime import datetime, timezone
 from datetime import time as dt_time
+from typing import Any
 
 from pyrogram import Client
 
@@ -42,6 +44,7 @@ from efi.memory.consolidation import DiaryConsolidator
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
 from efi.memory.local_embeddings import LocalEmbeddingEngine
+from efi.memory.people import PeopleStore
 from efi.memory.rag import RAGMemory
 from efi.memory.tfidf_fallback import TfidfFallbackIndex
 from efi.memory.working_memory import WorkingMemory
@@ -62,6 +65,7 @@ from efi.tools.memory_tools.manage_promises import CompletePromiseTool, Remember
 from efi.tools.memory_tools.recall_fact import RecallFactTool
 from efi.tools.memory_tools.remember_diary_entry import RememberDiaryEntryTool
 from efi.tools.memory_tools.remember_fact import RememberFactTool
+from efi.tools.memory_tools.remember_person import RememberPersonTool
 from efi.tools.memory_tools.update_self_state import UpdateSelfStateTool
 from efi.tools.registry import ToolRegistry
 from efi.tools.system_tools.device import GetBatteryStatusTool, TriggerVibrationTool
@@ -132,6 +136,11 @@ class EfiApp:
         self._beliefs = BeliefStore(self._database)
         self._affinity = AffinityTracker(self._database)
         self._curiosity = CuriosityTracker(self._database)
+        # Социальная память по КОНКРЕТНЫМ людям (в группе chat_id общий,
+        # а собеседники разные) — см. efi/memory/people.py. Зависит от
+        # BeliefStore: устойчивое отношение к человеку перетекает в общую
+        # матрицу убеждений, поэтому конструируется ПОСЛЕ него.
+        self._people = PeopleStore(self._database, beliefs=self._beliefs)
 
         # -- инструменты, нужные фоновым исследователям (см. ниже) -------------
         # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher/
@@ -140,15 +149,23 @@ class EfiApp:
         # и до телеграм-обработчиков (которым нужен GroqSTT).
         self._web_search_tool = WebSearchTool()
         self._weather_tool = GetWeatherTool()
-        self._stt = (
-            GroqSTT(settings.stt.groq_api_key.get_secret_value()) if settings.stt.groq_api_key is not None else None
-        )
+        # Ключ Groq для STT не дублируется отдельным полем в конфиге — берётся
+        # из уже настроенных LLM-эндпоинтов, если явного переопределения нет
+        # (см. Settings.resolve_groq_api_key и докстринг SttSettings).
+        groq_api_key = settings.resolve_groq_api_key()
+        self._stt = GroqSTT(groq_api_key.get_secret_value()) if groq_api_key is not None else None
 
         # -- промпты -----------------------------------------------------
         templates_dir = settings.paths.base_dir / "efi" / "prompts" / "templates"
         self._prompt_loader = PromptLoader(templates_dir)
         self._prompt_builder = EfiSystemPromptBuilder(
-            self._prompt_loader, settings, self._rag, self._working_memory, self._beliefs, self._affinity
+            self._prompt_loader,
+            settings,
+            self._rag,
+            self._working_memory,
+            self._beliefs,
+            self._affinity,
+            self._people,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -210,6 +227,7 @@ class EfiApp:
             affinity_recorder=self._affinity,
             curiosity_recorder=self._curiosity,
             organic_ping_recorder=self._organic_ping,
+            people_recorder=self._people,
             stt=self._stt,
         )
 
@@ -227,6 +245,7 @@ class EfiApp:
             UpdateSelfStateTool(self._working_memory),
             RememberPromiseTool(self._working_memory),
             CompletePromiseTool(self._working_memory),
+            RememberPersonTool(self._people),
             SendMessageTool(
                 self._telegram_client,
                 anti_repeat=self._anti_repeat,
@@ -296,17 +315,40 @@ class EfiApp:
 
         self._background_tasks.extend(
             [
-                asyncio.create_task(self._scheduler.run(), name="scheduler"),
-                asyncio.create_task(self._silence_monitor.run(), name="silence_monitor"),
-                asyncio.create_task(self._spontaneous_ping.run(), name="spontaneous_ping"),
-                asyncio.create_task(self._researcher.run(), name="background_researcher"),
-                asyncio.create_task(self._life_engine.run(), name="life_engine"),
-                asyncio.create_task(self._prompt_loader.watch(), name="prompt_loader_watch"),
-                asyncio.create_task(self._run_consolidation_loop(), name="diary_consolidation"),
+                self._spawn_supervised(self._scheduler.run(), name="scheduler"),
+                self._spawn_supervised(self._silence_monitor.run(), name="silence_monitor"),
+                self._spawn_supervised(self._spontaneous_ping.run(), name="spontaneous_ping"),
+                self._spawn_supervised(self._researcher.run(), name="background_researcher"),
+                self._spawn_supervised(self._life_engine.run(), name="life_engine"),
+                self._spawn_supervised(self._prompt_loader.watch(), name="prompt_loader_watch"),
+                self._spawn_supervised(self._run_consolidation_loop(), name="diary_consolidation"),
             ]
         )
 
         logger.info("app: started (%d workers, %d background services)", len(self._worker_tasks), len(self._background_tasks))
+
+    def _spawn_supervised(self, coro: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
+        """
+        Создаёт фоновую задачу с логированием её падения В МОМЕНТ падения.
+
+        Голый asyncio.create_task() для долгоживущего сервиса — тихая дыра:
+        если корутина упадёт (сбой БД, баг в цикле), задача просто перестаёт
+        существовать, а исключение всплывает либо на shutdown при gather(),
+        либо вообще только сборщиком мусора как "Task exception was never
+        retrieved". С точки зрения наблюдателя фоновый сервис молча
+        переставал работать, и в логах на этот счёт не было ничего.
+        """
+
+        def _log_failure(task: asyncio.Task[None]) -> None:
+            if task.cancelled():
+                return
+            exception = task.exception()
+            if exception is not None:
+                logger.error("app: background task %r died", name, exc_info=exception)
+
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(_log_failure)
+        return task
 
     async def _run_consolidation_loop(self) -> None:
         """

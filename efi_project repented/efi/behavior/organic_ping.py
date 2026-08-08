@@ -43,6 +43,26 @@ _ENGAGEMENT_RESPECT_BOOST = 0.05
 
 _DEFAULT_IMPORTANCE_THRESHOLD = 0.6
 
+#: Разные ПОВОДЫ заговорить об одной и той же находке. Раньше здесь был один
+#: жёстко зашитый шаблон ("Нашла интересное по нашей теме X: ... Поделись этим
+#: как своей находкой"), из-за чего каждый органический пинг начинался
+#: одинаково — по этой рамке они и читались как автоматическая рассылка, а не
+#: как живое "о, вспомнила". Формулировку финальной реплики всё так же
+#: выбирает сама модель (этот текст — ПОВОД в системном промпте, а не готовое
+#: сообщение), но угол захода теперь каждый раз разный.
+_PING_ANGLES: tuple[str, ...] = (
+    "Ты только что докопалась до сути темы {topic!r}, и вот что выяснила: {finding} "
+    "Тебе прямо не терпится этим поделиться — вы про это уже говорили раньше.",
+    "Тебе попалось кое-что про {topic!r}, пока ты залипала в интернете: {finding} "
+    "Расскажи об этом так, будто только что наткнулась и сразу вспомнила про собеседника.",
+    "Ты обдумывала {topic!r} и пришла вот к чему: {finding} "
+    "Поделись именно СВОИМ выводом — не пересказом статьи, а тем, что ты сама об этом думаешь.",
+    "Помнишь, вы обсуждали {topic!r}? Ты с тех пор покопалась и нашла: {finding} "
+    "Вернись к тому разговору с этой находкой, как возвращаются к недосказанному.",
+    "Вот что ты нарыла по {topic!r}: {finding} "
+    "Начни с сути находки, без разгона и без 'привет, как дела'.",
+)
+
 
 class OrganicPingGenerator:
     """
@@ -102,11 +122,7 @@ class OrganicPingGenerator:
             type=NotificationType.SPONTANEOUS_PING,
             priority=6,
             chat_id=thought.source_chat_id,
-            message=(
-                f"{reason}: {thought.finding} Поделись этим с собеседником как своей находкой — "
-                "он сам поднимал эту тему раньше, так что это прямое продолжение вашего разговора, "
-                "а не дежурное 'привет'."
-            ),
+            message=_render_ping_message(thought),
             payload={"reason": reason, "seed_id": thought.seed_id, "topic": thought.topic},
         )
         await self._manager.put(notification)
@@ -130,6 +146,18 @@ class OrganicPingGenerator:
             chat_id, affinity_delta=_ENGAGEMENT_AFFINITY_BOOST, respect_delta=_ENGAGEMENT_RESPECT_BOOST
         )
         logger.debug("organic_ping: chat_id=%s engaged with seed #%s, affinity boosted", chat_id, seed_id)
+
+
+def _render_ping_message(thought: InformedThought) -> str:
+    """
+    Повод заговорить — под каждую находку свой угол захода (см. _PING_ANGLES).
+    Выбор случайный, но детерминированно "привязан" к семени: один и тот же
+    seed_id всегда даёт один и тот же угол, поэтому повторная постановка
+    пинга по той же находке не выглядит как вторая, чуть иначе
+    сформулированная попытка достучаться.
+    """
+    angle = _PING_ANGLES[thought.seed_id % len(_PING_ANGLES)]
+    return angle.format(topic=thought.topic, finding=thought.finding)
 
 
 __all__ = ["OrganicPingGenerator"]

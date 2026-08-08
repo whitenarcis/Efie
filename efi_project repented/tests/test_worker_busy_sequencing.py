@@ -9,9 +9,11 @@ TYPING-пульсом) -> llm_generation_time в ToolContext.extra, и (регр
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import pytest
 
+from efi.behavior.busy_engine import BusyDecision
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMServerError
 from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session, ToolCall, ToolCallFunction
@@ -24,13 +26,14 @@ from efi.tools.telegram_actions.send_message import SendMessageTool
 
 
 class _FakeBusyEngine:
-    def __init__(self, delay: float = 0.0) -> None:
+    def __init__(self, delay: float = 0.0, *, is_active_conversation: bool = False) -> None:
         self.delay = delay
+        self.is_active_conversation = is_active_conversation
         self.calls: list[int | None] = []
 
-    async def compute_ignore_delay(self, chat_id: int | None) -> float:
+    async def decide(self, chat_id: int | None) -> BusyDecision:
         self.calls.append(chat_id)
-        return self.delay
+        return BusyDecision(delay_seconds=self.delay, is_active_conversation=self.is_active_conversation)
 
 
 class _FakeHistoryRepository:
@@ -122,6 +125,66 @@ async def test_user_message_marks_as_read_after_busy_delay_and_before_llm() -> N
     assert busy_engine.calls == [42]
     assert events.index("mark_as_read") < events.index("build_prompt") < events.index("llm_chat")
     assert telegram.typing_calls >= 1
+
+
+async def test_active_conversation_marks_as_read_before_any_delay() -> None:
+    """
+    Регрессия: внутри уже идущего разговора сообщение не должно "висеть"
+    непрочитанным на время задержки — Эфи и так смотрит в этот чат. Отметка
+    прочитанного обязана уйти ДО сна busy-задержки, а не после.
+    """
+    events: list[str] = []
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    # Заметная задержка + активный разговор: если бы mark_as_read шёл после
+    # сна, тест занял бы эти секунды и порядок событий был бы другим.
+    busy_engine = _FakeBusyEngine(5.0, is_active_conversation=True)
+    worker = Worker(
+        0,
+        manager,
+        llm_router=_FakeLLMRouter(events),  # type: ignore[arg-type]
+        tool_registry=ToolRegistry(),
+        history=_FakeHistoryRepository(),
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    read_at_start = asyncio.create_task(worker._handle(notification))
+    await asyncio.sleep(0.05)  # заведомо меньше busy-задержки в 5с
+    assert "mark_as_read" in events, "внутри активного разговора читать надо сразу, не дожидаясь задержки"
+
+    read_at_start.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await read_at_start
+
+
+async def test_inactive_chat_still_marks_as_read_only_after_the_delay() -> None:
+    """Первое сообщение после паузы — прежнее поведение: сначала задержка, только потом 'прочитано'."""
+    events: list[str] = []
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    busy_engine = _FakeBusyEngine(5.0, is_active_conversation=False)
+    worker = Worker(
+        0,
+        manager,
+        llm_router=_FakeLLMRouter(events),  # type: ignore[arg-type]
+        tool_registry=ToolRegistry(),
+        history=_FakeHistoryRepository(),
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    task = asyncio.create_task(worker._handle(notification))
+    await asyncio.sleep(0.05)
+    assert "mark_as_read" not in events, "без активного разговора отметка должна ждать окончания задержки"
+
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
 
 
 async def test_non_user_message_does_not_mark_as_read() -> None:

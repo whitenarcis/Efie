@@ -109,6 +109,12 @@ class TelegramEventHandlers:
     `handle_reply(chat_id: int)`), которым отмечается, что собеседник
     ответил в чате, где недавно был органический пинг.
 
+    `people_recorder` — аналогичный необязательный дак-тайпинг (обычно
+    efi.memory.people.PeopleStore; асинхронный метод `record_message(user_id,
+    text, *, display_name, chat_id, chat_title)`), которым ведётся учёт
+    КОНКРЕТНЫХ людей: в группе за одним chat_id стоят разные собеседники, и
+    без этого их вклад сваливался бы в общий счётчик близости чата.
+
     `stt` — необязательный efi.media.stt_groq.GroqSTT: если задан, голосовые
     и видео-кружки транскрибируются им в первую очередь (см. `_transcribe_audio`),
     с откатом на LLMRouter, если Groq не настроен или вернул пустой результат.
@@ -127,6 +133,7 @@ class TelegramEventHandlers:
         affinity_recorder: Any | None = None,
         curiosity_recorder: Any | None = None,
         organic_ping_recorder: Any | None = None,
+        people_recorder: Any | None = None,
         stt: GroqSTT | None = None,
     ) -> None:
         self._manager = manager
@@ -137,6 +144,7 @@ class TelegramEventHandlers:
         self._affinity_recorder = affinity_recorder
         self._curiosity_recorder = curiosity_recorder
         self._organic_ping_recorder = organic_ping_recorder
+        self._people_recorder = people_recorder
         self._stt = stt
         self._debouncer: MessageDebouncer[_PendingMessage] = MessageDebouncer(
             self._flush_debounced,
@@ -356,6 +364,18 @@ class TelegramEventHandlers:
         if self._organic_ping_recorder is not None:
             await self._organic_ping_recorder.handle_reply(access_info.chat_id)
 
+        # Учёт КОНКРЕТНОГО человека, а не чата: в группе за одним chat_id
+        # стоят разные люди, и без этого их вклад сваливался бы в общий
+        # счётчик близости (см. efi/memory/people.py).
+        if self._people_recorder is not None and message.from_user is not None:
+            await self._people_recorder.record_message(
+                message.from_user.id,
+                text,
+                display_name=message.from_user.first_name or "",
+                chat_id=access_info.chat_id,
+                chat_title=message.chat.title if message.chat is not None else None,
+            )
+
         await self._debouncer.add(
             access_info.chat_id,
             _PendingMessage(message=message, text=text, payload=payload or {}),
@@ -445,6 +465,9 @@ def _build_chat_context(message: PyrogramMessage) -> dict[str, Any]:
         "chat_type": chat.type.name if chat.type else None,
         "chat_title": chat.title,
         "sender_name": sender_name,
+        # user_id отправителя — ключ социальной памяти по КОНКРЕТНЫМ людям
+        # (efi/memory/people.py): в группе chat_id общий, а человек разный.
+        "sender_id": message.from_user.id if message.from_user else None,
     }
 
 

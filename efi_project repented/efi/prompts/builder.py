@@ -60,9 +60,10 @@ from efi.behavior.affinity import (
 from efi.config.schema import LockdownMode, Settings
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
 from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
+from efi.memory.people import PeopleStore, PersonProfile
 from efi.memory.rag import RAGMemory
 from efi.memory.working_memory import WorkingMemory, WorkingMemorySnapshot
-from efi.notifications.schemas import Notification
+from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
 
@@ -123,6 +124,12 @@ _TIME_OF_DAY_BOUNDARIES: tuple[tuple[int, int, str], ...] = (
 
 _GROUP_CHAT_TYPES = ("GROUP", "SUPERGROUP")
 
+#: Типы уведомлений, где Эфи пишет ПЕРВОЙ, без реплики собеседника —
+#: для них включается жёсткое ограничение длины (см. _build_proactive_brevity_block).
+_PROACTIVE_NOTIFICATION_TYPES = frozenset(
+    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING, NotificationType.FOLLOW_UP}
+)
+
 
 class _SafeFormatDict(dict[str, str]):
     """Для .format_map(): плейсхолдеры без данных остаются в тексте как есть, вместо KeyError."""
@@ -147,6 +154,7 @@ class EfiSystemPromptBuilder:
         working_memory: WorkingMemory,
         beliefs: BeliefStore,
         affinity: AffinityTracker,
+        people: PeopleStore | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -154,6 +162,7 @@ class EfiSystemPromptBuilder:
         self._working_memory = working_memory
         self._beliefs = beliefs
         self._affinity = affinity
+        self._people = people
 
     async def build(self, notification: Notification, history: Session) -> str:
         """
@@ -173,9 +182,17 @@ class EfiSystemPromptBuilder:
             notification.message, limit=self._settings.state_vector.relevant_beliefs_limit
         )
         affinity_task = self._resolve_affinity_snapshot(notification)
+        person_task = self._resolve_person_profile(notification)
 
-        personality, rag_results, memory_snapshot, relevant_beliefs, affinity_snapshot = await asyncio.gather(
-            personality_task, rag_task, working_memory_task, beliefs_task, affinity_task
+        (
+            personality,
+            rag_results,
+            memory_snapshot,
+            relevant_beliefs,
+            affinity_snapshot,
+            person_profile,
+        ) = await asyncio.gather(
+            personality_task, rag_task, working_memory_task, beliefs_task, affinity_task, person_task
         )
 
         rendered_personality = _render_personality_template(
@@ -185,6 +202,8 @@ class EfiSystemPromptBuilder:
         blocks = [
             rendered_personality.strip(),
             _build_chat_context_block(notification),
+            _build_person_block(person_profile),
+            _build_proactive_brevity_block(notification),
             _build_time_block(),
             _build_working_memory_block(memory_snapshot),
             _build_state_vector_block(
@@ -195,6 +214,13 @@ class EfiSystemPromptBuilder:
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    async def _resolve_person_profile(self, notification: Notification) -> PersonProfile | None:
+        """Профиль конкретного отправителя, если он известен — см. _build_person_block."""
+        sender_id = notification.payload.get("sender_id")
+        if self._people is None or not isinstance(sender_id, int):
+            return None
+        return await self._people.get(sender_id)
 
     async def _resolve_affinity_snapshot(self, notification: Notification) -> AffinitySnapshot:
         """События без chat_id (например, NIGHTLY_TASK) — дефолтный снимок без похода в БД, брать близость неоткуда."""
@@ -273,6 +299,60 @@ def _build_chat_context_block(notification: Notification) -> str:
     return ""
 
 
+def _build_person_block(profile: PersonProfile | None) -> str:
+    """
+    Кто именно сейчас пишет — с точки зрения накопленного ЛИЧНОГО опыта
+    общения с ним, а не общей близости чата (см. efi/memory/people.py).
+    В группе это единственный способ отличить одного собеседника от другого:
+    chat_id у них общий, а отношение — разное.
+    """
+    if profile is None:
+        return ""
+
+    name = profile.display_name or f"user {profile.user_id}"
+    if not profile.is_familiar:
+        return (
+            f"[Про собеседника] {name} — вы общались всего ничего "
+            f"({profile.message_count} сообщ.), ты его толком ещё не знаешь. "
+            "Не делай вид, что у вас давняя история."
+        )
+
+    parts = [f"[Про собеседника] {name}, вы общаетесь давно ({profile.message_count} сообщ.)."]
+    if profile.respect_level >= HIGH_RESPECT_THRESHOLD:
+        parts.append("Ты его уважаешь — с ним можно говорить всерьёз и разворачивать мысль.")
+    elif profile.respect_level <= LOW_RESPECT_THRESHOLD:
+        parts.append("Общение с ним обычно так себе — держись суше и короче обычного.")
+    if profile.impression:
+        parts.append(f"Что ты о нём думаешь: {sanitize_text(profile.impression)}")
+    if profile.last_chat_title:
+        parts.append(f"В прошлый раз пересекались в «{sanitize_text(profile.last_chat_title)}».")
+    return " ".join(parts)
+
+
+def _build_proactive_brevity_block(notification: Notification) -> str:
+    """
+    Жёсткое ограничение длины для проактивных пингов (Эфи пишет ПЕРВОЙ).
+
+    Собеседник ничего не спрашивал — он молчит. Реальный человек в такой
+    ситуации кидает одну короткую реплику ("ты там как?", "живой?") и ждёт
+    ответа, а не выдаёт монолог из трёх сообщений с нарастающей подколкой.
+    Без этого блока проактивный пинг стабильно превращался в трёхэтажную
+    остроту ("эй /// ты там не уснул в обнимку с клавиатурой? /// или всё
+    ещё в режиме энергосбережения"), что читается как отчаянная попытка
+    расшевелить, а не как живое "просто вспомнила о тебе".
+    """
+    if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
+        return ""
+    return (
+        "[Ты пишешь первой] Собеседник сейчас молчит и ни о чём тебя не спрашивал. "
+        "ЖЁСТКОЕ ОГРАНИЧЕНИЕ на этот ответ: РОВНО ОДНА короткая реплика, без единого ' /// ' — "
+        "два и более сообщения подряд здесь запрещены. Никаких нагнетающих подколок серией и "
+        "никаких острот про технику/энергосбережение/сон в обнимку с клавиатурой. "
+        "Просто напиши то, с чем реально пришла — коротко и по-человечески, "
+        "и оставь собеседнику место ответить. Если есть уместный стикер — он тут лучше слов."
+    )
+
+
 def _build_time_block() -> str:
     now = datetime.now(timezone.utc).astimezone()
     return f"[Время] Сейчас {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname() or 'UTC'})."
@@ -293,14 +373,55 @@ def _build_working_memory_block(snapshot: WorkingMemorySnapshot) -> str:
     return "[Текущее состояние]\n" + "\n".join(parts)
 
 
+#: Тег, которым efi.behavior.life_engine помечает записи о СОБСТВЕННОМ опыте
+#: Эфи (что она читала в сети сама по себе, вне разговора). Такие записи
+#: подаются модели иначе, чем обычные воспоминания о переписке — см.
+#: _build_rag_block: на них можно и нужно ссылаться вслух ("я тут вычитала").
+_AUTONOMOUS_THOUGHT_TAG = "#autonomous_thought"
+
+
 def _build_rag_block(rag_results: list[DiaryQueryResult]) -> str:
+    """
+    Долгосрочная память двумя РАЗНЫМИ блоками, а не одним списком.
+
+    Записи о собственном фоновом опыте (что Эфи сама читала в сети, пока
+    никто не писал — тег `_AUTONOMOUS_THOUGHT_TAG`, ставит
+    efi.behavior.life_engine) принципиально отличаются от воспоминаний о
+    переписке: на них МОЖНО и НУЖНО ссылаться вслух ("я тут вычитала..."),
+    потому что это её личная жизнь, а не пересказ прошлого разговора
+    собеседнику, который в нём и участвовал. Свалив всё в один список
+    "[Из долгосрочной памяти]", модель обращалась с находками так же
+    осторожно, как с воспоминаниями, и почти никогда их не упоминала.
+    """
     if not rag_results:
         return ""
+
     # sanitize_text — на случай, если в дневник когда-то попал текст,
     # содержащий фрагменты, похожие на служебную разметку (defense in depth:
     # даже "свой" контент проходит ту же обработку, что и внешний).
-    lines = "\n".join(f"- {sanitize_text(result.entry.body.strip())}" for result in rag_results)
-    return f"[Из долгосрочной памяти]\n{lines}"
+    own_experience: list[str] = []
+    memories: list[str] = []
+    for result in rag_results:
+        body = sanitize_text(result.entry.body.strip())
+        if _AUTONOMOUS_THOUGHT_TAG in body:
+            own_experience.append(body.replace(_AUTONOMOUS_THOUGHT_TAG, "").strip())
+        else:
+            memories.append(body)
+
+    blocks: list[str] = []
+    if own_experience:
+        lines = "\n".join(f"- {item}" for item in own_experience)
+        blocks.append(
+            "[Твоя личная жизнь: что ты сама читала и надумала]\n"
+            f"{lines}\n"
+            "Это ТВОЙ собственный опыт, а не пересказ чужих слов. Если к разговору подходит — вверни "
+            "это живой фразой ('я тут на форуме вычитала', 'мне попалось на глаза'), с тем же отношением, "
+            "с каким записывала. Не зачитывай справкой и не приплетай туда, где оно не в тему."
+        )
+    if memories:
+        lines = "\n".join(f"- {item}" for item in memories)
+        blocks.append(f"[Из долгосрочной памяти]\n{lines}")
+    return "\n\n".join(blocks)
 
 
 def _build_safety_block(lockdown_mode: LockdownMode) -> str:

@@ -54,12 +54,30 @@ from __future__ import annotations
 
 import asyncio
 import random
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
 
 from efi.behavior.affinity import AffinitySnapshot, AffinityTracker
 from efi.config.schema import BusyEngineSettings
 from efi.memory.working_memory import WorkingMemory
+
+
+@dataclass(slots=True, frozen=True)
+class BusyDecision:
+    """
+    Результат одного расчёта занятости: сколько ждать И почему.
+
+    `is_active_conversation` нужен вызывающей стороне отдельно от задержки:
+    efi.notifications.worker.Worker по нему решает, отмечать ли сообщение
+    прочитанным СРАЗУ. Если Эфи уже в контексте активного чата, держать
+    сообщение непрочитанным незачем — она физически "смотрит в этот чат"
+    прямо сейчас, и задержка перед read_history выглядела бы как
+    искусственное удержание в непрочитанных, а не как живое поведение.
+    """
+
+    delay_seconds: float
+    is_active_conversation: bool
 
 
 class BusyState(Protocol):
@@ -102,7 +120,7 @@ class BusyEngine:
         self._settings = settings
         self._last_message_source = last_message_source
 
-    async def compute_ignore_delay(self, chat_id: int | None) -> float:
+    async def decide(self, chat_id: int | None) -> BusyDecision:
         """
         Критический путь (в начале обработки КАЖДОГО уведомления — см.
         efi.notifications.worker.Worker._handle): WorkingMemory,
@@ -118,13 +136,19 @@ class BusyEngine:
             working_memory_task, affinity_task, last_message_task
         )
 
-        return _calculate_ignore_delay(
+        is_active_conversation = _is_active_conversation(last_message_at, self._settings)
+        delay = _calculate_ignore_delay(
             is_researching=self._life_engine.is_researching,
             energy=memory_snapshot.energy,
             affinity=affinity_snapshot,
-            is_active_conversation=_is_active_conversation(last_message_at, self._settings),
+            is_active_conversation=is_active_conversation,
             settings=self._settings,
         )
+        return BusyDecision(delay_seconds=delay, is_active_conversation=is_active_conversation)
+
+    async def compute_ignore_delay(self, chat_id: int | None) -> float:
+        """Только задержка, без остального контекста решения — тонкая обёртка над `decide()`."""
+        return (await self.decide(chat_id)).delay_seconds
 
     async def _get_last_message_at(self, chat_id: int | None) -> datetime | None:
         if chat_id is None or self._last_message_source is None:
@@ -183,4 +207,4 @@ def _calculate_ignore_delay(
     return max(settings.min_delay_seconds, min(delay, settings.max_delay_seconds))
 
 
-__all__ = ["BusyEngine", "BusyState", "LastMessageSource"]
+__all__ = ["BusyDecision", "BusyEngine", "BusyState", "LastMessageSource"]

@@ -23,7 +23,12 @@ def _make_router(*, buffer: float = 0.05) -> LLMRouter:
     main_route = RoleRoute(primary=_endpoint("primary", 0.05), fallback=_endpoint("fallback", 0.05))
     fast_route = RoleRoute(primary=_endpoint("fast-primary", 0.05))
     vision_route = RoleRoute(primary=_endpoint("vision-primary", 0.05))
-    routes = {TaskRole.MAIN: main_route, TaskRole.FAST: fast_route, TaskRole.VISION: vision_route}
+    routes = {
+        TaskRole.MAIN: main_route,
+        TaskRole.FAST: fast_route,
+        TaskRole.BACKGROUND: fast_route,
+        TaskRole.VISION: vision_route,
+    }
     return LLMRouter(routes, role_timeout_buffer_seconds=buffer)
 
 
@@ -73,6 +78,7 @@ async def test_vision_role_budget_is_independent_of_main_role() -> None:
         {
             TaskRole.MAIN: RoleRoute(primary=_endpoint("main-primary", 0.05)),
             TaskRole.FAST: RoleRoute(primary=_endpoint("fast-primary", 0.05)),
+            TaskRole.BACKGROUND: RoleRoute(primary=_endpoint("background-primary", 0.05)),
             TaskRole.VISION: RoleRoute(primary=_endpoint("vision-primary", 2.0)),
         },
         role_timeout_buffer_seconds=0.5,
