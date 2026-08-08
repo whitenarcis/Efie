@@ -33,6 +33,12 @@ Worker — обрабатывает уведомления, закреплённ
        задача) — заметно урезанный `proactive_max_tool_call_rounds`: без
        настоящей реплики собеседника несколько полных раундов подряд иначе
        выливаются в монолог с самой собой ("эй, ты там?" / "алло" / ...).
+       Кроме бюджета раундов, цикл ЖЁСТКО останавливается сразу, как только
+       send_telegram_message реально сработал хотя бы раз за ход (см.
+       _run_with_tool_calls) — раньше это было только пожеланием в
+       personality.md, и модель, уже отправив ответ, иногда продолжала
+       генерировать ещё реплики как ни в чём не бывало ("чё, молчишь?" —
+       через несколько раундов ПОСЛЕ уже доставленного ответа).
     5. Для USER_MESSAGE — проверяет (_ensure_reply_was_sent), что модель
        реально вызвала send_telegram_message хотя бы раз за ход. Ничто в
        контракте LLM это не гарантирует — модель может формально завершить
@@ -386,6 +392,23 @@ class Worker:
         уведомлений без реальной реплики собеседника, защита от монолога с
         самой собой (см. вызывающую сторону — `_handle`).
 
+        ВАЖНО: как только в каком-то раунде реально сработал
+        send_telegram_message (`tool_context.extra["sent_texts"]` стало
+        непустым), цикл останавливается СРАЗУ, не дожидаясь, пока модель
+        сама решит закончить ход. personality.md и так требует вызывать
+        send_telegram_message ПОСЛЕДНИМ действием хода, но это лишь
+        инструкция в промпте — ничто не мешало модели, уже отправив
+        сообщение и получив TOOL-результат "Message sent successfully",
+        продолжить как ни в чём не бывало: сгенерировать ещё реплику, будто
+        прошло время и собеседник промолчал ("чё, молчишь?"), отправить её,
+        и повторить это до max_rounds раз — что на практике выглядело не
+        как один ответ (пусть даже из нескольких bubble'ов через "///"), а
+        как самостоятельный внутренний диалог поверх уже доставленного
+        ответа. Одного успешного send_telegram_message достаточно для
+        целого хода: multi-bubble ответы уже поддерживаются ВНУТРИ одного
+        вызова (см. efi/humanizer/message_splitting.py), отдельный
+        повторный вызов инструмента для этого не нужен.
+
         Перед исполнением каждого раунда tool-вызовов кладёт накопленное
         время генерации в `tool_context.extra["llm_generation_time"]` — это
         читает efi.tools.telegram_actions.send_message.SendMessageTool, чтобы
@@ -409,6 +432,9 @@ class Worker:
             for tool_call in message.tool_calls:
                 result_text = await self._tool_registry.execute(tool_call, tool_context)
                 session.append(Message(role=Role.TOOL, content=result_text, tool_call_id=tool_call.id))
+
+            if tool_context.extra.get("sent_texts"):
+                return response
 
         logger.warning(
             "worker[%d]: reached max_rounds=%d while processing %s, returning last response as-is",

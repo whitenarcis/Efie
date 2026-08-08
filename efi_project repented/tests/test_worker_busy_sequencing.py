@@ -18,7 +18,7 @@ from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session,
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.notifications.worker import _FAILURE_NOTICE_TEXT, Worker
-from efi.tools.base import ToolContext
+from efi.tools.base import Tool, ToolContext
 from efi.tools.registry import ToolRegistry
 from efi.tools.telegram_actions.send_message import SendMessageTool
 
@@ -434,8 +434,19 @@ async def test_llm_generation_time_is_recorded_only_with_tool_calls() -> None:
     assert "llm_generation_time" not in tool_context.extra
 
 
-class _AlwaysCallsToolRouter:
-    """Модель, которая НИКОГДА не останавливается сама — на каждый раунд отвечает новым tool_call."""
+class _NoopTool(Tool):
+    """Инструмент-пустышка для тестов — не отправляет ничего, просто занимает раунд tool-calling."""
+
+    name = "noop_tool"
+    description = "test-only tool that does nothing"
+    parameters: dict[str, object] = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+
+    async def execute(self, arguments: dict[str, object], context: ToolContext) -> str:
+        return "ok"
+
+
+class _AlwaysSendsRouter:
+    """Модель, которая на КАЖДЫЙ раунд заново вызывает send_telegram_message — 'никогда не считает себя законченной'."""
 
     def __init__(self, events: list[str]) -> None:
         self._events = events
@@ -455,14 +466,30 @@ class _AlwaysCallsToolRouter:
         return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content="", tool_calls=[tool_call]))])
 
 
-async def test_proactive_notification_gets_a_much_smaller_tool_call_round_budget() -> None:
+class _NeverSendsRouter:
+    """Модель, которая каждый раунд вызывает посторонний инструмент, но НИКОГДА не отправляет сообщение."""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.call_count = 0
+
+    async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
+        self._events.append("llm_chat")
+        self.call_count += 1
+        tool_call = ToolCall(
+            id=f"call_{self.call_count}", type="function", function=ToolCallFunction(name="noop_tool", arguments="{}")
+        )
+        return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content="", tool_calls=[tool_call]))])
+
+
+@pytest.mark.parametrize("notification_type", [NotificationType.USER_MESSAGE, NotificationType.SPONTANEOUS_PING])
+async def test_loop_stops_immediately_after_first_successful_send(notification_type: NotificationType) -> None:
     """
-    Регрессия на "монолог с самой собой": для SPONTANEOUS_PING (и прочих
-    уведомлений без реальной реплики собеседника) раньше использовался тот
-    же 8-раундовый бюджет, что и для обычного диалога — модель, которую
-    ничего не останавливает, генерировала цепочку из нескольких сообщений
-    подряд ("эй, ты там?" / "алло" / "ты в коме?" / ...). Бюджет для
-    проактивных уведомлений должен быть заметно меньше (по умолчанию 2).
+    Регрессия на "монолог поверх уже доставленного ответа": модель, отправив
+    сообщение, раньше могла продолжать генерировать ещё реплики как ни в чём
+    не бывало ("чё, молчишь?" — уже ПОСЛЕ того, как ответ дошёл), пока не
+    кончится бюджет раундов. Один успешный send_telegram_message теперь
+    обрывает цикл сразу — вне зависимости от типа уведомления.
     """
     events: list[str] = []
     manager = NotificationManager(worker_count=1)
@@ -471,7 +498,42 @@ async def test_proactive_notification_gets_a_much_smaller_tool_call_round_budget
     history = _FakeHistoryRepository()
     tool_registry = ToolRegistry()
     tool_registry.register(SendMessageTool(telegram))
-    router = _AlwaysCallsToolRouter(events)
+    router = _AlwaysSendsRouter(events)
+    worker = Worker(
+        0,
+        manager,
+        llm_router=router,  # type: ignore[arg-type]
+        tool_registry=tool_registry,
+        history=history,
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=busy_engine,  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+    )
+    notification = Notification(type=notification_type, chat_id=42, message="привет")
+
+    await worker._handle(notification)
+
+    assert router.call_count == 1
+    assert events.count("send_message") == 1
+
+
+async def test_proactive_notification_round_budget_caps_a_model_that_never_sends() -> None:
+    """
+    Бэкстоп на случай, если модель вообще не отправляет сообщение (а просто
+    вызывает посторонние инструменты раунд за раундом) — для проактивных
+    уведомлений бюджет раундов заметно меньше (по умолчанию 2), а не
+    max_tool_call_rounds=8, чтобы не жечь раунды впустую на монолог с самой
+    собой без единого реального сообщения собеседнику.
+    """
+    events: list[str] = []
+    manager = NotificationManager(worker_count=1)
+    telegram = _FakeTelegramNotifier(events)
+    busy_engine = _FakeBusyEngine(0.0)
+    history = _FakeHistoryRepository()
+    tool_registry = ToolRegistry()
+    tool_registry.register(SendMessageTool(telegram))
+    tool_registry.register(_NoopTool())
+    router = _NeverSendsRouter(events)
     worker = Worker(
         0,
         manager,
@@ -489,32 +551,35 @@ async def test_proactive_notification_gets_a_much_smaller_tool_call_round_budget
 
     await worker._handle(notification)
 
-    assert router.call_count == 2  # остановилась на proactive_max_tool_call_rounds, а не max_tool_call_rounds=8
-    assert events.count("send_message") == 2
+    assert router.call_count == 2
+    assert events.count("send_message") == 0
 
 
-async def test_user_message_still_gets_the_full_tool_call_round_budget() -> None:
-    """Тот же 'никогда не останавливающийся' раутер, но для USER_MESSAGE — бюджет должен остаться полным (8)."""
+async def test_user_message_keeps_the_full_tool_call_round_budget() -> None:
+    """Тот же 'никогда не отправляющий' раутер, но напрямую через _run_with_tool_calls — бюджет остаётся полным (8)."""
     events: list[str] = []
     manager = NotificationManager(worker_count=1)
     telegram = _FakeTelegramNotifier(events)
     busy_engine = _FakeBusyEngine(0.0)
-    history = _FakeHistoryRepository()
     tool_registry = ToolRegistry()
     tool_registry.register(SendMessageTool(telegram))
-    router = _AlwaysCallsToolRouter(events)
+    tool_registry.register(_NoopTool())
+    router = _NeverSendsRouter(events)
     worker = Worker(
         0,
         manager,
         llm_router=router,  # type: ignore[arg-type]
         tool_registry=tool_registry,
-        history=history,
+        history=_FakeHistoryRepository(),
         system_prompt_builder=_FakeSystemPromptBuilder(events),
         busy_engine=busy_engine,  # type: ignore[arg-type]
         telegram=telegram,  # type: ignore[arg-type]
     )
     notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+    tool_context = ToolContext(notification=notification)
+    params = LLMParams(model="", system_prompt="x")
+    session = Session()
 
-    await worker._handle(notification)
+    await worker._run_with_tool_calls(params, session, tool_context, 8)
 
     assert router.call_count == 8

@@ -117,7 +117,13 @@ class EfiApp:
         self._working_memory = WorkingMemory(settings.paths.data_dir / "working_memory.json")
         self._facts = FactStore(self._database)
         self._history = SqliteHistoryRepository(self._database)
-        self._consolidator = DiaryConsolidator(self._diary, self._llm_router, self._rag)
+        self._consolidator = DiaryConsolidator(
+            self._diary,
+            self._llm_router,
+            self._rag,
+            novelization_char_limit=settings.memory.novelization_char_limit,
+            novelization_max_output_tokens=settings.memory.novelization_max_output_tokens,
+        )
 
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются

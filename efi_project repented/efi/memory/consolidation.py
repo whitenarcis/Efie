@@ -73,7 +73,18 @@ _NOVELIZATION_SYSTEM_PROMPT = (
 
 _NOVELIZATION_EMPTY_MARKER = "ПУСТО"
 _ENTRY_SPLIT_RE = re.compile(r"\n\s*-{3,}\s*\n")
-_MESSAGE_PREVIEW_MAX_LENGTH = 2000
+
+#: Дефолты извлечения памяти из переписки (novelize_recent_history) —
+#: намеренно щедрые. Раньше здесь стояло 2000 символов и 768 токенов вывода:
+#: этого хватало на пару часов переписки, а за целый активный день
+#: разговор обрубался почти сразу, и LLM видела только начало дня — отсюда
+#: жалоба "дневник за весь день почему-то обрезанный". Сжатие — отдельная,
+#: НАМЕРЕННО более скупая операция (см. summarize_stale_entries), которая
+#: срабатывает только спустя `older_than` (по умолчанию 30 дней) над уже
+#: сохранёнными записями; здесь же, на этапе первого извлечения, экономить
+#: не на чем — потерянная на этом шаге деталь не восстановится никогда.
+_DEFAULT_NOVELIZATION_CHAR_LIMIT = 10_000
+_DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS = 2048
 
 
 class HistorySource(Protocol):
@@ -99,9 +110,13 @@ class DiaryConsolidator:
         rag: RAGMemory,
         *,
         summarization_role: TaskRole = TaskRole.FAST,
+        novelization_char_limit: int = _DEFAULT_NOVELIZATION_CHAR_LIMIT,
+        novelization_max_output_tokens: int = _DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS,
     ) -> None:
         self._diary = diary
         self._router = router
+        self._novelization_char_limit = novelization_char_limit
+        self._novelization_max_output_tokens = novelization_max_output_tokens
         self._rag = rag
         self._summarization_role = summarization_role
 
@@ -271,11 +286,15 @@ class DiaryConsolidator:
             return datetime.now(timezone.utc) - lookback
 
     async def _extract_memories(self, session: Session) -> list[str]:
-        conversation_text = _render_conversation(session)
+        conversation_text = _render_conversation(session, char_limit=self._novelization_char_limit)
         if not conversation_text:
             return []
 
-        params = LLMParams(model="", system_prompt=_NOVELIZATION_SYSTEM_PROMPT, max_output_tokens=768)
+        params = LLMParams(
+            model="",
+            system_prompt=_NOVELIZATION_SYSTEM_PROMPT,
+            max_output_tokens=self._novelization_max_output_tokens,
+        )
         prompt_session = Session(messages=[Message(role=Role.USER, content=conversation_text)])
         try:
             response = await self._router.chat(self._summarization_role, params, prompt_session)
@@ -306,11 +325,11 @@ class DiaryConsolidator:
         return response.text.strip() or None
 
 
-def _render_conversation(session: Session) -> str:
+def _render_conversation(session: Session, *, char_limit: int) -> str:
     """Плоский текст переписки для промпта новеллизации — только реплики с содержимым (не голые tool-calls)."""
     lines = [f"{message.role.value}: {message.content}" for message in session if message.content.strip()]
     text = "\n".join(lines)
-    return text[:_MESSAGE_PREVIEW_MAX_LENGTH] if text else ""
+    return text[:char_limit] if text else ""
 
 
 def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:

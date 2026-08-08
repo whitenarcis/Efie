@@ -459,6 +459,22 @@ class MemorySettings(BaseModel):
         default=6, ge=1,
         description="Минимум новых сообщений в чате с прошлой новеллизации, чтобы вообще запускать по нему извлечение памяти — не тратить LLM-вызов на пустяковую переписку",
     )
+    novelization_char_limit: int = Field(
+        default=10_000, ge=1,
+        description=(
+            "Сколько символов недавней переписки максимум передавать LLM за один запрос новеллизации "
+            "(DiaryConsolidator._extract_memories). Раньше стояло 2000 — активный день переписки обрубался "
+            "почти сразу, в дневник попадало только начало дня; см. novelization_max_output_tokens."
+        ),
+    )
+    novelization_max_output_tokens: int = Field(
+        default=2048, ge=1,
+        description=(
+            "Лимит токенов вывода при извлечении воспоминаний из переписки — дневник должен быть точным и "
+            "подробным на этом шаге; сжатие уже сохранённых старых записей (summarize_stale_entries) — "
+            "отдельная, намеренно более скупая операция, срабатывающая много позже (older_than)."
+        ),
+    )
     use_local_embeddings: bool = Field(
         default=True,
         description="Использовать локальный embedding-движок (fastembed/ONNX) как основной источник эмбеддингов вместо облачного LLMRouter",
