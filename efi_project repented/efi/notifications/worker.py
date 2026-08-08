@@ -26,7 +26,13 @@ Worker — обрабатывает уведомления, закреплённ
        сообщением. Если запрос падает как "слишком большой" (413 — реальный
        случай на узких TPM-лимитах бесплатных тиров), один раз пробует заново
        с урезанной историей вместо того, чтобы сразу сдаваться (см.
-       _chat_with_size_retry).
+       _chat_with_size_retry). Бюджет раундов зависит от типа уведомления:
+       USER_MESSAGE получает полный `max_tool_call_rounds` (реальный диалог,
+       может понадобиться несколько шагов — поиск, потом ответ), а
+       проактивные уведомления (спонтанный пинг, follow-up, тишина, ночная
+       задача) — заметно урезанный `proactive_max_tool_call_rounds`: без
+       настоящей реплики собеседника несколько полных раундов подряд иначе
+       выливаются в монолог с самой собой ("эй, ты там?" / "алло" / ...).
     5. Для USER_MESSAGE — проверяет (_ensure_reply_was_sent), что модель
        реально вызвала send_telegram_message хотя бы раз за ход. Ничто в
        контракте LLM это не гарантирует — модель может формально завершить
@@ -158,6 +164,7 @@ class Worker:
         busy_engine: BusyEngine,
         main_role: TaskRole = TaskRole.MAIN,
         max_tool_call_rounds: int = 8,
+        proactive_max_tool_call_rounds: int = 2,
         history_limit: int = 20,
         telegram: TelegramNotifier | None = None,
     ) -> None:
@@ -170,6 +177,7 @@ class Worker:
         self._busy_engine = busy_engine
         self._main_role = main_role
         self._max_tool_call_rounds = max_tool_call_rounds
+        self._proactive_max_tool_call_rounds = proactive_max_tool_call_rounds
         self._history_limit = history_limit
         self._telegram = telegram
 
@@ -238,8 +246,26 @@ class Worker:
             tools=self._tool_registry.as_openai_tools(tool_context),
         )
 
+        # Проактивные уведомления (спонтанный пинг, пинг по затишью, follow-up,
+        # ночная задача) не имеют настоящей "реплики собеседника" — это
+        # синтетический повод, а не реальный туда-обратно диалог. С полным
+        # бюджетом раундов (max_tool_call_rounds=8, как у обычного ответа)
+        # модель может провести несколько раундов подряд БЕЗ единой реакции
+        # от собеседника и уйти в монолог с самой собой ("эй, ты там?" / "алло"
+        # / "ты в коме?" / ... одним потоком) — с точки зрения истории это
+        # выглядит как обычный разговор, но по факту никто не отвечал.
+        # Для таких уведомлений бюджет раундов заметно ниже: одна попытка
+        # позвать/поделиться и один раунд на wrap-up, не восемь.
+        max_rounds = (
+            self._max_tool_call_rounds
+            if notification.type is NotificationType.USER_MESSAGE
+            else self._proactive_max_tool_call_rounds
+        )
+
         try:
-            response = await self._run_with_typing_pulse(notification.chat_id, params, session, tool_context)
+            response = await self._run_with_typing_pulse(
+                notification.chat_id, params, session, tool_context, max_rounds
+            )
             if notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None:
                 response = await self._ensure_reply_was_sent(params, session, tool_context, response)
         except LLMError:
@@ -272,7 +298,7 @@ class Worker:
             self._worker_index, tool_context.notification.id,
         )
         session.append(Message(role=Role.SYSTEM, content=_NO_REPLY_REMINDER_TEXT))
-        response = await self._run_with_tool_calls(params, session, tool_context)
+        response = await self._run_with_tool_calls(params, session, tool_context, self._max_tool_call_rounds)
 
         if not tool_context.extra.get("sent_texts") and self._telegram is not None and tool_context.chat_id is not None:
             logger.warning(
@@ -320,7 +346,7 @@ class Worker:
         )
 
     async def _run_with_typing_pulse(
-        self, chat_id: int | None, params: LLMParams, session: Session, tool_context: ToolContext
+        self, chat_id: int | None, params: LLMParams, session: Session, tool_context: ToolContext, max_rounds: int
     ) -> Response:
         """
         Оборачивает цикл tool-calling фоновым "пульсом" TYPING, пока Worker
@@ -329,11 +355,11 @@ class Worker:
         чем живой статус "печатает".
         """
         if chat_id is None or self._telegram is None:
-            return await self._run_with_tool_calls(params, session, tool_context)
+            return await self._run_with_tool_calls(params, session, tool_context, max_rounds)
 
         pulse_task = asyncio.create_task(self._typing_pulse(chat_id))
         try:
-            return await self._run_with_tool_calls(params, session, tool_context)
+            return await self._run_with_tool_calls(params, session, tool_context, max_rounds)
         finally:
             pulse_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -348,13 +374,17 @@ class Worker:
         except asyncio.CancelledError:
             raise
 
-    async def _run_with_tool_calls(self, params: LLMParams, session: Session, tool_context: ToolContext) -> Response:
+    async def _run_with_tool_calls(
+        self, params: LLMParams, session: Session, tool_context: ToolContext, max_rounds: int
+    ) -> Response:
         """
         Цикл tool-calling: запросить ответ у LLM -> если модель вызвала
         инструменты, выполнить их и вернуть результаты в модель как
         TOOL-сообщения -> повторить, пока модель не даст финальный ответ без
-        tool_calls. `max_tool_call_rounds` — защита от зацикливания (модель
-        может застрять, бесконечно вызывая инструменты).
+        tool_calls. `max_rounds` — защита от зацикливания (модель может
+        застрять, бесконечно вызывая инструменты) и, для проактивных
+        уведомлений без реальной реплики собеседника, защита от монолога с
+        самой собой (см. вызывающую сторону — `_handle`).
 
         Перед исполнением каждого раунда tool-вызовов кладёт накопленное
         время генерации в `tool_context.extra["llm_generation_time"]` — это
@@ -367,7 +397,7 @@ class Worker:
         """
         start_time = asyncio.get_running_loop().time()
         response: Response | None = None
-        for _round_number in range(self._max_tool_call_rounds):
+        for _round_number in range(max_rounds):
             response = await self._chat_with_size_retry(params, session)
             message = response.message
             session.append(message)
@@ -381,10 +411,10 @@ class Worker:
                 session.append(Message(role=Role.TOOL, content=result_text, tool_call_id=tool_call.id))
 
         logger.warning(
-            "worker[%d]: reached max_tool_call_rounds=%d while processing %s, returning last response as-is",
-            self._worker_index, self._max_tool_call_rounds, tool_context.notification.id,
+            "worker[%d]: reached max_rounds=%d while processing %s, returning last response as-is",
+            self._worker_index, max_rounds, tool_context.notification.id,
         )
-        assert response is not None  # цикл выполняется минимум один раз, т.к. max_tool_call_rounds задаётся >= 1
+        assert response is not None  # цикл выполняется минимум один раз, т.к. max_rounds задаётся >= 1
         return response
 
     async def _chat_with_size_retry(self, params: LLMParams, session: Session) -> Response:

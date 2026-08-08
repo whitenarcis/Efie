@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from datetime import time as dt_time
 
 from pyrogram import Client
@@ -77,6 +78,9 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WORKER_COUNT = 3
 _QUEUE_DRAIN_TIMEOUT_SECONDS = 30.0
 _CONSOLIDATION_TRIGGER_AT = dt_time(hour=3, minute=30)
+#: "С начала времён" — для get_active_chat_ids(since=...) в _active_chat_candidates,
+#: где нужны ВСЕ чаты с известной историей, а не только недавние.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class EfiApp:
@@ -144,7 +148,7 @@ class EfiApp:
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
-        self._silence_monitor = SilenceMonitor(self._notification_manager)
+        self._silence_monitor = SilenceMonitor(self._notification_manager, quiet_hours=settings.quiet_hours)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
         self._researcher = BackgroundResearcher(
             templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
@@ -153,11 +157,13 @@ class EfiApp:
             self._notification_manager,
             self._active_chat_candidates,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
+            quiet_hours=settings.quiet_hours,
         )
         self._organic_ping = OrganicPingGenerator(
             self._notification_manager,
             self._affinity,
             importance_threshold=settings.life_engine.ping_importance_threshold,
+            quiet_hours=settings.quiet_hours,
         )
         self._life_engine = BackgroundLifeWorker(
             self._curiosity,
@@ -235,14 +241,23 @@ class EfiApp:
 
     async def _active_chat_candidates(self) -> list[int]:
         """
-        Список чатов-кандидатов для спонтанного пинга.
+        Список чатов-кандидатов для спонтанного пинга: allowed_chats из
+        конфига, пересечённые с чатами, где реально было хоть одно
+        сообщение (efi.db.history_repository.SqliteHistoryRepository.
+        get_active_chat_ids).
 
-        TODO: как только появится полноценный реестр известных диалогов
-        (например, через Pyrogram get_dialogs, кэшируемый в efi/telegram/),
-        заменить на реальный источник. Сейчас — allowed_chats из конфига;
-        этого достаточно, чтобы функциональность была рабочей с первого дня.
+        Раньше отдавался «сырой» allowed_chats целиком. chat_id, который
+        туда попал (например, руками в behavior.toml), но с которым этот
+        Telegram-аккаунт ещё ни разу не обменивался сообщением, Pyrogram
+        локально не резолвит (peer неизвестен его storage) — попытка
+        send_message для такого чата падает изнутри Pyrogram KeyError'ом
+        ("ID not found: ...", resolve_peer/get_peer_by_id) на КАЖДОЙ
+        попытке пинга, без единого шанса на успех. Пересечение с историей —
+        дешёвая гарантия, что peer уже засветился хотя бы раз и кэш есть.
         """
-        return list(self._settings.telegram.allowed_chats)
+        allowed = set(self._settings.telegram.allowed_chats)
+        active = await self._history.get_active_chat_ids(since=_EPOCH)
+        return [chat_id for chat_id in active if chat_id in allowed]
 
     async def start(self) -> None:
         """Поднимает все подсистемы: Telegram-клиент, обработчики, воркеры, проактивные сервисы."""

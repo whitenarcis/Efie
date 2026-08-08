@@ -23,7 +23,10 @@ import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 
+from efi.behavior.quiet_hours import is_quiet_hours
+from efi.config.schema import QuietHoursSettings
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 
@@ -57,12 +60,14 @@ class SpontaneousPingScheduler:
         check_interval_seconds: float = 1800.0,  # 30 минут
         ping_probability: float = 0.15,
         incubated_thought_provider: IncubatedThoughtProvider | None = None,
+        quiet_hours: QuietHoursSettings | None = None,
     ) -> None:
         self._manager = manager
         self._candidate_chats_provider = candidate_chats_provider
         self._check_interval_seconds = check_interval_seconds
         self._ping_probability = ping_probability
         self._incubated_thought_provider = incubated_thought_provider
+        self._quiet_hours = quiet_hours
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
@@ -79,6 +84,16 @@ class SpontaneousPingScheduler:
             raise
 
     async def _maybe_ping_candidates(self) -> None:
+        if (
+            self._quiet_hours is not None
+            and self._quiet_hours.enabled
+            and is_quiet_hours(
+                datetime.now(), start_hour=self._quiet_hours.start_hour, end_hour=self._quiet_hours.end_hour
+            )
+        ):
+            logger.debug("spontaneous_ping: skipping check — quiet hours")
+            return
+
         try:
             candidates = await self._candidate_chats_provider()
         except Exception:
