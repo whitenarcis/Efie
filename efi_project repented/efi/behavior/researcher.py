@@ -83,7 +83,7 @@ class BackgroundResearcher:
         *,
         check_interval_seconds: float = 2700.0,  # 45 минут
         research_probability: float = 0.25,
-        hypothesis_role: TaskRole = TaskRole.FAST,
+        hypothesis_role: TaskRole = TaskRole.BACKGROUND,
     ) -> None:
         self._worldview_path = worldview_path
         self._web_search = web_search

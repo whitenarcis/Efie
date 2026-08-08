@@ -9,13 +9,17 @@ Worker — обрабатывает уведомления, закреплённ
 очереди — никакой другой Worker его в это время не подхватит.
 
 На каждое уведомление Worker (порядок ВАЖЕН — см. efi/behavior/busy_engine.py):
-    1. Считает и выжидает `ignore_delay` (BusyEngine) — симуляция занятости.
-       До этого момента Worker НЕ делает ни одного обращения к Telegram, ни
-       видимого (typing/read), ни любого другого — значит, Telegram не
-       покажет клиента "в сети", а сообщение остаётся "не прочитано".
-    2. Для USER_MESSAGE — заходит в чат (mark_as_read): именно в ЭТОТ момент
-       появляется статус "прочитано" и, как следствие, онлайн-присутствие —
-       не раньше.
+    1. Спрашивает у BusyEngine решение (`decide`): сколько ждать и идёт ли
+       уже активный разговор в этом чате.
+       - Разговор УЖЕ идёт: сообщение отмечается прочитанным СРАЗУ, до
+         всякой задержки. Эфи физически смотрит в этот чат прямо сейчас, и
+         держать реплику непрочитанной было бы искусственным удержанием в
+         непрочитанных, а не симуляцией занятости.
+       - Разговора нет (первое сообщение после паузы): Worker выжидает
+         `ignore_delay`, НЕ делая ни одного обращения к Telegram — значит,
+         Telegram не покажет клиента "в сети", а сообщение остаётся
+         непрочитанным, — и только потом заходит в чат (mark_as_read).
+         Именно в ЭТОТ момент появляется "прочитано" и онлайн-присутствие.
     3. Собирает Session (история + текст события, прогнанный через
        security.sanitize) и просит системный промпт у SystemPromptBuilder
        (личность, время, working memory, RAG, ограничения безопасности,
@@ -212,7 +216,22 @@ class Worker:
             raise
 
     async def _handle(self, notification: Notification) -> None:
-        await self._apply_busy_delay(notification)
+        decision = await self._busy_engine.decide(notification.chat_id)
+        is_user_message = notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None
+
+        # Если Эфи УЖЕ в контексте активного чата, сообщение отмечается
+        # прочитанным сразу, ДО какой-либо задержки: она физически смотрит в
+        # этот чат прямо сейчас, и держать реплику непрочитанной несколько
+        # секунд — не "занятость", а искусственное удержание в непрочитанных.
+        # Полноценная задержка "не сразу взяла телефон" осмысленна только
+        # тогда, когда разговор ещё не идёт (см. efi/behavior/busy_engine.py).
+        marked_as_read = False
+        if is_user_message and decision.is_active_conversation and self._telegram is not None:
+            assert notification.chat_id is not None  # гарантировано is_user_message
+            await self._telegram.mark_as_read(notification.chat_id)
+            marked_as_read = True
+
+        await self._apply_busy_delay(notification, decision.delay_seconds)
 
         history = (
             await self._history.get_recent(notification.chat_id, limit=self._history_limit)
@@ -221,7 +240,7 @@ class Worker:
         )
         session = _finalize_session(history, notification)
 
-        if notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None:
+        if is_user_message and notification.chat_id is not None:
             # Реплика собеседника — единственное, что делает историю ИСТОРИЕЙ
             # ДИАЛОГА, а не монологом Эфи с самой собой: раньше сюда попадал
             # только response.message (см. ниже), а сообщение пользователя
@@ -233,14 +252,12 @@ class Worker:
             # остаться в истории, даже если сам запрос к LLM ниже провалится.
             await self._history.append(notification.chat_id, session.messages[-1])
 
-        if (
-            notification.type is NotificationType.USER_MESSAGE
-            and notification.chat_id is not None
-            and self._telegram is not None
-        ):
-            # "Заход в чат" — именно тут, а не раньше: до этого момента
-            # Worker не совершил ни одного видимого телеграм-действия (см.
-            # докстринг модуля и efi/behavior/busy_engine.py).
+        if is_user_message and not marked_as_read and self._telegram is not None:
+            # "Заход в чат" после паузы — именно тут, а не раньше: до этого
+            # момента Worker не совершил ни одного видимого телеграм-действия
+            # (см. докстринг модуля и efi/behavior/busy_engine.py). Внутри
+            # активного разговора отметка уже проставлена выше, до задержки.
+            assert notification.chat_id is not None  # гарантировано is_user_message
             await self._telegram.mark_as_read(notification.chat_id)
 
         system_prompt = await self._system_prompt_builder.build(notification, history)
@@ -272,7 +289,7 @@ class Worker:
             response = await self._run_with_typing_pulse(
                 notification.chat_id, params, session, tool_context, max_rounds
             )
-            if notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None:
+            if is_user_message:
                 response = await self._ensure_reply_was_sent(params, session, tool_context, response)
         except LLMError:
             await self._notify_failure(notification)
@@ -316,8 +333,7 @@ class Worker:
 
         return response
 
-    async def _apply_busy_delay(self, notification: Notification) -> None:
-        delay = await self._busy_engine.compute_ignore_delay(notification.chat_id)
+    async def _apply_busy_delay(self, notification: Notification, delay: float) -> None:
         if delay <= 0:
             return
         logger.debug(
