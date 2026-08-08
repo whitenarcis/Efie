@@ -585,12 +585,33 @@ class BusyEngineSettings(BaseModel):
     min_delay_seconds: float = Field(default=0.5, ge=0.0, description="Нижний потолок итоговой ignore_delay")
     max_delay_seconds: float = Field(default=25.0, gt=0.0, description="Верхний потолок итоговой ignore_delay")
 
+    active_conversation_window_seconds: float = Field(
+        default=300.0, ge=0.0,
+        description=(
+            "Если в чате уже было сообщение (в любую сторону) не позже, чем это число секунд назад — "
+            "разговор считается 'активным', и Эфи не 'уходит и возвращается' на каждую реплику: полная "
+            "ignore_delay применяется только к ПЕРВОМУ сообщению после паузы, не к каждому подряд."
+        ),
+    )
+    active_conversation_delay_min_seconds: float = Field(
+        default=0.2, ge=0.0,
+        description="Нижняя граница крошечной задержки-реакции внутри активного разговора — не занятость, а живой темп",
+    )
+    active_conversation_delay_max_seconds: float = Field(
+        default=1.5, ge=0.0,
+        description="Верхняя граница крошечной задержки-реакции внутри активного разговора",
+    )
+
     @model_validator(mode="after")
     def _validate_ranges(self) -> "BusyEngineSettings":
         if self.base_delay_min_seconds > self.base_delay_max_seconds:
             raise ValueError("base_delay_min_seconds не может быть больше base_delay_max_seconds")
         if self.min_delay_seconds > self.max_delay_seconds:
             raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
+        if self.active_conversation_delay_min_seconds > self.active_conversation_delay_max_seconds:
+            raise ValueError(
+                "active_conversation_delay_min_seconds не может быть больше active_conversation_delay_max_seconds"
+            )
         return self
 
 

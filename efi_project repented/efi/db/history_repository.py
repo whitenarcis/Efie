@@ -78,6 +78,25 @@ class SqliteHistoryRepository:
         """Полностью очищает историю чата (например, по команде вида "забудь наш разговор")."""
         await self._database.execute("DELETE FROM messages WHERE chat_id = ?", (chat_id,))
 
+    async def get_last_message_at(self, chat_id: int) -> datetime | None:
+        """
+        Момент последнего сообщения чата (в любую сторону), или None, если
+        сообщений ещё не было. Используется efi.behavior.busy_engine.
+        BusyEngine, чтобы отличить "продолжение уже идущего разговора" (тогда
+        ignore_delay должна быть почти нулевой) от "первого сообщения после
+        паузы" (тогда уместна полноценная задержка "не сразу взяла телефон").
+        Вызывается ДО того, как текущее входящее сообщение попадёт в историю
+        (см. Worker._handle — busy delay считается раньше append), поэтому
+        честно возвращает момент ПРЕДЫДУЩЕГО сообщения, а не этого самого.
+        """
+        row = await self._database.fetch_one(
+            "SELECT created_at FROM messages WHERE chat_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+            (chat_id,),
+        )
+        if row is None:
+            return None
+        return datetime.fromisoformat(row["created_at"])
+
     async def get_active_chat_ids(self, *, since: datetime) -> list[int]:
         """
         Список chat_id, где было хоть одно сообщение начиная с `since`.
