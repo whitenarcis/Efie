@@ -578,6 +578,25 @@ class BusyEngineSettings(BaseModel):
         return self
 
 
+class QuietHoursSettings(BaseModel):
+    """
+    Ночные "тихие часы" для проактивных путей (efi.behavior.spontaneous_ping,
+    efi.behavior.organic_ping, efi.behavior.silence_monitor) — окно, в
+    котором Эфи не пишет первой сама. НЕ блокирует ответ на входящее
+    сообщение пользователя: если собеседник написал сам, Эфи всё равно
+    отвечает, независимо от часа.
+
+    Без этого раньше проактивные сервисы будили собеседника пингами в 5 и 7
+    утра наравне с днём — ни один из них не смотрел на время суток вообще.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=True)
+    start_hour: int = Field(default=23, ge=0, le=23, description="Час начала тихих часов (локальное время сервера)")
+    end_hour: int = Field(default=8, ge=0, le=23, description="Час окончания тихих часов (локальное время сервера)")
+
+
 class Settings(BaseSettings):
     """
     Корневой объект конфигурации приложения.
@@ -614,6 +633,7 @@ class Settings(BaseSettings):
     stt: SttSettings = Field(default_factory=SttSettings)
     life_engine: LifeEngineSettings = Field(default_factory=LifeEngineSettings)
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
+    quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
 
     @classmethod
     def settings_customise_sources(

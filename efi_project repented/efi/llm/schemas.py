@@ -304,6 +304,14 @@ class DiaryEntryMetadata(BaseModel):
     last_used: datetime | None = Field(default=None, description="None означает «запись ещё ни разу не использовалась»")
     usage_count: int = Field(default=0, ge=0)
     embedding: EmbeddingVector = Field(default_factory=list)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        description=(
+            "Когда запись реально появилась в дневнике — НЕ путать с last_used (когда её последний раз "
+            "нашли поиском). Записи без last_used (ещё ни разу не использовались) не должны читаться как "
+            "«старые»: свежая запись, которую пока никто не искал, — это норма, а не признак устаревания."
+        ),
+    )
 
     def touch(self) -> None:
         """Отмечает использование записи: увеличивает счётчик и обновляет last_used. Аналог incrementUsageCount()."""

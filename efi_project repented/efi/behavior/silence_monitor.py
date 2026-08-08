@@ -21,6 +21,8 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+from efi.behavior.quiet_hours import is_quiet_hours
+from efi.config.schema import QuietHoursSettings
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 
@@ -50,10 +52,12 @@ class SilenceMonitor:
         *,
         check_interval_seconds: float = 900.0,  # 15 минут
         silence_threshold: timedelta = timedelta(hours=6),
+        quiet_hours: QuietHoursSettings | None = None,
     ) -> None:
         self._manager = manager
         self._check_interval_seconds = check_interval_seconds
         self._silence_threshold = silence_threshold
+        self._quiet_hours = quiet_hours
         self._last_activity: dict[int, datetime] = {}
         self._last_silence_ping: dict[int, datetime] = {}
         self._pending_follow_ups: dict[int, list[_PendingFollowUp]] = {}
@@ -89,6 +93,20 @@ class SilenceMonitor:
             raise
 
     async def _check_silence(self) -> None:
+        if (
+            self._quiet_hours is not None
+            and self._quiet_hours.enabled
+            and is_quiet_hours(
+                datetime.now(), start_hour=self._quiet_hours.start_hour, end_hour=self._quiet_hours.end_hour
+            )
+        ):
+            # Не трогаем _last_silence_ping — намеренно: как только тихие часы
+            # закончатся, следующий проход снова увидит то же затишье и
+            # запингует нормально, а не будет молчать ещё один полный
+            # silence_threshold из-за пропущенного окна.
+            logger.debug("silence_monitor: skipping silence check — quiet hours")
+            return
+
         now = datetime.now(timezone.utc)
         for chat_id, last_activity in list(self._last_activity.items()):
             if now - last_activity < self._silence_threshold:

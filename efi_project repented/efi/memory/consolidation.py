@@ -167,15 +167,23 @@ class DiaryConsolidator:
         """
         entries = await self._diary.all_entries()
         cutoff = datetime.now(timezone.utc) - older_than
+        # ВАЖНО: критерий устаревания — created_at (когда запись реально
+        # появилась), а НЕ last_used. Раньше здесь читался last_used с
+        # фолбэком на "максимально старую дату" для записей, которые ещё ни
+        # разу не искали (last_used is None) — а это ЛЮБАЯ только что
+        # созданная запись, включая те, что novelize_recent_history сохранил
+        # в дневник минутами раньше В ЭТОМ ЖЕ ночном проходе (см.
+        # efi/app.py::_run_consolidation_loop, novelize идёт первым шагом).
+        # На практике это означало, что весь день переписки мог в ту же
+        # ночь схлопнуться в один сжатый "мемуар" — свежие записи выглядели
+        # как самые старые кандидаты на сжатие.
         candidates = [
-            entry
-            for entry in entries
-            if not entry.metadata.is_ground_truth and (entry.metadata.last_used or _min_datetime()) < cutoff
+            entry for entry in entries if not entry.metadata.is_ground_truth and entry.metadata.created_at < cutoff
         ]
         if len(candidates) < 2:
             return None
 
-        batch = sorted(candidates, key=lambda entry: entry.metadata.last_used or _min_datetime())[:batch_size]
+        batch = sorted(candidates, key=lambda entry: entry.metadata.created_at)[:batch_size]
         summary_text = await self._summarize_via_llm(batch)
         if summary_text is None:
             return None
@@ -285,7 +293,11 @@ class DiaryConsolidator:
     async def _summarize_via_llm(self, entries: list[DiaryEntry]) -> str | None:
         bodies = "\n\n".join(f"- {entry.body.strip()}" for entry in entries)
         session = Session(messages=[Message(role=Role.USER, content=bodies)])
-        params = LLMParams(model="", system_prompt=_CONSOLIDATION_SYSTEM_PROMPT, max_output_tokens=512)
+        # 512 токенов оказалось мало для батча из batch_size=10 записей —
+        # сводка обрывалась на середине предложения (см. пример в дневнике:
+        # "...вернулся с" без продолжения). 1024 даёт запас без риска, что
+        # обрезание повторится на чуть более многословном батче.
+        params = LLMParams(model="", system_prompt=_CONSOLIDATION_SYSTEM_PROMPT, max_output_tokens=1024)
         try:
             response = await self._router.chat(self._summarization_role, params, session)
         except LLMError as exc:
@@ -306,11 +318,6 @@ def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:
     if a.metadata.confidence != b.metadata.confidence:
         return a.id if a.metadata.confidence < b.metadata.confidence else b.id
     return a.id if a.metadata.usage_count <= b.metadata.usage_count else b.id
-
-
-def _min_datetime() -> datetime:
-    """Для записей без last_used (никогда не использовались) — «максимально старые», кандидаты на консолидацию в первую очередь."""
-    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 __all__ = ["DiaryConsolidator", "HistorySource"]
