@@ -23,6 +23,10 @@ api_id = 38386496
 api_hash = "REPLACEME"
 owner_id = 2129889949
 allowed_chats = [2129889949, -2041871692, -4404120219]
+# Каналы/группы обсуждений, где Эфи участвует как обычный участник сообщества.
+# ЯВНЫЙ opt-in: только эти чаты обходят lockdown_mode. Пустой список (по
+# умолчанию) = Эфи остаётся персональным ботом и никуда не выходит.
+community_chats = []
 lockdown_mode = "owner_only"      # none | contacts_only | owner_only
 check_chats_on_startup = true
 can_join_chats = false
@@ -107,3 +111,15 @@ max_messages_per_burst = 5
 # [state_vector]
 # sycophancy_protection_text = "..."
 # relevant_beliefs_limit = 3
+
+# Поведение в сообществе (efi/telegram/comments.py). Сами чаты — в
+# telegram.community_chats выше; здесь только насколько охотно вписываться.
+# Дефолты сдержанные: участник, комментирующий каждый пост, — это спамер.
+[community]
+enabled = true
+comment_probability = 0.35        # шанс вписаться в подходящий по теме пост
+min_delay_seconds = 300.0         # 5 минут: живой человек не отвечает мгновенно
+max_delay_seconds = 1800.0        # ...и не позже получаса
+thread_scan_interval_seconds = 1800.0
+max_replies_per_thread = 1        # одна реплика за заход, а не проход по всей ветке
+topic_match_min_score = 0.34

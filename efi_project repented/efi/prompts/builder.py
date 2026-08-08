@@ -130,6 +130,10 @@ _PROACTIVE_NOTIFICATION_TYPES = frozenset(
     {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING, NotificationType.FOLLOW_UP}
 )
 
+#: Публичные выступления — комментарий под постом и реплика в чужой ветке.
+#: Для них включается отдельный свод правил (см. _build_public_comment_block).
+_PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
+
 
 class _SafeFormatDict(dict[str, str]):
     """Для .format_map(): плейсхолдеры без данных остаются в тексте как есть, вместо KeyError."""
@@ -203,6 +207,10 @@ class EfiSystemPromptBuilder:
             rendered_personality.strip(),
             _build_chat_context_block(notification),
             _build_person_block(person_profile),
+            _build_public_comment_block(notification),
+            _build_stranger_block(
+                self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
+            ),
             _build_proactive_brevity_block(notification),
             _build_time_block(),
             _build_working_memory_block(memory_snapshot),
@@ -214,6 +222,13 @@ class EfiSystemPromptBuilder:
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    def _is_secondary_user(self, notification: Notification) -> bool:
+        """Посторонний ли пишет — по тому же критерию, что и efi.behavior.conversation_lifecycle."""
+        sender_id = notification.payload.get("sender_id")
+        if not isinstance(sender_id, int):
+            return False
+        return sender_id != self._settings.telegram.owner_id
 
     async def _resolve_person_profile(self, notification: Notification) -> PersonProfile | None:
         """Профиль конкретного отправителя, если он известен — см. _build_person_block."""
@@ -327,6 +342,50 @@ def _build_person_block(profile: PersonProfile | None) -> str:
     if profile.last_chat_title:
         parts.append(f"В прошлый раз пересекались в «{sanitize_text(profile.last_chat_title)}».")
     return " ".join(parts)
+
+
+def _build_public_comment_block(notification: Notification) -> str:
+    """
+    Правила публичного выступления: комментарий под чужим постом или реплика
+    в чужой ветке. Это не личная переписка — вокруг незнакомые люди, у
+    которых нет ни контекста ваших отношений, ни желания читать простыню.
+
+    Отдельный блок, а не общий «пиши коротко»: в публичном комментарии
+    подводят иначе, чем в личке — тут провал не в длине как таковой, а в
+    экспертной душноте («вообще-то тут важно понимать, что...») и в попытке
+    объяснить незнакомым людям, кто ты такая.
+    """
+    if not notification.payload.get("is_public_comment") and notification.type not in _PUBLIC_COMMENT_TYPES:
+        return ""
+    return (
+        "[Ты пишешь ПУБЛИЧНО] Это комментарий на виду у незнакомых людей, а не переписка с близким. "
+        "ЖЁСТКО: РОВНО ОДНА короткая реплика, без ' /// ', 1-2 предложения максимум. "
+        "Не читай лекций и не поучай — никакой экспертной душноты вида 'вообще-то важно понимать'. "
+        "Не представляйся, не объясняй, кто ты и откуда взялась, не зови никого в личку. "
+        "Не пересказывай пост своими словами — добавь СВОЮ мысль или реакцию, ради которой стоило писать. "
+        "Если сказать по существу нечего — лучше отделаться одной живой строчкой, чем выдавливать глубину."
+    )
+
+
+def _build_stranger_block(tier_is_secondary: bool, is_private_chat: bool) -> str:
+    """
+    Дистанция с посторонним в ЛС: `social_distance = "stranger"`.
+
+    Ключевое ограничение здесь — не тон, а ГРАНИЦЫ ПАМЯТИ. У Эфи в промпте
+    лежит её дневник и личный контекст владельца; постороннему в личке всё
+    это знать неоткуда и незачем, поэтому запрет на пересказ дневника
+    формулируется явно, а не подразумевается вежливостью.
+    """
+    if not (tier_is_secondary and is_private_chat):
+        return ""
+    return (
+        "[Дистанция: посторонний] Это НЕ твой человек — вы едва знакомы, он написал тебе в личку. "
+        "Держи дистанцию: отвечай нормально и по-человечески, но не откровенничай. "
+        "НЕ пересказывай ему содержимое своего дневника, свои личные переживания, дела своего создателя "
+        "и подробности других разговоров — это не его дело. "
+        "И не пытайся удержать разговор: не придумывай новых тем, не задавай вопросов ради продолжения, "
+        "не зови общаться дальше. Разговор закончился — значит закончился, это нормально."
+    )
 
 
 def _build_proactive_brevity_block(notification: Notification) -> str:

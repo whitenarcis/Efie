@@ -26,6 +26,7 @@ from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
 from efi.behavior.busy_engine import BusyEngine
+from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
@@ -46,6 +47,7 @@ from efi.memory.facts import FactStore
 from efi.memory.local_embeddings import LocalEmbeddingEngine
 from efi.memory.people import PeopleStore
 from efi.memory.rag import RAGMemory
+from efi.memory.social_memory import SocialInteractionStore
 from efi.memory.tfidf_fallback import TfidfFallbackIndex
 from efi.memory.working_memory import WorkingMemory
 from efi.notifications.manager import NotificationManager
@@ -53,6 +55,12 @@ from efi.notifications.worker import Worker
 from efi.prompts.builder import EfiSystemPromptBuilder
 from efi.prompts.loader import PromptLoader
 from efi.telegram.client import TelegramClientWrapper
+from efi.telegram.comments import (
+    ChannelPostWatcher,
+    RandomCommentEngager,
+    ThreadStateStore,
+    build_community_interests,
+)
 from efi.telegram.handlers import TelegramEventHandlers
 from efi.telegram.typing_tracker import TypingTracker
 from efi.tools.base import Tool
@@ -141,6 +149,11 @@ class EfiApp:
         # BeliefStore: устойчивое отношение к человеку перетекает в общую
         # матрицу убеждений, поэтому конструируется ПОСЛЕ него.
         self._people = PeopleStore(self._database, beliefs=self._beliefs)
+        # Социальная память внешнего опыта: журнал в SQLite + индексация в
+        # векторную память через RAG, поэтому конструируется ПОСЛЕ _rag.
+        self._social_memory = SocialInteractionStore(self._database, rag=self._rag)
+        # Жизненный цикл диалога с посторонними (владелец vs остальные).
+        self._lifecycle = ConversationLifecycle(self._database, owner_id=settings.telegram.owner_id)
 
         # -- инструменты, нужные фоновым исследователям (см. ниже) -------------
         # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher/
@@ -216,6 +229,27 @@ class EfiApp:
         )
         self._telegram_client = TelegramClientWrapper(self._pyrogram_client, settings.humanizer)
         self._typing_tracker = TypingTracker(ttl_seconds=settings.humanizer.debounce_typing_ttl_seconds)
+        # -- участие в сообществе (комментарии/треды) ------------------------
+        self._thread_state = ThreadStateStore(self._database)
+        self._community_interests = build_community_interests(self._database, templates_dir / "worldview.json")
+        self._channel_post_watcher = ChannelPostWatcher(
+            self._notification_manager,
+            settings.telegram,
+            settings.community,
+            self._community_interests,
+            self._thread_state,
+            self._social_memory,
+        )
+        self._random_comment_engager = RandomCommentEngager(
+            self._notification_manager,
+            self._pyrogram_client,
+            settings.telegram,
+            settings.community,
+            self._community_interests,
+            self._thread_state,
+            self._social_memory,
+        )
+
         self._telegram_handlers = TelegramEventHandlers(
             self._notification_manager,
             settings.telegram,
@@ -295,6 +329,7 @@ class EfiApp:
         logger.info("app: starting")
 
         self._telegram_handlers.register(self._pyrogram_client)
+        self._channel_post_watcher.register(self._pyrogram_client)
         self._typing_tracker.register(self._pyrogram_client)
         await self._telegram_client.start()
 
@@ -310,6 +345,8 @@ class EfiApp:
                 main_role=TaskRole.MAIN,
                 telegram=self._telegram_client,
                 history_limit=self._settings.memory.history_limit,
+                lifecycle=self._lifecycle,
+                social_memory=self._social_memory,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 
@@ -322,6 +359,7 @@ class EfiApp:
                 self._spawn_supervised(self._life_engine.run(), name="life_engine"),
                 self._spawn_supervised(self._prompt_loader.watch(), name="prompt_loader_watch"),
                 self._spawn_supervised(self._run_consolidation_loop(), name="diary_consolidation"),
+                self._spawn_supervised(self._random_comment_engager.run(), name="random_comment_engager"),
             ]
         )
 
@@ -416,6 +454,9 @@ class EfiApp:
         # написал что-то за секунды до остановки) — сбрасываем в очередь,
         # а не молча теряем.
         await self._telegram_handlers.flush_pending()
+        # Запланированные, но ещё не сработавшие комментарии — снимаем:
+        # они спят минутами, и без отмены shutdown ждал бы их впустую.
+        await self._channel_post_watcher.cancel_pending()
 
         for task in self._background_tasks:
             task.cancel()

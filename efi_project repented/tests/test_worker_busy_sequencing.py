@@ -14,9 +14,11 @@ import contextlib
 import pytest
 
 from efi.behavior.busy_engine import BusyDecision
+from efi.behavior.conversation_lifecycle import LifecycleDecision
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMServerError
 from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session, ToolCall, ToolCallFunction
+from efi.memory.social_memory import SocialInteraction, SocialInteractionKind
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.notifications.worker import _FAILURE_NOTICE_TEXT, Worker
@@ -646,3 +648,124 @@ async def test_user_message_keeps_the_full_tool_call_round_budget() -> None:
     await worker._run_with_tool_calls(params, session, tool_context, 8)
 
     assert router.call_count == 8
+
+
+class _FakeLifecycle:
+    """Подменяет ConversationLifecycle: фиксированное решение + список запросов."""
+
+    def __init__(self, *, disengage: bool = False, allow_proactive: bool = True) -> None:
+        self._disengage = disengage
+        self._allow_proactive = allow_proactive
+        self.evaluated: list[tuple[int | None, int, str]] = []
+
+    def allows_proactive_ping(self, user_id: int | None) -> bool:
+        return self._allow_proactive
+
+    async def evaluate(self, peer_user_id: int | None, chat_id: int, text: str) -> LifecycleDecision:
+        self.evaluated.append((peer_user_id, chat_id, text))
+        return LifecycleDecision(should_disengage=self._disengage, reason="test")
+
+
+def _worker_with_lifecycle(
+    events: list[str], lifecycle: _FakeLifecycle, *, social_memory: object | None = None
+) -> Worker:
+    telegram = _FakeTelegramNotifier(events)
+    tool_registry = ToolRegistry()
+    tool_registry.register(SendMessageTool(telegram))
+    return Worker(
+        0,
+        NotificationManager(worker_count=1),
+        llm_router=_ScriptedToolCallingLLMRouter(events, actual_reply_text="ответ"),  # type: ignore[arg-type]
+        tool_registry=tool_registry,
+        history=_FakeHistoryRepository(),
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=_FakeBusyEngine(0.0),  # type: ignore[arg-type]
+        telegram=telegram,  # type: ignore[arg-type]
+        lifecycle=lifecycle,  # type: ignore[arg-type]
+        social_memory=social_memory,  # type: ignore[arg-type]
+    )
+
+
+async def test_disengaged_conversation_produces_total_silence() -> None:
+    """
+    Молчание должно выглядеть как молчание: ни "прочитано", ни "печатает",
+    ни обращения к LLM — иначе это читается как начатый и брошенный ответ.
+    """
+    events: list[str] = []
+    worker = _worker_with_lifecycle(events, _FakeLifecycle(disengage=True))
+    notification = Notification(
+        type=NotificationType.USER_MESSAGE, chat_id=42, message="пока", payload={"sender_id": 999}
+    )
+
+    await worker._handle(notification)
+
+    assert events == []
+
+
+async def test_proactive_ping_to_a_stranger_is_dropped() -> None:
+    """Писать первой тому, кто об этом не просил, — навязчивость по определению."""
+    events: list[str] = []
+    worker = _worker_with_lifecycle(events, _FakeLifecycle(allow_proactive=False))
+    notification = Notification(type=NotificationType.SPONTANEOUS_PING, chat_id=42, message="напиши первой")
+
+    await worker._handle(notification)
+
+    assert events == []
+
+
+async def test_proactive_ping_to_the_owner_goes_through() -> None:
+    events: list[str] = []
+    worker = _worker_with_lifecycle(events, _FakeLifecycle(allow_proactive=True))
+    notification = Notification(type=NotificationType.SPONTANEOUS_PING, chat_id=42, message="напиши первой")
+
+    await worker._handle(notification)
+
+    assert events.count("send_message") == 1
+
+
+class _RecordingSocialMemory:
+    def __init__(self) -> None:
+        self.recorded: list[SocialInteraction] = []
+
+    async def record(self, interaction: SocialInteraction) -> int:
+        self.recorded.append(interaction)
+        return len(self.recorded)
+
+
+async def test_public_comment_is_recorded_in_social_memory() -> None:
+    """Внешний опыт фиксируется тем, что РЕАЛЬНО ушло людям, а не черновиком модели."""
+    events: list[str] = []
+    social_memory = _RecordingSocialMemory()
+    worker = _worker_with_lifecycle(events, _FakeLifecycle(), social_memory=social_memory)
+    notification = Notification(
+        type=NotificationType.PUBLIC_COMMENT,
+        chat_id=-1001,
+        message="пост про async",
+        payload={"is_public_comment": True, "thread_id": 55, "chat_title": "Канал"},
+    )
+
+    await worker._handle(notification)
+
+    assert len(social_memory.recorded) == 1
+    assert social_memory.recorded[0].kind is SocialInteractionKind.PUBLIC_COMMENT
+    assert social_memory.recorded[0].text == "ответ"
+    assert social_memory.recorded[0].thread_id == 55
+
+
+async def test_owner_conversation_is_not_recorded_as_external_experience() -> None:
+    """Личный разговор с владельцем — не «внешний опыт», ему в социальной памяти не место."""
+    events: list[str] = []
+    social_memory = _RecordingSocialMemory()
+    worker = _worker_with_lifecycle(
+        events, _FakeLifecycle(allow_proactive=True), social_memory=social_memory
+    )
+    notification = Notification(
+        type=NotificationType.USER_MESSAGE,
+        chat_id=42,
+        message="привет",
+        payload={"sender_id": 111, "chat_type": "PRIVATE"},
+    )
+
+    await worker._handle(notification)
+
+    assert social_memory.recorded == []
