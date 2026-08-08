@@ -19,7 +19,11 @@ from pyrogram.types import Message, Sticker
 from efi.notifications.schemas import Notification, NotificationType
 from efi.telegram.handlers import _build_sticker_text_and_payload
 from efi.tools.base import ToolContext
-from efi.tools.telegram_actions.react_with_emoji import ReactWithEmojiTool
+from efi.tools.telegram_actions.react_with_emoji import (
+    _ALLOWED_REACTIONS,
+    ReactWithEmojiTool,
+    normalize_reaction_emoji,
+)
 
 
 def _sticker(*, emoji: str | None = "😂", file_id: str | None = "AAAA_file_id") -> Sticker:
@@ -79,7 +83,9 @@ async def test_react_resolves_message_id_from_context_without_model_input() -> N
     result = await tool.execute({"emoji": "❤️"}, context)
 
     assert "Реакция поставлена" in result
-    assert reactor.calls == [(42, 12, "❤️")]  # реагирует на ПОСЛЕДНЕЕ сообщение пачки
+    # Реагирует на ПОСЛЕДНЕЕ сообщение пачки, и эмодзи уходит уже каноничным
+    # (без U+FE0F) — иначе Telegram примет вызов молча, не поставив ничего.
+    assert reactor.calls == [(42, 12, "❤")]
 
 
 async def test_react_is_unavailable_without_a_current_message() -> None:
@@ -100,3 +106,63 @@ async def test_react_requires_non_empty_emoji() -> None:
     context = _context(message_ids=[1])
     result = await tool.execute({"emoji": ""}, context)
     assert result.startswith("error:")
+
+
+# -- нормализация эмодзи под набор реакций Telegram --------------------------------
+#
+# Регрессия ровно с тем симптомом, который её и скрывал: MTProto-вызов с
+# нештатным эмодзи проходит без ошибки, Pyrogram возвращает True, в логах
+# честное "реакция поставлена" — а в чате не появляется ничего.
+
+
+def test_variation_selector_is_stripped() -> None:
+    """'❤️' (U+2764 U+FE0F) — то, что пишет модель; в списке реакций лежит '❤' (U+2764)."""
+    assert normalize_reaction_emoji("❤️") == "❤"
+
+
+def test_skin_tone_is_stripped() -> None:
+    assert normalize_reaction_emoji("👍🏻") == "👍"
+
+
+def test_plain_reaction_passes_through() -> None:
+    assert normalize_reaction_emoji("🔥") == "🔥"
+
+
+def test_composite_reactions_survive_normalization() -> None:
+    """ZWJ трогать нельзя: в наборе есть составные реакции, разбор по частям их уничтожит."""
+    assert normalize_reaction_emoji("❤‍🔥") == "❤‍🔥"
+    assert normalize_reaction_emoji("🤷‍♂️") == "🤷‍♂"
+
+
+def test_non_standard_emoji_is_rejected() -> None:
+    assert normalize_reaction_emoji("🫠") is None
+    assert normalize_reaction_emoji("не эмодзи") is None
+
+
+async def test_unsupported_emoji_never_reaches_the_network() -> None:
+    """
+    Ключевое: молчаливый no-op заменён внятной ошибкой, по которой модель
+    может выбрать другую реакцию, — вместо доклада об успехе без результата.
+    """
+    reactor = _FakeReactor()
+    tool = ReactWithEmojiTool(reactor)
+
+    result = await tool.execute({"emoji": "🫠"}, _context(message_ids=[7]))
+
+    assert result.startswith("error:")
+    assert reactor.calls == []
+
+
+def test_every_allowed_reaction_survives_its_own_normalization() -> None:
+    """
+    Защита от опечатки в самом списке: запись с U+FE0F или тоном кожи внутри
+    стала бы недостижимой — нормализация превращала бы её в другую строку, и
+    штатная реакция молча отвергалась бы как нештатная.
+    """
+    assert [item for item in _ALLOWED_REACTIONS if normalize_reaction_emoji(item) != item] == []
+
+
+async def test_rejection_suggests_valid_alternatives() -> None:
+    tool = ReactWithEmojiTool(_FakeReactor())
+    result = await tool.execute({"emoji": "🫠"}, _context(message_ids=[7]))
+    assert "👍" in result and "🔥" in result

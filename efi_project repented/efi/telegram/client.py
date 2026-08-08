@@ -285,7 +285,20 @@ class TelegramClientWrapper:
         свежий Pyrogram с поддержкой реакций — если метод недоступен в
         установленной версии, вызов бросит AttributeError, и это лучше
         обнаружить сразу при первом использовании, чем проглатывать молча.
+
+        Peer прогревается так же, как перед отправкой сообщения: внутри
+        send_reaction идёт resolve_peer, и для чата, которого нет в локальном
+        storage сессии, он падает сырым KeyError('ID not found') — наружу это
+        уходило невнятным "error: could not react: 'ID not found: ...'"
+        вместо честного "этот чат недоступен".
+
+        Эмодзи сюда обязан приходить уже приведённым к штатному набору
+        реакций Telegram (efi.tools.telegram_actions.react_with_emoji.
+        normalize_reaction_emoji) — сервер принимает нештатный вариант
+        молча, ничего не ставя.
         """
+        if not await self.ensure_peer_known(chat_id):
+            raise UnknownChatError(chat_id)
         await self._client.send_reaction(chat_id, message_id, emoji)
 
 
