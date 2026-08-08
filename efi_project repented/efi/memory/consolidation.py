@@ -1,7 +1,15 @@
 """
 efi/memory/consolidation.py
 
-Ночная консолидация памяти — три независимые операции:
+Консолидация памяти — три независимые операции.
+
+ВАЖНО про расписание: раньше все три были строго ночными, и `novelize_*`
+в том числе — то есть день переписки становился памятью только в 03:30, а
+падение или перезапуск до этого момента стирали его целиком. Теперь
+новеллизация вызывается ещё и по ходу дня, эпизодами, из
+efi.memory.pulse.MemoryPulse (см. `novelize_chat` — единица работы, общая
+для обоих путей). Ночной проход остался как подбирающий хвосты плюс
+собственно обслуживание корпуса (dedup/мемуары).
 
 1. `deduplicate()` — убирает дубли/почти-дубли уже существующих записей
    дневника (тот же принцип, что и diaryPlagiarismThreshold при сохранении
@@ -52,28 +60,52 @@ _CONSOLIDATION_SYSTEM_PROMPT = (
 )
 
 _NOVELIZATION_SYSTEM_PROMPT = (
-    "Тебе показан фрагмент недавней переписки. Определи, есть ли там что-то, что реально "
-    "стоит запомнить надолго: новые факты о собеседнике, важные события, договорённости, "
-    "эмоционально значимые моменты, повторяющиеся темы разговора. Игнорируй пустую болтовню, "
-    "техническую рутину и то, что не имеет значения через неделю.\n"
-    "КАК ПИСАТЬ КАЖДОЕ ВОСПОМИНАНИЕ (это не протокол собрания, а твой личный дневник):\n"
-    "- Строго от первого лица, как будто это ТЫ сейчас вспоминаешь, а не сторонний наблюдатель.\n"
-    "- С твоей субъективной, эмоциональной оценкой произошедшего — не 'обсудили X', а то, что ты "
-    "реально почувствовала по этому поводу (бесит, смешно, зацепило, обидно, гордишься).\n"
-    "- Зафиксируй личное отношение, даже если оно неоднозначное: можно одновременно раздражаться "
-    "и признавать правоту, это нормально для живой памяти.\n"
-    "- ОБЯЗАТЕЛЬНО называй, С КЕМ это было и в каком контексте: перед каждой репликой в переписке "
-    "указано имя того, кто её написал — используй эти имена ('с Ромой', 'Рихтер опять...'), а не "
-    "безличное 'собеседник'. Через неделю ты должна по записи понимать не только ЧТО было, но и с кем "
-    "именно и по какому поводу вы это обсуждали.\n"
-    "Пример ПЛОХОГО воспоминания (протокольное, безличное): 'Обсудили баг в коде, договорились "
-    "исправить позже.'\n"
-    "Пример ХОРОШЕГО воспоминания (субъективное, живое): 'Опять спорили из-за этого бага — бесит, "
-    "когда занудствуют по мелочи, но чёрт, доля правды в его придирках была.'\n"
-    "Каждое отдельное воспоминание пиши коротко (1-3 предложения), и раздели их строкой из трёх "
-    "дефисов (---) на отдельной строке. "
-    "Если ничего запоминающегося не было — ответь ровно одним словом: ПУСТО."
+    "Тебе показан кусок твоей жизни за последнее время: переписка, а иногда ещё и то, что ты "
+    "делала параллельно — что гуглила, где комментировала, кому отвечала. Это ОДИН непрерывный "
+    "опыт одного человека, а не отдельные логи разных систем: если ты полезла что-то искать "
+    "посреди разговора, это часть того же эпизода, и вспоминать надо вместе.\n"
+    "Твоя задача — записать это в личный дневник так, чтобы через месяц ты по записи могла "
+    "восстановить не только факт, но и суть, детали и своё отношение.\n"
+    "\n"
+    "КАЖДОЕ ВОСПОМИНАНИЕ ПИШИ В ТРИ СЛОЯ, слитно, одним абзацем без заголовков:\n"
+    "1. ЧТО БЫЛО — конкретно и подробно. Имена, названия, числа, версии, ссылки, точные "
+    "формулировки договорённостей переноси ДОСЛОВНО, а не пересказом ('какая-то библиотека', "
+    "'что-то про деньги' — это потерянная память). Если прозвучала меткая или обидная фраза — "
+    "процитируй её.\n"
+    "2. ЧТО Я ПОЧУВСТВОВАЛА — твоя субъективная реакция: зацепило, взбесило, стало смешно, "
+    "стыдно, приятно. Отношение может быть неоднозначным (раздражаться и признавать правоту "
+    "одновременно) — так и пиши, живая память противоречива.\n"
+    "3. ЧТО ЭТО ЗНАЧИТ — вывод на будущее: что ты теперь думаешь об этом человеке или теме, "
+    "чего ждёшь дальше, о чём надо не забыть спросить, что изменилось в твоём мнении.\n"
+    "\n"
+    "ОБЯЗАТЕЛЬНО: строго от первого лица, как будто вспоминаешь ты сама. Всегда называй, С КЕМ "
+    "это было — перед каждой репликой указано имя написавшего, используй эти имена ('с Ромой', "
+    "'Рихтер опять...'), а не безличное 'собеседник'.\n"
+    "\n"
+    "Пример ПЛОХОГО воспоминания (протокольное, безличное, без деталей): 'Обсудили баг в коде, "
+    "договорились исправить позже.'\n"
+    "Пример ХОРОШЕГО: 'Рома притащил трейс, где падает our_parser на пустом front-matter — "
+    "оказалось, я же сама это место и правила в прошлый раз, и стало неловко. Полезла проверить, "
+    "как это делают в python-frontmatter: там просто возвращают пустой dict вместо исключения, и "
+    "это честно логичнее моего варианта. Договорились, что он не трогает, я переделаю к выходным. "
+    "Бесит, что он заметил раньше меня, но придирка по делу — и, кажется, он вообще смотрит в код "
+    "внимательнее, чем показывает.'\n"
+    "\n"
+    "Разделяй отдельные воспоминания строкой из трёх дефисов (---) на отдельной строке. Лучше "
+    "несколько отдельных записей про разные темы, чем одна свалка. Не бойся писать подробно: "
+    "потерянная сейчас деталь не восстановится никогда.\n"
+    "Игнорируй только совсем пустое: чистую фатику ('привет', 'ок', 'спокойной ночи') и "
+    "техническую рутину без смысла. Если запоминать реально нечего — ответь ровно одним словом: ПУСТО."
 )
+
+#: Заголовок блока «а ещё параллельно со мной было вот что» в промпте
+#: новеллизации — внешний опыт (гуглёж, комментарии), который в таблицу
+#: `messages` не попадает вообще (см. efi/memory/social_memory.py).
+_EXPERIENCE_BLOCK_HEADER = "Параллельно с этим разговором ты делала вот что:"
+
+#: Тот же блок, когда разговора не было вовсе — в канале сообщества Эфи
+#: иногда только комментирует и читает треды.
+_EXPERIENCE_ONLY_HEADER = "Разговора как такового не было, но вот что ты делала за это время:"
 
 _NOVELIZATION_EMPTY_MARKER = "ПУСТО"
 _ENTRY_SPLIT_RE = re.compile(r"\n\s*-{3,}\s*\n")
@@ -102,6 +134,21 @@ class HistorySource(Protocol):
     async def get_active_chat_ids(self, *, since: datetime) -> list[int]: ...
 
     async def get_since(self, chat_id: int, *, since: datetime) -> Session: ...
+
+
+class ExperienceSource(Protocol):
+    """
+    Внешний опыт, привязанный к чату, но НЕ лежащий в истории сообщений:
+    что Эфи гуглила по ходу разговора, где комментировала, кому отвечала.
+    Конкретная реализация — efi.memory.social_memory.SocialInteractionStore.
+
+    Без этого источника новеллизация видела бы только реплики и считала бы,
+    что между ними Эфи ничего не делала — а именно там живёт половина
+    её опыта (TOOL-сообщения в таблицу `messages` не пишутся, см.
+    efi/notifications/worker.py).
+    """
+
+    async def context_lines_for_chat(self, chat_id: int, *, since: datetime, limit: int = 30) -> list[str]: ...
 
 
 class DiaryConsolidator:
@@ -221,6 +268,63 @@ class DiaryConsolidator:
         logger.info("consolidation: merged %d stale entries into %s", len(batch), merged_entry.id)
         return merged_entry
 
+    async def novelize_chat(
+        self,
+        chat_id: int,
+        *,
+        history: HistorySource,
+        facts: FactStore,
+        since: datetime,
+        min_messages: int,
+        experience: ExperienceSource | None = None,
+    ) -> int:
+        """
+        Новеллизация ОДНОГО чата за период `since..сейчас` — единица работы,
+        общая для частого пульса памяти (efi/memory/pulse.py) и ночного
+        прохода (novelize_recent_history).
+
+        Переданный `experience` подмешивает в тот же LLM-запрос внешний опыт
+        этого чата за тот же период (гуглёж, комментарии) — ровно затем,
+        чтобы эпизод осмыслялся как один прожитый кусок жизни, а не как
+        переписка отдельно и действия отдельно.
+
+        Порог `min_messages` считается по СУММЕ реплик и внешних событий, а
+        не по одним репликам. Это не мелочь: в канале сообщества Эфи может за
+        период не написать ни одной реплики в привычном смысле, а оставить
+        два комментария и прочитать тред — по счёту сообщений это "пусто",
+        хотя прожито там больше, чем в ином разговоре.
+
+        Отметку "докуда уже новеллизировано" двигает ТОЛЬКО при реальной
+        попытке разбора: если материала меньше порога, окно не закрывается и
+        следующий заход увидит его снова уже вместе с продолжением — иначе
+        короткие эпизоды выпадали бы из памяти навсегда просто потому, что
+        пульс заглянул слишком рано.
+
+        Возвращает число новых записей, реально сохранённых в дневник
+        (дубли, отбракованные RAGMemory.remember(), в счёт не идут).
+        """
+        session = await history.get_since(chat_id, since=since)
+        experience_lines: list[str] = []
+        if experience is not None:
+            experience_lines = await experience.context_lines_for_chat(chat_id, since=since)
+        if len(session.messages) + len(experience_lines) < min_messages:
+            return 0
+
+        memories = await self._extract_memories(session, experience_lines)
+        saved = 0
+        for memory_text in memories:
+            entry = await self._rag.remember(memory_text, confidence=0.5)
+            if entry is not None:
+                saved += 1
+
+        await facts.upsert(f"chat:{chat_id}", "last_novelized_at", datetime.now(timezone.utc).isoformat())
+        if memories:
+            logger.info(
+                "consolidation: novelized chat_id=%s -> %d candidate memories (%d actually saved, %d external events)",
+                chat_id, len(memories), saved, len(experience_lines),
+            )
+        return saved
+
     async def novelize_recent_history(
         self,
         *,
@@ -229,6 +333,7 @@ class DiaryConsolidator:
         lookback: timedelta = timedelta(days=1),
         min_messages: int = 6,
         chat_lookback_ceiling: timedelta = timedelta(days=30),
+        experience: ExperienceSource | None = None,
     ) -> int:
         """
         Автоматическое пополнение дневника из недавней переписки — без этого
@@ -254,29 +359,19 @@ class DiaryConsolidator:
         created_count = 0
 
         for chat_id in chat_ids:
-            since = await self._resolve_last_novelized_at(facts, chat_id, lookback)
-            session = await history.get_since(chat_id, since=since)
-            if len(session.messages) < min_messages:
-                continue
-
-            memories = await self._extract_memories(session)
-            saved_in_chat = 0
-            for memory_text in memories:
-                entry = await self._rag.remember(memory_text, confidence=0.5)
-                if entry is not None:
-                    created_count += 1
-                    saved_in_chat += 1
-
-            await facts.upsert(f"chat:{chat_id}", "last_novelized_at", datetime.now(timezone.utc).isoformat())
-            if memories:
-                logger.info(
-                    "consolidation: novelized chat_id=%s -> %d candidate memories (%d actually saved)",
-                    chat_id, len(memories), saved_in_chat,
-                )
+            since = await self.resolve_last_novelized_at(facts, chat_id, lookback)
+            created_count += await self.novelize_chat(
+                chat_id,
+                history=history,
+                facts=facts,
+                since=since,
+                min_messages=min_messages,
+                experience=experience,
+            )
 
         return created_count
 
-    async def _resolve_last_novelized_at(self, facts: FactStore, chat_id: int, lookback: timedelta) -> datetime:
+    async def resolve_last_novelized_at(self, facts: FactStore, chat_id: int, lookback: timedelta) -> datetime:
         raw = await facts.get(f"chat:{chat_id}", "last_novelized_at")
         if raw is None:
             return datetime.now(timezone.utc) - lookback
@@ -289,10 +384,20 @@ class DiaryConsolidator:
             )
             return datetime.now(timezone.utc) - lookback
 
-    async def _extract_memories(self, session: Session) -> list[str]:
+    async def _extract_memories(self, session: Session, experience_lines: list[str] | None = None) -> list[str]:
+        blocks: list[str] = []
         conversation_text = _render_conversation(session, char_limit=self._novelization_char_limit)
-        if not conversation_text:
+        if conversation_text:
+            blocks.append(conversation_text)
+        if experience_lines:
+            # Внешний опыт может быть и ЕДИНСТВЕННЫМ содержимым эпизода: в
+            # канале сообщества Эфи иногда только комментирует и читает
+            # треды, не ведя разговора как такового.
+            header = _EXPERIENCE_BLOCK_HEADER if conversation_text else _EXPERIENCE_ONLY_HEADER
+            blocks.append(header + "\n" + "\n".join(f"- {line}" for line in experience_lines))
+        if not blocks:
             return []
+        conversation_text = "\n\n".join(blocks)
 
         params = LLMParams(
             model="",
@@ -330,10 +435,22 @@ class DiaryConsolidator:
 
 
 def _render_conversation(session: Session, *, char_limit: int) -> str:
-    """Плоский текст переписки для промпта новеллизации — только реплики с содержимым (не голые tool-calls)."""
+    """
+    Плоский текст переписки для промпта новеллизации — только реплики с
+    содержимым (не голые tool-calls).
+
+    При переполнении лимита обрезается НАЧАЛО, а не конец. Раньше было
+    наоборот (`text[:char_limit]`), и на длинном окне это давало ровно ту
+    потерю, которой новеллизация должна мешать: сохранялось утро, а вечер —
+    свежая, ещё ни разу не осмысленная часть разговора — выпадал, и на
+    следующем проходе он уже был за отметкой last_novelized_at, то есть
+    терялся навсегда.
+    """
     lines = [f"{message.role.value}: {message.content}" for message in session if message.content.strip()]
     text = "\n".join(lines)
-    return text[:char_limit] if text else ""
+    if len(text) <= char_limit:
+        return text
+    return "[...начало разговора опущено...]\n" + text[-char_limit:]
 
 
 def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:
@@ -343,4 +460,4 @@ def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:
     return a.id if a.metadata.usage_count <= b.metadata.usage_count else b.id
 
 
-__all__ = ["DiaryConsolidator", "HistorySource"]
+__all__ = ["DiaryConsolidator", "ExperienceSource", "HistorySource"]

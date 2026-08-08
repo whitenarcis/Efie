@@ -491,8 +491,13 @@ class MemorySettings(BaseModel):
         description="На сколько дней назад заглядывать при первой ночной новеллизации чата, если для него ещё нет отметки 'докуда уже новеллизировано'",
     )
     novelization_min_messages: int = Field(
-        default=6, ge=1,
-        description="Минимум новых сообщений в чате с прошлой новеллизации, чтобы вообще запускать по нему извлечение памяти — не тратить LLM-вызов на пустяковую переписку",
+        default=3, ge=1,
+        description=(
+            "Минимум новых сообщений в чате с прошлой новеллизации, чтобы вообще запускать по нему "
+            "извлечение памяти. Раньше стояло 6, и чат, где за сутки прошёл короткий, но "
+            "содержательный обмен из 4-5 реплик, не попадал в дневник НИКОГДА: порог не набирался, "
+            "а на следующий день окно уже уезжало вперёд."
+        ),
     )
     novelization_char_limit: int = Field(
         default=10_000, ge=1,
@@ -522,6 +527,56 @@ class MemorySettings(BaseModel):
     def resolve_diary_dir(self, paths: PathsSettings) -> Path:
         """Возвращает diary_dir с учётом переопределения — используется при сборке Diary в app.py."""
         return self.diary_dir if self.diary_dir is not None else paths.diary_dir
+
+
+class MemoryPulseSettings(BaseModel):
+    """
+    Параметры пульса памяти (efi.memory.pulse.MemoryPulse) — насколько часто
+    прожитое превращается в воспоминания.
+
+    До появления пульса это происходило ровно один раз в сутки, ночью, и
+    день переписки до 03:30 не был памятью вообще (см. докстринг
+    efi/memory/pulse.py). Дефолты подобраны так, чтобы эпизод осмыслялся
+    вскоре после того, как разговор закончился, но LLM-вызов не уходил на
+    каждую пару реплик живого диалога.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(
+        default=True,
+        description="Выключает частую новеллизацию, оставляя только ночной проход (поведение до появления пульса)",
+    )
+    check_interval_seconds: float = Field(
+        default=600.0, gt=0.0, description="Как часто проверять, не завершился ли где-то разговорный эпизод"
+    )
+    episode_idle_seconds: float = Field(
+        default=900.0, gt=0.0,
+        description=(
+            "Сколько тишины в чате означает, что эпизод закончился и его пора запоминать. Человек "
+            "запоминает разговор не по часам, а когда общение закончилось — отсюда и критерий."
+        ),
+    )
+    max_messages_before_flush: int = Field(
+        default=30, ge=2,
+        description=(
+            "Сколько сообщений может накопиться с прошлого разбора, прежде чем эпизод разбирается "
+            "принудительно, не дожидаясь паузы — иначе марафонская переписка снова свернулась бы "
+            "в один обрубленный кусок."
+        ),
+    )
+    min_messages: int = Field(
+        default=3, ge=1,
+        description=(
+            "Минимум сообщений в эпизоде, чтобы вообще звать LLM. Ниже, чем у ночного прохода "
+            "(memory.novelization_min_messages): короткий, но содержательный обмен репликами — "
+            "это тоже прожитый эпизод, а не пустяк."
+        ),
+    )
+    lookback_hours: int = Field(
+        default=12, ge=1,
+        description="На сколько часов назад заглядывать в чате, для которого ещё нет отметки 'докуда новеллизировано'",
+    )
 
 
 class StateVectorSettings(BaseModel):
@@ -750,6 +805,7 @@ class Settings(BaseSettings):
     telegram: TelegramSettings
     llm_roles: LLMRolesSettings
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    memory_pulse: MemoryPulseSettings = Field(default_factory=MemoryPulseSettings)
     humanizer: HumanizerSettings = Field(default_factory=HumanizerSettings)
     state_vector: StateVectorSettings = Field(default_factory=StateVectorSettings)
     stt: SttSettings = Field(default_factory=SttSettings)
@@ -831,6 +887,7 @@ __all__ = [
     "RoleRoute",
     "LLMRolesSettings",
     "MemorySettings",
+    "MemoryPulseSettings",
     "HumanizerSettings",
     "StateVectorSettings",
     "SttSettings",

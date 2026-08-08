@@ -62,6 +62,14 @@ class SocialInteractionKind(str, Enum):
     STRANGER_DM = "stranger_dm"
     #: Эфи прочитала тред обсуждения (зашла посмотреть, что пишут).
     THREAD_READ = "thread_read"
+    #: Эфи полезла в интернет прямо по ходу разговора (web_search).
+    #: Раньше этот опыт не сохранялся НИГДЕ: результаты поиска приходят
+    #: модели TOOL-сообщением, а в таблицу `messages` пишутся только реплика
+    #: собеседника и итоговый ответ Эфи (см. efi/notifications/worker.py) —
+    #: значит, ни история, ни новеллизация этого следа не видели. Через день
+    #: Эфи не помнила, что вообще что-то гуглила, хотя разговор строился
+    #: вокруг найденного.
+    WEB_LOOKUP = "web_lookup"
 
 
 #: Как каждый вид опыта звучит в дневнике от первого лица. Ключ — вид,
@@ -73,10 +81,18 @@ _DIARY_TEMPLATES: dict[SocialInteractionKind, str] = {
     SocialInteractionKind.RECEIVED_REPLY: "{who} ответил мне {where}: «{text}»",
     SocialInteractionKind.STRANGER_DM: "Мне в ЛС писал {who}: «{text}»",
     SocialInteractionKind.THREAD_READ: "Читала обсуждение {where}. Там: «{text}»",
+    SocialInteractionKind.WEB_LOOKUP: "Полезла гуглить и вычитала: «{text}»",
 }
 
 TAG_PUBLIC_COMMENT = "#public_comment"
 TAG_DISCUSSION_THREAD = "#discussion_thread"
+TAG_WEB_LOOKUP = "#web_lookup"
+
+#: Сколько символов результата поиска сохранять в журнале. Больше, чем
+#: _MAX_TEXT_PREVIEW: сниппеты — это фактура (числа, названия, ссылки),
+#: ради которой запись и делается, а обрезанный до пары фраз результат
+#: поиска в дневнике бесполезен.
+_MAX_LOOKUP_DIGEST = 1200
 
 
 @dataclass(slots=True, frozen=True)
@@ -111,21 +127,28 @@ class SocialInteraction:
             tags.append(f"#secondary_user_{self.peer_user_id}")
         return tags
 
+    def render_for_prompt(self) -> str:
+        """
+        Живая фраза от первого лица БЕЗ метатегов — то, что подмешивается в
+        промпт новеллизации как «а ещё за это время со мной было вот что»
+        (см. efi/memory/pulse.py). Теги там только зашумляли бы контекст:
+        они нужны для поиска по уже сохранённому, а не для осмысления.
+        """
+        where = f"в «{self.chat_title}»" if self.chat_title else "в чужом чате"
+        who = self.peer_name or "какой-то тип"
+        limit = _MAX_LOOKUP_DIGEST if self.kind is SocialInteractionKind.WEB_LOOKUP else _MAX_TEXT_PREVIEW
+        text = self.text.strip()
+        if len(text) > limit:
+            text = text[:limit].rstrip() + "…"
+        return _DIARY_TEMPLATES[self.kind].format(where=where, who=who, text=text)
+
     def render_for_diary(self) -> str:
         """
         Текст записи для векторной памяти — живой фразой от первого лица,
         а не протоколом (см. докстринг модуля). Метатеги идут отдельной
         строкой в конце, чтобы не ломать читаемость самой фразы.
         """
-        where = f"в «{self.chat_title}»" if self.chat_title else "в чужом чате"
-        who = self.peer_name or "какой-то тип"
-        text = self.text.strip()
-        if len(text) > _MAX_TEXT_PREVIEW:
-            text = text[:_MAX_TEXT_PREVIEW].rstrip() + "…"
-
-        template = _DIARY_TEMPLATES[self.kind]
-        body = template.format(where=where, who=who, text=text)
-        return f"{body}\n{' '.join(self.build_tags())}"
+        return f"{self.render_for_prompt()}\n{' '.join(self.build_tags())}"
 
 
 class SocialInteractionStore:
@@ -181,6 +204,62 @@ class SocialInteractionStore:
             interaction.peer_user_id, interaction_id,
         )
         return interaction_id
+
+    async def record_web_lookup(
+        self,
+        *,
+        query: str,
+        digest: str,
+        chat_id: int | None = None,
+        thread_id: int | None = None,
+    ) -> int:
+        """
+        Фиксирует поход в интернет как отдельный вид внешнего опыта.
+
+        Вызывается прямо из efi.tools.web_tools.web_search.WebSearchTool в
+        момент поиска, а не отложенно: результаты поиска приходят модели
+        TOOL-сообщением, которое в историю чата не сохраняется вообще (см.
+        комментарий у SocialInteractionKind.WEB_LOOKUP) — если не записать
+        здесь, этот опыт не восстановится ниоткуда.
+
+        Запись синхронная (await, а не fire-and-forget) сознательно: вставка
+        в SQLite плюс локальный эмбеддинг — десятки миллисекунд на фоне
+        секунд самого сетевого поиска, а взамен нет ни гонок, ни потерянных
+        задач при остановке приложения посреди хода.
+        """
+        return await self.record(
+            SocialInteraction(
+                kind=SocialInteractionKind.WEB_LOOKUP,
+                text=f"{query.strip()} — {digest.strip()}",
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+        )
+
+    async def context_lines_for_chat(
+        self, chat_id: int, *, since: datetime, limit: int = 30
+    ) -> list[str]:
+        """
+        Что произошло во внешнем мире в рамках ЭТОГО чата начиная с `since`,
+        живыми фразами от первого лица — вход для новеллизации эпизода
+        (efi/memory/pulse.py). Именно это склеивает опыт в одну личность:
+        разговор, гуглёж по ходу разговора и оставленный комментарий
+        осмысляются одной записью, а не тремя независимыми логами.
+
+        Хронологический порядок (от старых к новым) — в отличие от recent(),
+        где интересны как раз самые свежие: для пересказа эпизода нужен
+        естественный ход времени.
+        """
+        rows = await self._database.fetch_all(
+            """
+            SELECT kind, chat_id, thread_id, peer_user_id, peer_name, text, created_at
+            FROM social_interactions
+            WHERE chat_id = ? AND created_at >= ?
+            ORDER BY created_at ASC LIMIT ?
+            """,
+            (chat_id, since.isoformat(), limit),
+        )
+        return [_row_to_interaction(row).render_for_prompt() for row in rows]
 
     async def _index_in_vector_memory(self, interaction: SocialInteraction) -> None:
         if self._rag is None:
@@ -243,4 +322,5 @@ __all__ = [
     "SocialInteractionStore",
     "TAG_DISCUSSION_THREAD",
     "TAG_PUBLIC_COMMENT",
+    "TAG_WEB_LOOKUP",
 ]
