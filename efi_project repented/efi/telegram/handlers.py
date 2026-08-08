@@ -1,7 +1,7 @@
 """
 efi/telegram/handlers.py
 
-Обработчики входящих событий Telegram: текст, фото, голосовые, видео-кружки.
+Обработчики входящих событий Telegram: текст, фото, голосовые, видео-кружки, стикеры.
 
 Путь одного сообщения:
     1. Единая точка допуска — `_authorize()`: Lockdown/allowlist
@@ -157,6 +157,7 @@ class TelegramEventHandlers:
         client.add_handler(_make_handler(filters.photo & own_messages_filter, self._handle_photo))
         client.add_handler(_make_handler(filters.voice & own_messages_filter, self._handle_voice))
         client.add_handler(_make_handler(filters.video_note & own_messages_filter, self._handle_video_note))
+        client.add_handler(_make_handler(filters.sticker & own_messages_filter, self._handle_sticker))
 
     async def flush_pending(self) -> None:
         """Принудительно сбрасывает все накопленные в дебаунсере сообщения. Вызывается при graceful shutdown (efi/app.py)."""
@@ -223,6 +224,25 @@ class TelegramEventHandlers:
         await self._dispatch_user_message(
             access_info, message, text=f"[прислал(а) видео-кружок] {transcript}", payload={"media_type": "video_note"}
         )
+
+    async def _handle_sticker(self, client: Client, message: PyrogramMessage) -> None:
+        """
+        Раньше стикеры не обрабатывались вообще — не было зарегистрировано
+        ни одного обработчика на filters.sticker, поэтому входящий стикер
+        просто исчезал: ни в истории, ни в контексте модели о нём не
+        оставалось ни следа. Заодно кладём file_id в текст: это единственный
+        способ, которым Эфи вообще может УЗНАТЬ file_id хоть какого-то
+        стикера — send_sticker (efi.tools.telegram_actions.stickers.
+        SendStickerTool) принимает file_id, но собственного индекса стикеров
+        у неё нет, так что раньше ей было физически неоткуда взять хотя бы
+        один валидный file_id для отправки.
+        """
+        access_info = await self._authorize(client, message)
+        if access_info is None:
+            return
+
+        text, payload = _build_sticker_text_and_payload(message)
+        await self._dispatch_user_message(access_info, message, text=text, payload=payload)
 
     async def _transcribe_audio(
         self,
@@ -367,6 +387,26 @@ class TelegramEventHandlers:
             payload=merged_payload,
         )
         await self._manager.put(notification)
+
+
+def _build_sticker_text_and_payload(message: PyrogramMessage) -> tuple[str, dict[str, Any]]:
+    """
+    Текст и payload для входящего стикера — вынесено из _handle_sticker в
+    чистую функцию, чтобы её можно было протестировать без реального
+    Client/дебаунсера. file_id кладётся и в текст (единственный способ,
+    которым модель вообще может узнать хоть один валидный file_id для
+    send_sticker — см. докстринг _handle_sticker), и в payload отдельным
+    ключом на случай, если он понадобится программно, а не через текст.
+    """
+    sticker = message.sticker
+    emoji = getattr(sticker, "emoji", None) or "?"
+    file_id = getattr(sticker, "file_id", None)
+    text = f"[прислал(а) стикер {emoji}]"
+    payload: dict[str, Any] = {"media_type": "sticker"}
+    if file_id:
+        text += f" (file_id для повторной отправки через send_sticker: {file_id})"
+        payload["sticker_file_id"] = file_id
+    return text, payload
 
 
 def _is_addressed_to_bot(message: PyrogramMessage, client: Client) -> bool:
