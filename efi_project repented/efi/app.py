@@ -179,7 +179,13 @@ class EfiApp:
             self._organic_ping,
             check_interval_seconds=settings.life_engine.check_interval_seconds,
         )
-        self._busy_engine = BusyEngine(self._working_memory, self._affinity, self._life_engine, settings.busy_engine)
+        self._busy_engine = BusyEngine(
+            self._working_memory,
+            self._affinity,
+            self._life_engine,
+            settings.busy_engine,
+            last_message_source=self._history,
+        )
 
         # -- telegram --------------------------------------------------------
         self._pyrogram_client = Client(
