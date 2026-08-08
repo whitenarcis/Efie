@@ -100,6 +100,46 @@ CREATE INDEX IF NOT EXISTS idx_people_last_seen ON people (last_seen_at DESC);
 """
 
 
+_SOCIAL_INTERACTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS social_interactions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind           TEXT NOT NULL,        -- значение efi.memory.social_memory.SocialInteractionKind
+    chat_id        INTEGER,              -- канал/группа/ЛС, где это произошло
+    thread_id      INTEGER,              -- id обсуждения под постом, если это тред
+    peer_user_id   INTEGER,              -- с кем именно (NULL для чтения треда «вообще»)
+    peer_name      TEXT NOT NULL DEFAULT '',
+    text           TEXT NOT NULL,
+    tags           TEXT NOT NULL DEFAULT '',  -- пробел-разделённые метатеги (#public_comment и т.п.)
+    created_at     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_social_interactions_created ON social_interactions (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_social_interactions_peer ON social_interactions (peer_user_id);
+CREATE INDEX IF NOT EXISTS idx_social_interactions_chat ON social_interactions (chat_id, thread_id);
+"""
+
+_CONVERSATION_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS conversation_state (
+    peer_user_id    INTEGER NOT NULL,
+    chat_id         INTEGER NOT NULL,
+    annoyance_score REAL NOT NULL DEFAULT 0.0,
+    status          TEXT NOT NULL DEFAULT 'active',   -- active | closed
+    closed_reason   TEXT NOT NULL DEFAULT '',
+    updated_at      TEXT NOT NULL,
+    PRIMARY KEY (peer_user_id, chat_id)
+);
+"""
+
+_THREAD_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS thread_state (
+    chat_id        INTEGER NOT NULL,
+    thread_id      INTEGER NOT NULL,
+    commented_at   TEXT,                              -- когда Эфи там уже отписалась (NULL — ещё нет)
+    last_seen_at   TEXT NOT NULL,
+    PRIMARY KEY (chat_id, thread_id)
+);
+"""
+
+
 async def _migration_001_messages(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_MESSAGES_SCHEMA)
 
@@ -128,6 +168,18 @@ async def _migration_007_people(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_PEOPLE_SCHEMA)
 
 
+async def _migration_008_social_interactions(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_SOCIAL_INTERACTIONS_SCHEMA)
+
+
+async def _migration_009_conversation_state(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_CONVERSATION_STATE_SCHEMA)
+
+
+async def _migration_010_thread_state(conn: aiosqlite.Connection) -> None:
+    await conn.executescript(_THREAD_STATE_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -137,6 +189,9 @@ MIGRATIONS = [
     _migration_005_chat_affinity,
     _migration_006_curiosity_seeds,
     _migration_007_people,
+    _migration_008_social_interactions,
+    _migration_009_conversation_state,
+    _migration_010_thread_state,
 ]
 
 __all__ = ["MIGRATIONS"]

@@ -208,6 +208,14 @@ class TelegramSettings(BaseModel):
         "Если не задано — берётся Telegram-имя отправителя, когда он владелец, либо общее 'создатель'.",
     )
     allowed_chats: list[int] = Field(default_factory=list, description="Явный allowlist чатов помимо владельца")
+    community_chats: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Каналы/группы обсуждений, где Эфи участвует как обычный участник сообщества (комментарии, "
+            "треды, ответы на упоминания). ЯВНЫЙ opt-in: только эти чаты обходят lockdown_mode — всё "
+            "остальное он по-прежнему закрывает. Пустой список = Эфи остаётся персональным ботом."
+        ),
+    )
     chat_labels: dict[int, str] = Field(default_factory=dict, description="Человекочитаемые метки чатов для контекста LLM")
 
     lockdown_mode: LockdownMode = LockdownMode.OWNER_ONLY
@@ -649,6 +657,49 @@ class BusyEngineSettings(BaseModel):
         return self
 
 
+class CommunitySettings(BaseModel):
+    """
+    Параметры участия Эфи в жизни сообщества (efi.telegram.comments):
+    комментарии под постами и выборочное включение в треды обсуждений.
+
+    Сами чаты перечисляются в `telegram.community_chats` — здесь только
+    ПОВЕДЕНИЕ: насколько охотно вписываться и с какой задержкой. Дефолты
+    намеренно сдержанные: участник сообщества, который комментирует каждый
+    пост, — это спамер, а не участник.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=True, description="Полностью выключает комментирование, не трогая community_chats")
+    comment_probability: float = Field(
+        default=0.35, ge=0.0, le=1.0,
+        description="Вероятность вписаться в подходящий по теме пост (тема уже совпала — это ещё и «в настроении ли»)",
+    )
+    min_delay_seconds: float = Field(
+        default=300.0, ge=0.0,
+        description="Нижняя граница задержки перед комментарием: живой человек не отвечает на пост в ту же секунду",
+    )
+    max_delay_seconds: float = Field(
+        default=1800.0, gt=0.0, description="Верхняя граница той же задержки (по умолчанию 30 минут)"
+    )
+    thread_scan_interval_seconds: float = Field(
+        default=1800.0, gt=0.0, description="Как часто RandomCommentEngager заглядывает в треды"
+    )
+    max_replies_per_thread: int = Field(
+        default=1, ge=1, description="Сколько комментариев Эфи оставляет в одном треде за заход"
+    )
+    topic_match_min_score: float = Field(
+        default=0.34, ge=0.0, le=1.0,
+        description="Минимальная доля пересечения слов поста с интересами/семенами любопытства",
+    )
+
+    @model_validator(mode="after")
+    def _validate_delay_range(self) -> "CommunitySettings":
+        if self.min_delay_seconds > self.max_delay_seconds:
+            raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
+        return self
+
+
 class QuietHoursSettings(BaseModel):
     """
     Ночные "тихие часы" для проактивных путей (efi.behavior.spontaneous_ping,
@@ -705,6 +756,7 @@ class Settings(BaseSettings):
     life_engine: LifeEngineSettings = Field(default_factory=LifeEngineSettings)
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
     quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
+    community: CommunitySettings = Field(default_factory=CommunitySettings)
 
     @classmethod
     def settings_customise_sources(

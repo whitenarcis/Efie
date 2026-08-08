@@ -89,10 +89,12 @@ import logging
 from typing import Protocol
 
 from efi.behavior.busy_engine import BusyEngine
+from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Response, Role, Session
+from efi.memory.social_memory import SocialInteraction, SocialInteractionKind, SocialInteractionStore
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.security.sanitize import sanitize_text
@@ -120,6 +122,16 @@ _NO_REPLY_REMINDER_TEXT = (
 #: статуса "печатает" в Telegram (~5-6с, см. efi/telegram/typing_tracker.py),
 #: чтобы статус не успевал погаснуть между пингами.
 _TYPING_PULSE_INTERVAL_SECONDS = 4.0
+
+#: Уведомления, где Эфи пишет ПЕРВОЙ. Разрешены только владельцу —
+#: см. ConversationLifecycle.allows_proactive_ping и Worker._should_disengage.
+_PROACTIVE_NOTIFICATION_TYPES = frozenset(
+    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING, NotificationType.FOLLOW_UP}
+)
+
+#: Публичные выступления — их результат идёт в социальную память как
+#: #public_comment (см. Worker._record_social_interaction).
+_PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
 
 
 class HistoryRepository(Protocol):
@@ -177,6 +189,8 @@ class Worker:
         proactive_max_tool_call_rounds: int = 2,
         history_limit: int = 20,
         telegram: TelegramNotifier | None = None,
+        lifecycle: ConversationLifecycle | None = None,
+        social_memory: SocialInteractionStore | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -190,6 +204,8 @@ class Worker:
         self._proactive_max_tool_call_rounds = proactive_max_tool_call_rounds
         self._history_limit = history_limit
         self._telegram = telegram
+        self._lifecycle = lifecycle
+        self._social_memory = social_memory
 
     async def run(self) -> None:
         """
@@ -216,6 +232,9 @@ class Worker:
             raise
 
     async def _handle(self, notification: Notification) -> None:
+        if await self._should_disengage(notification):
+            return
+
         decision = await self._busy_engine.decide(notification.chat_id)
         is_user_message = notification.type is NotificationType.USER_MESSAGE and notification.chat_id is not None
 
@@ -297,6 +316,87 @@ class Worker:
 
         if notification.chat_id is not None:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
+
+        await self._record_social_interaction(notification, tool_context)
+
+    async def _record_social_interaction(self, notification: Notification, tool_context: ToolContext) -> None:
+        """
+        Немедленно фиксирует внешнее взаимодействие в социальной памяти —
+        публичный комментарий и переписку с посторонним (см. докстринг
+        efi/memory/social_memory.py про гарантию сохранения).
+
+        Пишется именно то, что РЕАЛЬНО ушло собеседнику (`sent_texts`), а не
+        то, что модель собиралась сказать: журнал внешнего опыта должен
+        совпадать с тем, что видели другие люди. Сбой записи не срывает уже
+        доставленный ответ — только логируется.
+        """
+        if self._social_memory is None or notification.chat_id is None:
+            return
+
+        sent_texts = tool_context.extra.get("sent_texts")
+        if not sent_texts:
+            return
+
+        sender_id = notification.payload.get("sender_id")
+        sender_id = sender_id if isinstance(sender_id, int) else None
+        is_public = bool(notification.payload.get("is_public_comment")) or notification.type in _PUBLIC_COMMENT_TYPES
+        is_stranger_dm = (
+            not is_public
+            and notification.payload.get("chat_type") == "PRIVATE"
+            and self._lifecycle is not None
+            and not self._lifecycle.allows_proactive_ping(sender_id)
+        )
+        if not is_public and not is_stranger_dm:
+            return
+
+        try:
+            await self._social_memory.record(
+                SocialInteraction(
+                    kind=SocialInteractionKind.PUBLIC_COMMENT if is_public else SocialInteractionKind.STRANGER_DM,
+                    text="\n".join(sent_texts),
+                    chat_id=notification.chat_id,
+                    thread_id=notification.payload.get("thread_id"),
+                    peer_user_id=sender_id,
+                    peer_name=str(notification.payload.get("sender_name") or ""),
+                    chat_title=str(notification.payload.get("chat_title") or ""),
+                )
+            )
+        except Exception:
+            logger.warning(
+                "worker[%d]: failed to record social interaction for notification %s",
+                self._worker_index, notification.id, exc_info=True,
+            )
+
+    async def _should_disengage(self, notification: Notification) -> bool:
+        """
+        Молчаливый выход из разговора с посторонним — см.
+        efi.behavior.conversation_lifecycle.ConversationLifecycle.
+
+        Проверяется ПЕРВЫМ, до busy-задержки и до любого обращения к
+        Telegram: если Эфи решила не отвечать, она и не должна засветиться
+        ни статусом "прочитано", ни "печатает" — молчание должно выглядеть
+        как молчание, а не как начатый и брошенный ответ.
+
+        Инициативные пинги посторонним отсекаются здесь же: писать первой
+        тому, кто об этом не просил, — навязчивость по определению.
+        """
+        if self._lifecycle is None:
+            return False
+
+        sender_id = notification.payload.get("sender_id")
+        sender_id = sender_id if isinstance(sender_id, int) else None
+
+        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not self._lifecycle.allows_proactive_ping(sender_id):
+            logger.debug(
+                "worker[%d]: skipping proactive %s for a non-primary user", self._worker_index, notification.type.value
+            )
+            return True
+
+        if notification.type is not NotificationType.USER_MESSAGE or notification.chat_id is None:
+            return False
+
+        decision = await self._lifecycle.evaluate(sender_id, notification.chat_id, notification.message)
+        return decision.should_disengage
 
     async def _ensure_reply_was_sent(
         self, params: LLMParams, session: Session, tool_context: ToolContext, response: Response
