@@ -33,7 +33,10 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> None:
-        """Регистрирует инструмент. Повторная регистрация того же имени — ошибка конфигурации, не должна проходить незаметно."""
+        """
+        Регистрирует инструмент. Повторная регистрация того же имени — ошибка конфигурации, не должна проходить
+        незаметно.
+        """
         if tool.name in self._tools:
             raise ValueError(f"tool {tool.name!r} is already registered")
         self._tools[tool.name] = tool

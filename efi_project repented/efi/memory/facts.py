@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from efi.db.core import Database
 
@@ -49,7 +49,7 @@ class FactStore:
 
     async def upsert(self, entity_id: str, key: str, value: str, *, confidence: float = 1.0) -> None:
         """Записывает или обновляет факт (SQLite UPSERT по составному первичному ключу)."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._database.execute(
             """
             INSERT INTO facts (entity_id, fact_key, fact_value, confidence, updated_at)

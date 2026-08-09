@@ -42,7 +42,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 OnFlush = Callable[[int, list[T]], Awaitable[None]]
-OnInterrupt = Callable[[int], Awaitable[None]]
+#: Возвращаемое значение не используется (ChatOrchestrator.interrupt отдаёт bool
+#: «было ли что прерывать») — буферу важен только сам факт вызова.
+OnInterrupt = Callable[[int], Awaitable[object]]
 
 #: Плавающее окно сборки. Нижняя граница — чтобы вторая реплика из быстрой
 #: пачки успела долететь; верхняя — чтобы одиночное сообщение не ждало

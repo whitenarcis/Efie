@@ -34,8 +34,8 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from efi.db.core import Database
 from efi.memory.rag import RAGMemory
@@ -51,7 +51,7 @@ _SOCIAL_CONFIDENCE = 0.6
 _MAX_TEXT_PREVIEW = 400
 
 
-class SocialInteractionKind(str, Enum):
+class SocialInteractionKind(StrEnum):
     """Что именно произошло во внешнем мире."""
 
     #: Эфи оставила публичный комментарий (канал/тред обсуждения).
@@ -106,7 +106,7 @@ class SocialInteraction:
     peer_user_id: int | None = None
     peer_name: str = ""
     chat_title: str = ""
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def build_tags(self) -> list[str]:
         """

@@ -136,13 +136,16 @@ def _parse_results(html: str) -> list[tuple[str, str, str]]:
     soup = BeautifulSoup(html, "html.parser")
     results: list[tuple[str, str, str]] = []
 
-    anchors = soup.select("a.result-link")
+    anchors: list[Tag] = list(soup.select("a.result-link"))
     if not anchors:
         anchors = _fallback_result_anchors(soup)
 
     for link in anchors:
         title = link.get_text(strip=True)
-        url = link.get("href", "")
+        # str(): у многозначных атрибутов bs4 отдаёт список, и тогда проверка
+        # "duckduckgo.com" in url молча проверяла бы вхождение ЭЛЕМЕНТА в
+        # список, а не подстроки в адрес.
+        url = str(link.get("href", "") or "")
         if not title or not url or "duckduckgo.com" in url:
             continue
         results.append((title, _extract_snippet_near(link), url))

@@ -13,7 +13,7 @@ efi/security/access_control.py
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 from efi.config.schema import LockdownMode, TelegramSettings
 
@@ -28,7 +28,7 @@ class ChatAccessInfo:
     is_private_chat: bool
 
 
-class AccessDeniedReason(str, Enum):
+class AccessDeniedReason(StrEnum):
     """Причина отказа — для логирования/дебага. НИКОГДА не должна попадать в текст, который видит пользователь."""
 
     LOCKDOWN_OWNER_ONLY = "lockdown_owner_only"
@@ -36,7 +36,9 @@ class AccessDeniedReason(str, Enum):
     NOT_IN_ALLOWLIST = "not_in_allowlist"
 
 
-def is_chat_accessible(chat: ChatAccessInfo, telegram_settings: TelegramSettings) -> tuple[bool, AccessDeniedReason | None]:
+def is_chat_accessible(
+    chat: ChatAccessInfo, telegram_settings: TelegramSettings
+) -> tuple[bool, AccessDeniedReason | None]:
     """
     Решает, разрешено ли реагировать на событие в данном чате.
 

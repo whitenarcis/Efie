@@ -81,7 +81,7 @@ class TelegramClientWrapper:
         self._humanizer_settings = humanizer_settings
         # Держим ссылки на фоновые задачи самокоррекции, чтобы их не собрал
         # GC до завершения (стандартная идиома для "оторванных" asyncio.Task).
-        self._background_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         await self._client.start()
@@ -220,8 +220,13 @@ class TelegramClientWrapper:
 
             await self._pause_before(humanized_chunk, is_first=is_first, llm_generation_time=llm_generation_time)
 
+            # Подавление ниже — про неточность аннотаций Pyrogram, а не про наш код:
+            # reply_to_message_id объявлен как int, хотя значение по умолчанию у
+            # него None, и "без реплая" передаётся именно None.
             sent_message = await self._client.send_message(
-                chat_id, humanized_chunk, reply_to_message_id=bubble.reply_to_message_id
+                chat_id,
+                humanized_chunk,
+                reply_to_message_id=bubble.reply_to_message_id,  # type: ignore[arg-type]
             )
             queue.mark_delivered(text=humanized_chunk)
             if on_bubble_sent is not None:
@@ -264,7 +269,9 @@ class TelegramClientWrapper:
         task.add_done_callback(self._background_tasks.discard)
 
     async def _self_correct(self, chat_id: int, message_id: int, correct_text: str) -> None:
-        """Короткая пауза (будто заметила опечатку и тут же поправилась), затем правка на изначально правильный текст."""
+        """
+        Короткая пауза (будто заметила опечатку и тут же поправилась), затем правка на изначально правильный текст.
+        """
         await asyncio.sleep(random.uniform(*_SELF_CORRECT_DELAY_RANGE))
         try:
             await self._client.edit_message_text(chat_id, message_id, correct_text)
@@ -291,7 +298,10 @@ class TelegramClientWrapper:
         await self._client.send_photo(chat_id, str(photo_path), caption=caption)
 
     async def send_voice(self, chat_id: int, voice_path: str | Path) -> None:
-        await self._client.send_chat_action(chat_id, ChatAction.UPLOAD_VOICE)
+        # UPLOAD_AUDIO, а не UPLOAD_VOICE: последнего в pyrogram.enums.ChatAction
+        # не существует (набор — RECORD_AUDIO/UPLOAD_AUDIO/RECORD_VIDEO_NOTE/...),
+        # и обращение к нему падало AttributeError ещё до самой отправки.
+        await self._client.send_chat_action(chat_id, ChatAction.UPLOAD_AUDIO)
         await self._client.send_voice(chat_id, str(voice_path))
 
     async def send_sticker(self, chat_id: int, sticker_file_id: str) -> None:
@@ -332,7 +342,10 @@ class TelegramClientWrapper:
         """
         query_lower = query.lower()
         matches: list[tuple[int, str]] = []
-        async for dialog in self._client.get_dialogs():
+        dialogs = self._client.get_dialogs()
+        if dialogs is None:  # у Pyrogram метод объявлен Optional — пустой список диалогов
+            return matches
+        async for dialog in dialogs:
             chat = dialog.chat
             title = chat.title or chat.first_name or chat.username or str(chat.id)
             username = chat.username or ""

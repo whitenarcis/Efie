@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import aiofiles.os
 import aiosqlite
@@ -50,13 +51,15 @@ class Database:
         self,
         db_path: Path,
         *,
-        migrations: list[Migration] | None = None,
+        # Sequence, а не list: list инвариантен, и список конкретных миграций
+        # (list[Callable[..., Coroutine[...]]]) под list[Migration] не подходит.
+        migrations: Sequence[Migration] | None = None,
         busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS,
         acquire_retries: int = _DEFAULT_ACQUIRE_RETRIES,
         acquire_retry_delay_seconds: float = _DEFAULT_ACQUIRE_RETRY_DELAY_SECONDS,
     ) -> None:
         self._db_path = db_path
-        self._migrations = migrations or []
+        self._migrations: Sequence[Migration] = migrations or []
         self._busy_timeout_ms = busy_timeout_ms
         self._acquire_retries = acquire_retries
         self._acquire_retry_delay_seconds = acquire_retry_delay_seconds
@@ -118,26 +121,29 @@ class Database:
 
     # -- удобные шорткаты для одиночных запросов ---------------------------
 
-    async def execute(self, sql: str, params: tuple = ()) -> None:
+    async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
         """INSERT/UPDATE/DELETE в одну операцию, с commit, без явного `async with`."""
         async with self.connection() as conn:
             await conn.execute(sql, params)
             await conn.commit()
 
-    async def execute_and_count_changes(self, sql: str, params: tuple = ()) -> int:
-        """Как execute(), но возвращает число затронутых строк (aiosqlite.Connection.total_changes) — для отчётности задач вроде очистки старых данных."""
+    async def execute_and_count_changes(self, sql: str, params: tuple[Any, ...] = ()) -> int:
+        """
+        Как execute(), но возвращает число затронутых строк (aiosqlite.Connection.total_changes) — для отчётности
+        задач вроде очистки старых данных.
+        """
         async with self.connection() as conn:
             cursor = await conn.execute(sql, params)
             await conn.commit()
             return cursor.rowcount if cursor.rowcount >= 0 else 0
 
-    async def fetch_all(self, sql: str, params: tuple = ()) -> list[aiosqlite.Row]:
+    async def fetch_all(self, sql: str, params: tuple[Any, ...] = ()) -> list[aiosqlite.Row]:
         """SELECT, возвращающий все строки, в одну операцию."""
         async with self.connection() as conn:
             async with conn.execute(sql, params) as cursor:
                 return list(await cursor.fetchall())
 
-    async def fetch_one(self, sql: str, params: tuple = ()) -> aiosqlite.Row | None:
+    async def fetch_one(self, sql: str, params: tuple[Any, ...] = ()) -> aiosqlite.Row | None:
         """SELECT, возвращающий одну (или ни одной) строку, в одну операцию."""
         async with self.connection() as conn:
             async with conn.execute(sql, params) as cursor:

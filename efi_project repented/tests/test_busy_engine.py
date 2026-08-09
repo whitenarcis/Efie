@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.behavior.affinity import AffinitySnapshot, AffinityTracker
@@ -130,12 +130,12 @@ async def test_compute_ignore_delay_uses_working_memory_energy(tmp_path: Path) -
 
 
 def test_is_active_conversation_true_within_window() -> None:
-    recent = datetime.now(timezone.utc) - timedelta(seconds=10)
+    recent = datetime.now(UTC) - timedelta(seconds=10)
     assert _is_active_conversation(recent, _SETTINGS) is True
 
 
 def test_is_active_conversation_false_outside_window() -> None:
-    old = datetime.now(timezone.utc) - timedelta(hours=6)
+    old = datetime.now(UTC) - timedelta(hours=6)
     assert _is_active_conversation(old, _SETTINGS) is False
 
 
@@ -180,7 +180,7 @@ async def test_compute_ignore_delay_is_near_instant_mid_active_conversation(tmp_
     database = Database(tmp_path / "test.db", migrations=MIGRATIONS)
     working_memory = WorkingMemory(tmp_path / "working_memory.json")
     affinity = AffinityTracker(database)
-    recent = datetime.now(timezone.utc) - timedelta(seconds=5)
+    recent = datetime.now(UTC) - timedelta(seconds=5)
     engine = BusyEngine(
         working_memory, affinity, _FakeLifeEngine(False), _SETTINGS, last_message_source=_FakeLastMessageSource(recent)
     )
@@ -193,7 +193,7 @@ async def test_compute_ignore_delay_full_delay_for_first_message_after_a_gap(tmp
     database = Database(tmp_path / "test.db", migrations=MIGRATIONS)
     working_memory = WorkingMemory(tmp_path / "working_memory.json")
     affinity = AffinityTracker(database)
-    long_ago = datetime.now(timezone.utc) - timedelta(hours=6)
+    long_ago = datetime.now(UTC) - timedelta(hours=6)
     engine = BusyEngine(
         working_memory, affinity, _FakeLifeEngine(False), _SETTINGS,
         last_message_source=_FakeLastMessageSource(long_ago),

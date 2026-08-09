@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from efi.behavior.affinity import (
     HIGH_RESPECT_THRESHOLD,
@@ -109,8 +109,12 @@ _SOCIAL_DISTANCE_DESCRIPTIONS: dict[str, str] = {
 
 _LOCKDOWN_DESCRIPTIONS: dict[LockdownMode, str] = {
     LockdownMode.NONE: "Ты можешь свободно общаться в любом чате.",
-    LockdownMode.CONTACTS_ONLY: "Ты сейчас отвечаешь только людям из своих контактов — с незнакомцами держись настороже.",
-    LockdownMode.OWNER_ONLY: "Ты в закрытом режиме: разговариваешь только с владельцем, во всех остальных чатах молчишь.",
+    LockdownMode.CONTACTS_ONLY: (
+        "Ты сейчас отвечаешь только людям из своих контактов — с незнакомцами держись настороже."
+    ),
+    LockdownMode.OWNER_ONLY: (
+        "Ты в закрытом режиме: разговариваешь только с владельцем, во всех остальных чатах молчишь."
+    ),
 }
 
 _TIME_OF_DAY_BOUNDARIES: tuple[tuple[int, int, str], ...] = (
@@ -286,7 +290,7 @@ def _render_personality_template(text: str, user_name: str) -> str:
 
 
 def _time_of_day_label(now: datetime | None = None) -> str:
-    hour = (now or datetime.now(timezone.utc).astimezone()).hour
+    hour = (now or datetime.now(UTC).astimezone()).hour
     for start, end, label in _TIME_OF_DAY_BOUNDARIES:
         if start <= hour < end:
             return label
@@ -466,7 +470,7 @@ def _build_proactive_brevity_block(notification: Notification) -> str:
 
 
 def _build_time_block() -> str:
-    now = datetime.now(timezone.utc).astimezone()
+    now = datetime.now(UTC).astimezone()
     return f"[Время] Сейчас {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname() or 'UTC'})."
 
 

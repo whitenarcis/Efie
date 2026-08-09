@@ -5,17 +5,24 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 
+import pytest
 from pyrogram.types import Message
 
-from efi.config.schema import LockdownMode, TelegramSettings
+from efi.config.schema import CommunitySettings, LockdownMode, TelegramSettings
 from efi.db.core import Database
 from efi.db.models import MIGRATIONS
+from efi.memory.social_memory import SocialInteractionStore
+from efi.notifications.manager import NotificationManager
+from efi.notifications.schemas import NotificationType
 from efi.security.access_control import ChatAccessInfo, is_chat_accessible
 from efi.telegram.comments import (
+    ChannelPostWatcher,
+    RandomCommentEngager,
     ThreadStateStore,
     _pick_most_interesting,
     tokenize,
@@ -164,3 +171,106 @@ def test_lockdown_still_closes_everything_else() -> None:
 def test_without_community_chats_efi_stays_a_personal_bot() -> None:
     allowed, _ = is_chat_accessible(_chat(-1001), _settings())
     assert allowed is False
+
+
+# -- куда фактически уходит комментарий -------------------------------------------
+#
+# Регрессия: и пост в канале, и реплика в треде ставились в очередь с chat_id
+# КАНАЛА, хотя комментарии живут в привязанной группе обсуждения. Обычный
+# аккаунт в канал писать не может, а message_id в payload был при этом id
+# сообщения из группы — пара (chat_id, message_id) была рассогласована, и
+# комментирование сообщества не работало ни по одному из двух путей.
+
+_CHANNEL_ID = -1001
+_DISCUSSION_ID = -1002
+
+
+def _community() -> CommunitySettings:
+    # Пренебрежимые задержки: тест проверяет адрес назначения, а не «человеческую» паузу.
+    return CommunitySettings(min_delay_seconds=0.0, max_delay_seconds=0.001, comment_probability=1.0)
+
+
+async def test_channel_post_comment_goes_to_the_discussion_group(tmp_path: Path) -> None:
+    manager = NotificationManager(worker_count=1)
+    watcher = ChannelPostWatcher(
+        manager,
+        _settings(community_chats=[_CHANNEL_ID]),
+        _community(),
+        cast("object", SimpleNamespace(current_interests=_async_return([]))),  # type: ignore[arg-type]
+        _threads(tmp_path),
+        SocialInteractionStore(Database(tmp_path / "social.db", migrations=MIGRATIONS)),
+    )
+    discussion_message = SimpleNamespace(id=77, chat=SimpleNamespace(id=_DISCUSSION_ID))
+    watcher._client = cast(  # type: ignore[assignment]
+        "object", SimpleNamespace(get_discussion_message=_async_return(discussion_message))
+    )
+
+    await watcher._schedule_comment(_CHANNEL_ID, "Канал", post_id=5, text="пост про async")
+
+    notification = await manager.get(0)
+    assert notification.type is NotificationType.PUBLIC_COMMENT
+    assert notification.chat_id == _DISCUSSION_ID, "комментарий обязан уйти в группу обсуждения, а не в канал"
+    assert notification.payload["telegram_message_ids"] == [77], "reply-цель — экземпляр поста в группе"
+    assert notification.payload["thread_id"] == 5, "идентичность треда — id поста в канале"
+    assert notification.payload["force_reply"] is True
+
+
+async def test_post_without_a_linked_discussion_is_skipped(tmp_path: Path) -> None:
+    """Без привязанного обсуждения комментировать нечем — повод молча пропускается."""
+    manager = NotificationManager(worker_count=1)
+    watcher = ChannelPostWatcher(
+        manager,
+        _settings(community_chats=[_CHANNEL_ID]),
+        _community(),
+        cast("object", SimpleNamespace(current_interests=_async_return([]))),  # type: ignore[arg-type]
+        _threads(tmp_path),
+        SocialInteractionStore(Database(tmp_path / "social.db", migrations=MIGRATIONS)),
+    )
+    watcher._client = cast("object", SimpleNamespace(get_discussion_message=_async_return(None)))  # type: ignore[assignment]
+
+    await watcher._schedule_comment(_CHANNEL_ID, "Канал", post_id=5, text="пост про async")
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(manager.get(0), timeout=0.05)
+
+
+async def test_thread_reply_goes_to_the_chat_the_comment_lives_in(tmp_path: Path) -> None:
+    manager = NotificationManager(worker_count=1)
+    threads = _threads(tmp_path)
+    await threads.mark_seen(_CHANNEL_ID, 5)
+
+    comment = SimpleNamespace(
+        id=42,
+        text="подводные камни async в Python и паттерны вокруг них",
+        caption=None,
+        chat=SimpleNamespace(id=_DISCUSSION_ID),
+        from_user=SimpleNamespace(id=9, first_name="Гость", is_self=False),
+    )
+    engager = RandomCommentEngager(
+        manager,
+        cast("object", SimpleNamespace()),  # type: ignore[arg-type]
+        _settings(community_chats=[_CHANNEL_ID]),
+        _community(),
+        cast("object", SimpleNamespace(current_interests=_async_return(_INTERESTS))),  # type: ignore[arg-type]
+        threads,
+        SocialInteractionStore(Database(tmp_path / "social.db", migrations=MIGRATIONS)),
+    )
+    engager._read_thread = _async_return([comment])  # type: ignore[assignment]
+
+    await engager._tick()
+
+    notification = await manager.get(0)
+    assert notification.type is NotificationType.THREAD_REPLY
+    assert notification.chat_id == _DISCUSSION_ID, "отвечаем туда, где лежит комментарий"
+    assert notification.payload["telegram_message_ids"] == [42]
+    assert notification.payload["community_chat_id"] == _CHANNEL_ID
+    assert notification.payload["force_reply"] is True
+
+
+def _async_return(value: object):  # noqa: ANN202 — тестовый хелпер, тип возврата не несёт смысла
+    """Асинхронная заглушка, отдающая заранее заданное значение на любой вызов."""
+
+    async def _call(*_args: object, **_kwargs: object) -> object:
+        return value
+
+    return _call

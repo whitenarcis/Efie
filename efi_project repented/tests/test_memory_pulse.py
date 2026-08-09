@@ -10,7 +10,7 @@ efi.memory.consolidation.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.db.core import Database
@@ -22,7 +22,7 @@ from efi.memory.pulse import MemoryPulse
 
 #: MemoryPulse берёт «сейчас» из системных часов, поэтому моменты последнего
 #: сообщения задаются относительно реального времени, а не фиксированной даты.
-_NOW = datetime.now(timezone.utc)
+_NOW = datetime.now(UTC)
 
 
 class _FakeRouter:
@@ -154,7 +154,7 @@ async def test_watermark_stops_the_same_episode_from_being_recorded_twice(tmp_pa
     # Второй тик: история та же, но окно уже сдвинуто — _FakeHistory это не
     # моделирует, поэтому проверяем сам факт сдвига отметки, а не число
     # записей (за окно отвечает SQL в SqliteHistoryRepository.get_since).
-    assert datetime.fromisoformat(watermark) <= datetime.now(timezone.utc)
+    assert datetime.fromisoformat(watermark) <= datetime.now(UTC)
     assert len(router.prompts) == 1
 
 

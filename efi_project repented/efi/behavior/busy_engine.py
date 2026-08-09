@@ -55,7 +55,7 @@ from __future__ import annotations
 import asyncio
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Protocol
 
 from efi.behavior.affinity import AffinitySnapshot, AffinityTracker
@@ -165,7 +165,7 @@ def _is_active_conversation(last_message_at: datetime | None, settings: BusyEngi
     """Чат без истории (last_message_at is None) — по определению не 'уже идущий' разговор."""
     if last_message_at is None:
         return False
-    elapsed = (datetime.now(timezone.utc) - last_message_at).total_seconds()
+    elapsed = (datetime.now(UTC) - last_message_at).total_seconds()
     return elapsed <= settings.active_conversation_window_seconds
 
 

@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.llm.schemas import Choice, DiaryEntry, DiaryEntryMetadata, LLMParams, Message, Response, Role, Session
@@ -31,7 +31,7 @@ class _FakeRouter:
 
 async def test_freshly_created_entry_is_not_swept_up_as_stale(tmp_path: Path) -> None:
     diary = Diary(tmp_path / "diary")
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     fresh = DiaryEntry(
         id="fresh_1",

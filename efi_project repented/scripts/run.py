@@ -17,16 +17,24 @@ import asyncio
 import logging
 import signal
 import sys
+import tomllib
 from pathlib import Path
+
+from pydantic import ValidationError
 
 # Позволяет запускать файл напрямую (python scripts/run.py), не только как
 # модуль пакета — добавляем корень репозитория в sys.path до импорта efi.*.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from efi.app import EfiApp  # noqa: E402 — импорт после правки sys.path, иначе он и не нужен
-from efi.config.schema import get_settings  # noqa: E402
+from efi.config.schema import ConfigurationError, Settings, get_settings  # noqa: E402
 
 logger = logging.getLogger("efi")
+
+#: Код возврата при нерабочей конфигурации — отличается от 1 (падение в
+#: рантайме), чтобы systemd/supervisor могли отличить «конфиг не заполнен»
+#: (перезапуск не поможет) от «упало по ходу работы» (перезапуск осмыслен).
+_CONFIG_EXIT_CODE = 2
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -66,10 +74,39 @@ def _configure_logging(level: str, log_file: str | None) -> None:
     logging.getLogger("httpcore").setLevel(third_party_level)
 
 
+def _load_settings() -> Settings:
+    """
+    Читает конфигурацию, превращая три типовых способа её сломать в короткое
+    сообщение вместо трейсбека из недр pydantic/tomllib:
+
+        - файл не разбирается как TOML (классика — значение-плейсхолдер без
+          кавычек: `api_id = HERE`);
+        - в файле нет обязательной секции (`[telegram]`, `[llm_roles.*]`);
+        - секции есть, но поля остались пустыми (см. Settings.validate_ready).
+
+    Ни один из трёх случаев не чинится перезапуском, поэтому выходим с
+    отдельным кодом возврата, а не падаем как при рантайм-ошибке.
+    """
+    try:
+        return get_settings()
+    except tomllib.TOMLDecodeError as exc:
+        logger.error(
+            "behavior.toml не разбирается как TOML: %s\n"
+            "Проверьте, что все значения — валидный TOML: строки в кавычках, числа без кавычек "
+            "(частая ошибка — оставленный плейсхолдер вида `api_id = HERE`).",
+            exc,
+        )
+    except ConfigurationError as exc:
+        logger.error("%s", exc)
+    except ValidationError as exc:
+        logger.error("конфигурация не прошла валидацию схемы:\n%s", exc)
+    raise SystemExit(_CONFIG_EXIT_CODE)
+
+
 async def _main_async(args: argparse.Namespace) -> None:
     _configure_logging(args.log_level, args.log_file)
 
-    settings = get_settings()
+    settings = _load_settings()
     app = EfiApp(settings)
 
     loop = asyncio.get_running_loop()

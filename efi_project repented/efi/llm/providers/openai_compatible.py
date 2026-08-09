@@ -39,7 +39,17 @@ from efi.llm.errors import (
     LLMServerError,
     LLMTimeoutError,
 )
-from efi.llm.schemas import AudioTranscription, Choice, EmbeddingVector, LLMParams, Message, Response, Role, Session, Usage
+from efi.llm.schemas import (
+    AudioTranscription,
+    Choice,
+    EmbeddingVector,
+    LLMParams,
+    Message,
+    Response,
+    Role,
+    Session,
+    Usage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +108,18 @@ class OpenAICompatibleProvider(LLMProvider):
             raise LLMInvalidResponseError(
                 f"{self.name}: response does not match expected schema: {exc}", provider=self.name
             ) from exc
+
+        # Пустой `choices` схему проходит (поле необязательное), но ответом не
+        # является: обратиться к `Response.message` можно только исключением.
+        # OpenAI-совместимые прокси реально отдают 200 с пустым choices — на
+        # срабатывании модерации или когда апстрим отвалился на их стороне.
+        # Без явной проверки такой ответ уходил из провайдера как успех, а
+        # ValueError("no choices") вылетал уже у Worker'а, В ОБХОД LLMError —
+        # то есть мимо и fallback'а роутера, и уведомления собеседника о сбое:
+        # человек получал "прочитано" и тишину. Здесь это честный сбой
+        # кандидата, и роутер идёт к следующему.
+        if not response.choices:
+            raise LLMInvalidResponseError(f"{self.name}: response contains no choices", provider=self.name)
 
         response.provider = response.provider or self.name
         return response
@@ -285,14 +307,20 @@ class OpenAICompatibleProvider(LLMProvider):
         logger.debug("%s: HTTP %s from %s", self.name, status, response.request.url)
 
         if status in (401, 403):
-            raise LLMAuthError(f"{self.name}: authentication failed ({status}): {preview}", provider=self.name, status_code=status)
+            raise LLMAuthError(
+                f"{self.name}: authentication failed ({status}): {preview}",
+                provider=self.name, status_code=status,
+            )
         if status == 429:
             retry_after = _parse_retry_after(response.headers.get("retry-after"))
             raise LLMRateLimitError(
                 f"{self.name}: rate limited (429): {preview}", provider=self.name, retry_after=retry_after
             )
         if status >= 500:
-            raise LLMServerError(f"{self.name}: server error ({status}): {preview}", provider=self.name, status_code=status)
+            raise LLMServerError(
+                f"{self.name}: server error ({status}): {preview}",
+                provider=self.name, status_code=status,
+            )
         raise LLMError(f"{self.name}: unexpected HTTP {status}: {preview}", provider=self.name, status_code=status)
 
 

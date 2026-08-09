@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 
@@ -70,7 +70,7 @@ class SqliteHistoryRepository:
                 message.content,
                 message.tool_call_id,
                 tool_calls_json,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
 
@@ -142,7 +142,7 @@ class SqliteHistoryRepository:
         сообщений СВОЕГО чата (не общего счётчика по всем чатам — иначе
         активный чат вытеснял бы историю тихого). Возвращает число удалённых строк.
         """
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=older_than_days)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
         result = await self._database.execute_and_count_changes(
             """
             DELETE FROM messages
