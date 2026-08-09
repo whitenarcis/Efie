@@ -16,15 +16,15 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from efi.db.core import Database
 
 logger = logging.getLogger(__name__)
 
 
-class SeedStatus(str, Enum):
+class SeedStatus(StrEnum):
     """Статус семени любопытства — жизненный цикл дальше ведёт BackgroundLifeWorker."""
 
     PENDING = "pending"
@@ -95,7 +95,7 @@ class CuriosityTracker:
             return None
 
         weight = min(_BASE_WEIGHT + (_QUESTION_MARK_BONUS if "?" in text else 0.0), 1.0)
-        created_at = datetime.now(timezone.utc)
+        created_at = datetime.now(UTC)
 
         async with self._database.connection() as conn:
             cursor = await conn.execute(

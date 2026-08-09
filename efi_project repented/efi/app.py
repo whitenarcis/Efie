@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Coroutine
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
 
@@ -94,7 +94,7 @@ _QUEUE_DRAIN_TIMEOUT_SECONDS = 30.0
 _CONSOLIDATION_TRIGGER_AT = dt_time(hour=3, minute=30)
 #: "С начала времён" — для get_active_chat_ids(since=...) в _active_chat_candidates,
 #: где нужны ВСЕ чаты с известной историей, а не только недавние.
-_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 
 
 class EfiApp:
@@ -111,8 +111,8 @@ class EfiApp:
     def __init__(self, settings: Settings, *, worker_count: int = _DEFAULT_WORKER_COUNT) -> None:
         self._settings = settings
         self._stop_event = asyncio.Event()
-        self._background_tasks: list[asyncio.Task] = []
-        self._worker_tasks: list[asyncio.Task] = []
+        self._background_tasks: list[asyncio.Task[None]] = []
+        self._worker_tasks: list[asyncio.Task[None]] = []
 
         # -- инфраструктура ------------------------------------------------
         self._database = Database(settings.paths.db_path, migrations=MIGRATIONS)
@@ -240,13 +240,17 @@ class EfiApp:
         )
 
         # -- telegram --------------------------------------------------------
+        phone_number = (
+            settings.telegram.phone_number.get_secret_value() if settings.telegram.phone_number else None
+        )
         self._pyrogram_client = Client(
             settings.paths.session_name,
             api_id=settings.telegram.api_id,
             api_hash=settings.telegram.api_hash.get_secret_value(),
-            phone_number=(
-                settings.telegram.phone_number.get_secret_value() if settings.telegram.phone_number else None
-            ),
+            # Подавление ниже — та же неточность аннотаций Pyrogram, что и с
+            # reply_to_message_id: объявлено `phone_number: str`, а значение по
+            # умолчанию None (номер нужен только при первой интерактивной авторизации).
+            phone_number=phone_number,  # type: ignore[arg-type]
             workdir=str(settings.paths.session_path.parent),
         )
         self._telegram_client = TelegramClientWrapper(self._pyrogram_client, settings.humanizer)
@@ -394,7 +398,10 @@ class EfiApp:
         if self._settings.memory_pulse.enabled:
             self._background_tasks.append(self._spawn_supervised(self._memory_pulse.run(), name="memory_pulse"))
 
-        logger.info("app: started (%d workers, %d background services)", len(self._worker_tasks), len(self._background_tasks))
+        logger.info(
+            "app: started (%d workers, %d background services)",
+            len(self._worker_tasks), len(self._background_tasks),
+        )
 
     def _spawn_supervised(self, coro: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
         """

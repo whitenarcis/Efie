@@ -176,7 +176,10 @@ class TelegramEventHandlers:
         client.add_handler(_make_handler(filters.sticker & own_messages_filter, self._handle_sticker))
 
     async def flush_pending(self) -> None:
-        """Принудительно сбрасывает все накопленные в дебаунсере сообщения. Вызывается при graceful shutdown (efi/app.py)."""
+        """
+        Принудительно сбрасывает все накопленные в дебаунсере сообщения. Вызывается при graceful shutdown
+        (efi/app.py).
+        """
         await self._buffer.flush_all()
 
     async def _handle_text(self, client: Client, message: PyrogramMessage) -> None:
@@ -295,7 +298,7 @@ class TelegramEventHandlers:
         except Exception:
             logger.exception("telegram: failed to download media for message_id=%s", message.id)
             return None
-        return Path(result) if result else None
+        return Path(result) if isinstance(result, str) else None
 
     async def _cleanup_media(self, path: Path | None) -> None:
         """

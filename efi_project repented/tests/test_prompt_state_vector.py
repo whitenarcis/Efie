@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from efi.behavior.affinity import AffinitySnapshot
 from efi.memory.beliefs import Belief
@@ -13,7 +13,7 @@ _SYCOPHANCY_TEXT = "не соглашайся просто чтобы понра
 
 def _belief(topic: str, confidence: float) -> Belief:
     return Belief(
-        topic=topic, stance="держусь своего мнения", confidence_score=confidence, origin_date=datetime.now(timezone.utc)
+        topic=topic, stance="держусь своего мнения", confidence_score=confidence, origin_date=datetime.now(UTC)
     )
 
 

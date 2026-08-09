@@ -50,7 +50,10 @@ async def _run_termux_api_command(*args: str) -> str:
         raise RuntimeError(f"{args[0]} не ответил за {_SUBPROCESS_TIMEOUT_SECONDS:.0f}с") from exc
 
     if process.returncode != 0:
-        raise RuntimeError(f"{args[0]} завершился с кодом {process.returncode}: {stderr.decode(errors='replace').strip()}")
+        raise RuntimeError(
+            f"{args[0]} завершился с кодом {process.returncode}: "
+            f"{stderr.decode(errors='replace').strip()}"
+        )
 
     return stdout.decode(errors="replace")
 
@@ -59,7 +62,10 @@ class GetBatteryStatusTool(Tool):
     """Возвращает текущий заряд и статус зарядки телефона, на котором работает Эфи."""
 
     name = "get_battery_status"
-    description = "Проверяет уровень заряда и статус зарядки устройства, на котором ты сейчас работаешь (через Termux:API)."
+    description = (
+        "Проверяет уровень заряда и статус зарядки устройства, на котором ты сейчас работаешь "
+        "(через Termux:API)."
+    )
     parameters = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
@@ -84,7 +90,10 @@ class TriggerVibrationTool(Tool):
     """Включает вибрацию устройства — физический "жест" в ответ на что-то важное/смешное."""
 
     name = "trigger_vibration"
-    description = "Заставляет устройство завибрировать на заданное время. Используй нечасто, как выразительный физический жест, а не как спецэффект на каждое сообщение."
+    description = (
+        "Заставляет устройство завибрировать на заданное время. Используй нечасто, как выразительный "
+        "физический жест, а не как спецэффект на каждое сообщение."
+    )
     parameters = {
         "type": "object",
         "properties": {

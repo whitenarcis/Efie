@@ -86,7 +86,7 @@ class Diary:
 
     async def _read_entry(self, path: Path) -> DiaryEntry | None:
         try:
-            async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
+            async with aiofiles.open(path, encoding="utf-8") as f:
                 raw = await f.read()
         except OSError as exc:
             logger.warning("diary: failed to read %s: %s", path, exc)

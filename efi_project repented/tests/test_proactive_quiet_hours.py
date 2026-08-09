@@ -10,7 +10,7 @@ SilenceMonitor. Регрессия на дефект: раньше ни один
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.behavior.affinity import AffinityTracker
@@ -75,7 +75,7 @@ async def test_silence_monitor_skips_ping_during_quiet_hours() -> None:
     monitor = SilenceMonitor(
         manager, silence_threshold=timedelta(seconds=0), quiet_hours=_quiet_hours_covering_now()
     )
-    monitor._last_activity[1] = datetime.now(timezone.utc) - timedelta(hours=1)
+    monitor._last_activity[1] = datetime.now(UTC) - timedelta(hours=1)
 
     await monitor._check_silence()
     assert manager.qsize() == 0
@@ -84,7 +84,7 @@ async def test_silence_monitor_skips_ping_during_quiet_hours() -> None:
 async def test_silence_monitor_pings_outside_quiet_hours() -> None:
     manager = NotificationManager(worker_count=1)
     monitor = SilenceMonitor(manager, silence_threshold=timedelta(seconds=0), quiet_hours=_quiet_hours_never())
-    monitor._last_activity[1] = datetime.now(timezone.utc) - timedelta(hours=1)
+    monitor._last_activity[1] = datetime.now(UTC) - timedelta(hours=1)
 
     await monitor._check_silence()
     assert manager.qsize() == 1

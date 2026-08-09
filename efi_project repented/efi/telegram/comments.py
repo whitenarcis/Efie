@@ -22,6 +22,20 @@ efi/telegram/comments.py
        заходит в тред, где Эфи уже отметилась, читает свежие комментарии и
        отвечает НА ОДИН подходящий — если ветка ему интересна.
 
+КУДА ФАКТИЧЕСКИ УХОДИТ КОММЕНТАРИЙ. Не в канал: обычный аккаунт в канал
+писать не может. Комментарии живут в ПРИВЯЗАННОЙ ГРУППЕ ОБСУЖДЕНИЯ, где у
+каждого поста есть свой автоматически пересланный экземпляр, и комментарий —
+это реплай на него (`Client.get_discussion_message` ровно для этого и
+существует). Поэтому в Notification кладётся chat_id группы обсуждения и
+message_id поста ВНУТРИ НЕЁ, а не id канала и id поста в канале: с ними
+отправка либо падала на резолве пира, либо (будь у аккаунта права) уходила
+отдельным постом в канал вместо комментария под нужным постом.
+
+По той же причине комментарий обязан быть реплаем, а не свободным сообщением
+в группу: без реплая он не привязывается к посту и выглядит как реплика
+из ниоткуда. Поэтому в payload идёт `force_reply` — см.
+efi.tools.telegram_actions.send_message.SendMessageTool.
+
 Про задержку: комментарий никогда не уходит мгновенно. Живой участник
 сообщества не отвечает на пост в ту же секунду, что он вышел, — поэтому
 между поводом и реакцией всегда стоит случайная пауза (по умолчанию 5-30
@@ -48,7 +62,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
@@ -136,7 +150,7 @@ class CommunityInterests:
 
     async def _worldview_interests(self) -> list[str]:
         try:
-            async with aiofiles.open(self._worldview_path, mode="r", encoding="utf-8") as f:
+            async with aiofiles.open(self._worldview_path, encoding="utf-8") as f:
                 raw = await f.read()
         except OSError as exc:
             logger.warning("comments: failed to read worldview file %s: %s", self._worldview_path, exc)
@@ -241,11 +255,16 @@ class ChannelPostWatcher:
         self._threads = threads
         self._social_memory = social_memory
         self._pending: set[asyncio.Task[None]] = set()
+        #: Проставляется в register(): нужен, чтобы найти экземпляр поста в
+        #: привязанной группе обсуждения — единственное место, куда обычный
+        #: аккаунт может оставить комментарий (см. докстринг модуля).
+        self._client: Client | None = None
 
     def register(self, client: Client) -> None:
         if not self._settings.enabled or not self._telegram_settings.community_chats:
             logger.info("comments: community engagement is disabled (no community_chats or enabled=false)")
             return
+        self._client = client
         client.add_handler(MessageHandler(self._handle_post, filters.channel))
         logger.info("comments: watching %d community channel(s)", len(self._telegram_settings.community_chats))
 
@@ -301,20 +320,57 @@ class ChannelPostWatcher:
             logger.debug("comments: scheduled comment for post %s cancelled", post_id)
             raise
 
+        # Разрешаем цель ПОСЛЕ паузы, а не до неё: за полчаса пост могли
+        # удалить или отвязать обсуждение, и тогда комментировать уже нечего.
+        target = await self._resolve_comment_target(chat_id, post_id)
+        if target is None:
+            return
+
+        discussion_chat_id, discussion_message_id = target
         await self._manager.put(
             Notification(
                 type=NotificationType.PUBLIC_COMMENT,
                 priority=7,  # ниже живого диалога: собеседник всегда важнее публики
-                chat_id=chat_id,
+                chat_id=discussion_chat_id,
                 message=_render_post_prompt(chat_title, text),
                 payload={
                     "chat_title": chat_title,
-                    "telegram_message_ids": [post_id],
+                    "telegram_message_ids": [discussion_message_id],
+                    # thread_id остаётся id поста В КАНАЛЕ: это идентичность
+                    # треда для ThreadStateStore и социальной памяти, а не
+                    # адрес, по которому уходит сообщение.
                     "thread_id": post_id,
+                    "community_chat_id": chat_id,
                     "is_public_comment": True,
+                    "force_reply": True,
                 },
             )
         )
+
+    async def _resolve_comment_target(self, chat_id: int, post_id: int) -> tuple[int, int] | None:
+        """
+        (chat_id группы обсуждения, message_id поста внутри неё) — адрес, по
+        которому комментарий реально можно оставить, см. докстринг модуля.
+
+        None означает «комментировать этот пост нечем»: у канала нет
+        привязанного обсуждения, пост удалён или аккаунту туда нельзя. Это
+        штатная ситуация, а не ошибка — молча пропускаем повод.
+        """
+        if self._client is None:
+            logger.warning("comments: no Pyrogram client bound, cannot resolve a discussion target")
+            return None
+        try:
+            discussion_message = await self._client.get_discussion_message(chat_id, post_id)
+        except Exception:
+            logger.info(
+                "comments: post %s in chat_id=%s has no reachable discussion thread, skipping",
+                post_id, chat_id, exc_info=True,
+            )
+            return None
+        if discussion_message is None or discussion_message.chat is None:
+            logger.info("comments: post %s in chat_id=%s has no linked discussion group", post_id, chat_id)
+            return None
+        return discussion_message.chat.id, discussion_message.id
 
 
 class RandomCommentEngager:
@@ -392,6 +448,16 @@ class RandomCommentEngager:
         author_name = best.from_user.first_name if best.from_user else ""
         text = (best.text or best.caption or "").strip()
 
+        # Отвечаем ТУДА, ГДЕ ЛЕЖИТ КОММЕНТАРИЙ, — в группу обсуждения, а не в
+        # канал: get_discussion_replies отдаёт сообщения именно из неё, и
+        # best.id — это id внутри неё же. С chat_id канала пара
+        # (chat_id, message_id) была рассогласована, а сама отправка в канал
+        # обычному аккаунту недоступна (см. докстринг модуля).
+        reply_chat_id = best.chat.id if best.chat is not None else None
+        if reply_chat_id is None:
+            logger.debug("random_comment_engager: comment %s has no chat, cannot answer it", best.id)
+            return
+
         await self._social_memory.record(
             SocialInteraction(
                 kind=SocialInteractionKind.THREAD_READ,
@@ -407,14 +473,16 @@ class RandomCommentEngager:
             Notification(
                 type=NotificationType.THREAD_REPLY,
                 priority=7,
-                chat_id=thread.chat_id,
+                chat_id=reply_chat_id,
                 message=_render_thread_prompt(author_name or "кто-то", text),
                 payload={
                     "telegram_message_ids": [best.id],
                     "thread_id": thread.thread_id,
+                    "community_chat_id": thread.chat_id,
                     "sender_id": author_id,
                     "sender_name": author_name,
                     "is_public_comment": True,
+                    "force_reply": True,
                 },
             )
         )
@@ -484,7 +552,7 @@ def _render_thread_prompt(author_name: str, text: str) -> str:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def is_public_comment(notification: Notification) -> bool:

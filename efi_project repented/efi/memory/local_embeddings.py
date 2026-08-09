@@ -84,7 +84,9 @@ class LocalEmbeddingEngine:
         async with self._load_lock:
             if self._model is not None:  # кто-то успел загрузить, пока мы ждали лок
                 return self._model
-            logger.info("local_embeddings: loading model %r (первый запуск может скачать веса из сети)", self._model_name)
+            logger.info(
+                "local_embeddings: loading model %r (первый запуск может скачать веса из сети)", self._model_name
+            )
             self._model = await asyncio.to_thread(self._load_model_sync)
             logger.info("local_embeddings: model %r loaded", self._model_name)
             return self._model

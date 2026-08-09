@@ -37,8 +37,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from efi.db.core import Database
 
@@ -83,14 +83,14 @@ _HOSTILE_MARKERS = (
 _REPEATED_PUNCTUATION_RE = re.compile(r"[?!]{3,}")
 
 
-class UserTier(str, Enum):
+class UserTier(StrEnum):
     """Статус собеседника — определяет и глубину доступа, и право на инициативу."""
 
     PRIMARY = "primary"
     SECONDARY = "secondary"
 
 
-class ConversationStatus(str, Enum):
+class ConversationStatus(StrEnum):
     ACTIVE = "active"
     CLOSED = "closed"
 
@@ -297,7 +297,7 @@ class ConversationLifecycle:
                 updated.annoyance_score,
                 updated.status.value,
                 updated.closed_reason,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
         return updated

@@ -143,7 +143,7 @@ class BackgroundResearcher:
 
     async def _pick_topic(self) -> str | None:
         try:
-            async with aiofiles.open(self._worldview_path, mode="r", encoding="utf-8") as f:
+            async with aiofiles.open(self._worldview_path, encoding="utf-8") as f:
                 raw = await f.read()
         except OSError as exc:
             logger.warning("researcher: failed to read worldview file %s: %s", self._worldview_path, exc)

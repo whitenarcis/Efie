@@ -58,7 +58,7 @@ TOML-файл (``behavior.toml``) > значения по умолчанию, з
 from __future__ import annotations
 
 import os
-from enum import Enum
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -90,6 +90,22 @@ _GROQ_HOST_MARKER = "api.groq.com"
 _TERMUX_READONLY_MARKERS = ("/sdcard", "/mnt/sdcard", "/storage/emulated")
 
 
+class ConfigurationError(RuntimeError):
+    """
+    Конфигурация синтаксически корректна, но не заполнена до рабочего
+    состояния: остались плейсхолдеры из behavior.toml (нулевой api_id,
+    пустой api_hash/api_key/base_url/model).
+
+    Отдельный тип, а не pydantic.ValidationError: с точки зрения схемы
+    `api_id = 0` и `api_key = ""` — валидные значения нужных типов, поэтому
+    поймать их можно только отдельной проверкой «готовности к запуску».
+    Без неё незаполненный конфиг проявлялся не на старте, а глубоко внутри
+    сторонних библиотек: Pyrogram падал на авторизации с нулевым api_id, а
+    httpx — на запросе к пустому base_url, и связать это с конфигом по
+    трейсбеку было нечем.
+    """
+
+
 def _termux_safe_path(path: Path) -> Path:
     """Переносит файл во внутреннее хранилище Termux, если путь указывает на /sdcard и т.п."""
     if any(marker in str(path) for marker in _TERMUX_READONLY_MARKERS):
@@ -97,14 +113,14 @@ def _termux_safe_path(path: Path) -> Path:
     return path
 
 
-class Environment(str, Enum):
+class Environment(StrEnum):
     """Окружение исполнения — влияет на уровень логирования, отладочные тулы и т.п."""
 
     DEVELOPMENT = "development"
     PRODUCTION = "production"
 
 
-class LockdownMode(str, Enum):
+class LockdownMode(StrEnum):
     """
     Режим доступа к личности Эфи, аналог Config::LockdownMode из референса.
 
@@ -199,7 +215,9 @@ class TelegramSettings(BaseModel):
 
     api_id: int = Field(..., description="Telegram API ID, my.telegram.org")
     api_hash: SecretStr = Field(..., description="Telegram API hash, my.telegram.org")
-    phone_number: SecretStr | None = Field(default=None, description="Нужен только при первой интерактивной авторизации")
+    phone_number: SecretStr | None = Field(
+        default=None, description="Нужен только при первой интерактивной авторизации"
+    )
 
     owner_id: int = Field(..., description="Telegram ID владельца — единственный безусловно доверенный собеседник")
     owner_display_name: str | None = Field(
@@ -216,7 +234,9 @@ class TelegramSettings(BaseModel):
             "остальное он по-прежнему закрывает. Пустой список = Эфи остаётся персональным ботом."
         ),
     )
-    chat_labels: dict[int, str] = Field(default_factory=dict, description="Человекочитаемые метки чатов для контекста LLM")
+    chat_labels: dict[int, str] = Field(
+        default_factory=dict, description="Человекочитаемые метки чатов для контекста LLM"
+    )
 
     lockdown_mode: LockdownMode = LockdownMode.OWNER_ONLY
     check_chats_on_startup: bool = True
@@ -261,7 +281,7 @@ class OmniRouteSettings(EndpointConfig):
     model: str = "google/gemma-4-31b-it:free"
 
 
-class TaskRole(str, Enum):
+class TaskRole(StrEnum):
     """
     Роль задачи, под которую подбирается модель.
 
@@ -346,7 +366,7 @@ class LLMRolesSettings(BaseModel):
             TaskRole.VISION: self.vision,
         }
 
-    def build_router(self, **router_kwargs: Any) -> "LLMRouter":
+    def build_router(self, **router_kwargs: Any) -> LLMRouter:
         """
         Собирает `LLMRouter` из текущей конфигурации ролей.
 
@@ -376,7 +396,9 @@ class HumanizerSettings(BaseModel):
     # --- Симуляция набора текста ---
     typing_wpm_min: int = Field(default=120, gt=0, description="Минимальная скорость набора, слов/мин")
     typing_wpm_max: int = Field(default=150, gt=0, description="Максимальная скорость набора, слов/мин")
-    typing_thinking_pause_min_seconds: float = Field(default=1.0, ge=0.0, description="Пауза «осмысления» перед набором")
+    typing_thinking_pause_min_seconds: float = Field(
+        default=1.0, ge=0.0, description="Пауза «осмысления» перед набором"
+    )
     typing_thinking_pause_max_seconds: float = Field(default=2.2, ge=0.0)
     typing_delay_min_seconds: float = Field(default=1.8, ge=0.0, description="Нижний предел суммарной задержки ответа")
     typing_delay_max_seconds: float = Field(default=7.0, gt=0.0, description="Верхний предел суммарной задержки ответа")
@@ -400,8 +422,12 @@ class HumanizerSettings(BaseModel):
     )
 
     # --- Защита от самоповторов ---
-    anti_repeat_trigger_max: float = Field(default=0.95, ge=0.0, le=1.0, description="Порог схожести с любым из последних N сообщений")
-    anti_repeat_trigger_avg: float = Field(default=0.85, ge=0.0, le=1.0, description="Порог средней схожести с последними N сообщениями")
+    anti_repeat_trigger_max: float = Field(
+        default=0.95, ge=0.0, le=1.0, description="Порог схожести с любым из последних N сообщений"
+    )
+    anti_repeat_trigger_avg: float = Field(
+        default=0.85, ge=0.0, le=1.0, description="Порог средней схожести с последними N сообщениями"
+    )
     anti_repeat_max_history: int = Field(default=32, ge=1, description="Глубина истории для проверки на повторы")
 
     # --- Разбивка ответа на несколько сообщений ---
@@ -448,15 +474,21 @@ class HumanizerSettings(BaseModel):
     )
     debounce_typing_ttl_seconds: float = Field(
         default=6.0, gt=0.0,
-        description="Сколько секунд без нового сигнала считать статус 'печатает' ещё актуальным (Telegram обновляет его каждые ~5-6с)",
+        description=(
+            "Сколько секунд без нового сигнала считать статус 'печатает' ещё актуальным (Telegram обновляет его "
+            "каждые ~5-6с)"
+        ),
     )
     debounce_max_wait_seconds: float = Field(
         default=15.0, gt=0.0,
-        description="Жёсткий потолок ожидания от первого сообщения пачки — не даёт активному собеседнику бесконечно откладывать ответ",
+        description=(
+            "Жёсткий потолок ожидания от первого сообщения пачки — не даёт активному собеседнику бесконечно "
+            "откладывать ответ"
+        ),
     )
 
     @model_validator(mode="after")
-    def _validate_ranges(self) -> "HumanizerSettings":
+    def _validate_ranges(self) -> HumanizerSettings:
         if self.typing_wpm_min > self.typing_wpm_max:
             raise ValueError("typing_wpm_min не может быть больше typing_wpm_max")
         if self.typing_thinking_pause_min_seconds > self.typing_thinking_pause_max_seconds:
@@ -494,15 +526,23 @@ class MemorySettings(BaseModel):
         default=0.97,
         ge=0.0,
         le=1.0,
-        description="Порог relatedness, выше которого новая запись дневника считается дублем существующей (diaryPlagiarismThreshold)",
+        description=(
+            "Порог relatedness, выше которого новая запись дневника считается дублем существующей "
+            "(diaryPlagiarismThreshold)"
+        ),
     )
     min_relatedness: float = Field(
         default=0.80,
         ge=0.0,
         le=1.0,
-        description="Нижний порог relatedness для результатов RAG-поиска (diaryMinRelatedness); ниже — запись не считается релевантной",
+        description=(
+            "Нижний порог relatedness для результатов RAG-поиска (diaryMinRelatedness); ниже — запись не считается "
+            "релевантной"
+        ),
     )
-    max_rag_results: int = Field(default=10, ge=1, description="Максимум записей, возвращаемых RAG-поиском за один запрос")
+    max_rag_results: int = Field(
+        default=10, ge=1, description="Максимум записей, возвращаемых RAG-поиском за один запрос"
+    )
     history_limit: int = Field(
         default=30, ge=1,
         description="Сколько последних сообщений диалога подмешивать в каждый запрос к LLM (Worker.history_limit). "
@@ -511,7 +551,10 @@ class MemorySettings(BaseModel):
     )
     novelization_lookback_days: int = Field(
         default=1, ge=1,
-        description="На сколько дней назад заглядывать при первой ночной новеллизации чата, если для него ещё нет отметки 'докуда уже новеллизировано'",
+        description=(
+            "На сколько дней назад заглядывать при первой ночной новеллизации чата, если для него ещё нет отметки "
+            "'докуда уже новеллизировано'"
+        ),
     )
     novelization_min_messages: int = Field(
         default=3, ge=1,
@@ -540,7 +583,10 @@ class MemorySettings(BaseModel):
     )
     use_local_embeddings: bool = Field(
         default=True,
-        description="Использовать локальный embedding-движок (fastembed/ONNX) как основной источник эмбеддингов вместо облачного LLMRouter",
+        description=(
+            "Использовать локальный embedding-движок (fastembed/ONNX) как основной источник эмбеддингов вместо "
+            "облачного LLMRouter"
+        ),
     )
     local_embedding_model: str = Field(
         default="intfloat/multilingual-e5-large",
@@ -723,7 +769,7 @@ class BusyEngineSettings(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_ranges(self) -> "BusyEngineSettings":
+    def _validate_ranges(self) -> BusyEngineSettings:
         if self.base_delay_min_seconds > self.base_delay_max_seconds:
             raise ValueError("base_delay_min_seconds не может быть больше base_delay_max_seconds")
         if self.min_delay_seconds > self.max_delay_seconds:
@@ -772,7 +818,7 @@ class CommunitySettings(BaseModel):
     )
 
     @model_validator(mode="after")
-    def _validate_delay_range(self) -> "CommunitySettings":
+    def _validate_delay_range(self) -> CommunitySettings:
         if self.min_delay_seconds > self.max_delay_seconds:
             raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
         return self
@@ -821,7 +867,10 @@ class Settings(BaseSettings):
     character_name: str = "Эфи"
     personality_prompt: str = Field(
         default="",
-        description="Базовое описание личности персонажа для системного промпта (секция [character]/personality_prompt в behavior.toml)",
+        description=(
+            "Базовое описание личности персонажа для системного промпта (секция [character]/personality_prompt в "
+            "behavior.toml)"
+        ),
     )
 
     paths: PathsSettings = Field(default_factory=PathsSettings)
@@ -860,7 +909,68 @@ class Settings(BaseSettings):
         """Идемпотентно создаёт всю файловую структуру данных приложения."""
         self.paths.ensure_directories()
 
-    def build_router(self, **router_kwargs: Any) -> "LLMRouter":
+    def unfilled_placeholders(self) -> list[str]:
+        """
+        Поля, оставшиеся плейсхолдерами из шаблонного behavior.toml, в виде
+        путей вида ``telegram.api_id`` / ``llm_roles.main.primary.api_key``.
+
+        Пустой список = конфиг заполнен и запускаться можно. Ничего не
+        бросает: вызывающая сторона (`validate_ready`, тесты, будущая
+        диагностическая команда) сама решает, что делать с находками.
+        """
+        problems: list[str] = []
+
+        if self.telegram.api_id <= 0:
+            problems.append("telegram.api_id")
+        if not self.telegram.api_hash.get_secret_value().strip():
+            problems.append("telegram.api_hash")
+        if self.telegram.owner_id <= 0:
+            problems.append("telegram.owner_id")
+
+        # Роли, а не as_routes(): BACKGROUND без своей секции переиспользует
+        # маршрут FAST, и жаловаться на него отдельно значило бы требовать
+        # заполнить секцию, которой в конфиге сознательно нет.
+        declared_routes = {
+            "main": self.llm_roles.main,
+            "fast": self.llm_roles.fast,
+            "vision": self.llm_roles.vision,
+            "background": self.llm_roles.background,
+        }
+        for role_name, route in declared_routes.items():
+            if route is None:
+                continue
+            for slot, endpoint in (("primary", route.primary), ("fallback", route.fallback)):
+                if endpoint is None:
+                    continue
+                prefix = f"llm_roles.{role_name}.{slot}"
+                if not endpoint.base_url.strip():
+                    problems.append(f"{prefix}.base_url")
+                if not endpoint.model.strip():
+                    problems.append(f"{prefix}.model")
+                if not endpoint.api_key.get_secret_value().strip():
+                    problems.append(f"{prefix}.api_key")
+
+        return problems
+
+    def validate_ready(self) -> None:
+        """
+        Бросает `ConfigurationError`, если конфиг ещё не заполнен — см.
+        докстринг того исключения про то, почему схемы для этого мало.
+        """
+        problems = self.unfilled_placeholders()
+        if not problems:
+            return
+        raise ConfigurationError(
+            "конфигурация не заполнена — осталось "
+            f"{len(problems)} незаполненное(ых) поле(й):\n  - "
+            + "\n  - ".join(problems)
+            + f"\n\nЗаполните их в {_DEFAULT_TOML_PATH.name} (в корне проекта) либо задайте "
+            "переменными окружения EFI_* (например, EFI_TELEGRAM__API_ID=12345, "
+            "EFI_LLM_ROLES__MAIN__PRIMARY__API_KEY=sk-...). Секреты надёжнее держать "
+            "в переменных окружения: behavior.toml отслеживается git'ом."
+        )
+
+    def build_router(self, **router_kwargs: Any) -> LLMRouter:
         """Шорткат: `settings.build_router()` эквивалентно `settings.llm_roles.build_router()`."""
         return self.llm_roles.build_router(**router_kwargs)
 
@@ -892,13 +1002,20 @@ def get_settings() -> Settings:
     Кэшируется на процесс: конфигурация читается один раз при первом вызове
     и переиспользуется всеми модулями (llm/, memory/, telegram/, dashboard/).
     Для тестов с другой конфигурацией используйте ``get_settings.cache_clear()``.
+
+    Готовность конфига проверяется здесь же (`validate_ready`) — до создания
+    каталогов и задолго до первого сетевого вызова: незаполненный шаблон
+    должен останавливать запуск внятной ошибкой, а не проявляться позже
+    падением внутри Pyrogram или httpx.
     """
     settings = Settings()
+    settings.validate_ready()
     settings.ensure_directories()
     return settings
 
 
 __all__ = [
+    "ConfigurationError",
     "Environment",
     "LockdownMode",
     "PathsSettings",
