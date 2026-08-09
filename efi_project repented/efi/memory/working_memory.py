@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiofiles
@@ -55,7 +55,7 @@ class WorkingMemorySnapshot(BaseModel):
         "(низкая энергия удлиняет ignore_delay перед ответом).",
     )
     items: list[WorkingMemoryItem] = Field(default_factory=list)
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class WorkingMemory:
@@ -88,7 +88,7 @@ class WorkingMemory:
 
     async def _read_from_disk(self) -> WorkingMemorySnapshot:
         try:
-            async with aiofiles.open(self._path, mode="r", encoding="utf-8") as f:
+            async with aiofiles.open(self._path, encoding="utf-8") as f:
                 raw = await f.read()
         except FileNotFoundError:
             return WorkingMemorySnapshot()
@@ -114,7 +114,7 @@ class WorkingMemory:
         if snapshot is None:
             snapshot = self._cache if self._cache is not None else await self.load()
         async with self._lock:
-            snapshot.updated_at = datetime.now(timezone.utc)
+            snapshot.updated_at = datetime.now(UTC)
             await aiofiles.os.makedirs(self._path.parent, exist_ok=True)
             async with aiofiles.open(self._path, mode="w", encoding="utf-8") as f:
                 await f.write(snapshot.model_dump_json(indent=2))
@@ -141,7 +141,7 @@ class WorkingMemory:
     async def add_item(self, text: str) -> WorkingMemoryItem:
         """Добавляет новый открытый пункт (обещание/напоминание/задачу)."""
         snapshot = await self.load()
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         item = WorkingMemoryItem(text=text, created_at=now, last_updated=now)
         snapshot.items.append(item)
         await self.save(snapshot)
@@ -154,7 +154,7 @@ class WorkingMemory:
         """
         snapshot = await self.load()
         if 0 <= index < len(snapshot.items):
-            snapshot.items[index].last_updated = datetime.now(timezone.utc)
+            snapshot.items[index].last_updated = datetime.now(UTC)
             await self.save(snapshot)
 
     async def mark_done(self, index: int) -> None:
@@ -194,7 +194,7 @@ class WorkingMemory:
         (по умолчанию 3 дня — как в референсе). Возвращает число удалённых пунктов.
         """
         snapshot = await self.load()
-        cutoff = datetime.now(timezone.utc) - self._horizon
+        cutoff = datetime.now(UTC) - self._horizon
         kept = [item for item in snapshot.items if not item.done and item.last_updated >= cutoff]
         removed = len(snapshot.items) - len(kept)
         if removed:

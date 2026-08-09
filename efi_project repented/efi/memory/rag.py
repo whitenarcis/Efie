@@ -107,7 +107,9 @@ class RAGMemory:
         embedding = await self._compute_embedding(body, is_query=False)
 
         if embedding is None:
-            logger.warning("rag: no embedding available for new entry (local and cloud both failed), storing without one")
+            logger.warning(
+                "rag: no embedding available for new entry (local and cloud both failed), storing without one"
+            )
             entry = DiaryEntry(id=_generate_entry_id(), metadata=DiaryEntryMetadata(confidence=confidence), body=body)
             await self._diary.save(entry)
             await self._tfidf.add(entry)

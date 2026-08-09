@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from efi.behavior.quiet_hours import is_quiet_hours
 from efi.config.schema import QuietHoursSettings
@@ -64,7 +64,7 @@ class SilenceMonitor:
 
     def record_activity(self, chat_id: int) -> None:
         """Отмечает, что в чате только что что-то произошло (сообщение в любую сторону). Синхронный, дешёвый вызов."""
-        self._last_activity[chat_id] = datetime.now(timezone.utc)
+        self._last_activity[chat_id] = datetime.now(UTC)
 
     def schedule_follow_up(self, chat_id: int, topic: str, resume_at: datetime) -> None:
         """
@@ -107,7 +107,7 @@ class SilenceMonitor:
             logger.debug("silence_monitor: skipping silence check — quiet hours")
             return
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for chat_id, last_activity in list(self._last_activity.items()):
             if now - last_activity < self._silence_threshold:
                 continue
@@ -127,7 +127,7 @@ class SilenceMonitor:
             logger.info("silence_monitor: queued SILENCE_PING for chat_id=%s", chat_id)
 
     async def _check_follow_ups(self) -> None:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         for chat_id, items in list(self._pending_follow_ups.items()):
             due = [item for item in items if item.resume_at <= now]
             if not due:

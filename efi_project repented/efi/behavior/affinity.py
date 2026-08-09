@@ -26,8 +26,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 
 from efi.db.core import Database
 
@@ -70,7 +70,7 @@ _PHATIC_PHRASES = (
 _SHOUTING_RE = re.compile(r"[A-ZА-ЯЁ]{4,}")
 
 
-class MessageKind(str, Enum):
+class MessageKind(StrEnum):
     """Грубая классификация реплики собеседника для эвристики близости/уважения."""
 
     TROLLING = "trolling"
@@ -204,7 +204,7 @@ class AffinityTracker:
         )
         self._cache[chat_id] = updated
 
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._database.execute(
             """
             INSERT INTO chat_affinity (chat_id, affinity, respect_level, updated_at)

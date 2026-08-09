@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from efi.memory.consolidation import DiaryConsolidator, ExperienceSource, HistorySource
@@ -139,7 +139,7 @@ class MemoryPulse:
         Один проход по активным чатам. Возвращает число новых записей
         дневника — удобно и для логов, и для тестов.
         """
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         async with self._lock:
             chat_ids = await self._history.get_active_chat_ids(since=now - _ACTIVE_CHAT_WINDOW)
             created = 0

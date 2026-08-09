@@ -16,7 +16,7 @@ efi/humanizer/typos.py
 from __future__ import annotations
 
 import random
-from enum import Enum
+from enum import StrEnum
 
 from efi.config.schema import HumanizerSettings
 
@@ -50,7 +50,7 @@ _DEFAULT_KEYBOARD_NEIGHBORS: dict[str, list[str]] = {
 }
 
 
-class TypoKind(str, Enum):
+class TypoKind(StrEnum):
     """Вид алгоритмической опечатки — см. докстринг модуля."""
 
     SKIP = "skip"

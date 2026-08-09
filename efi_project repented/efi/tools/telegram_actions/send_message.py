@@ -174,8 +174,15 @@ class SendMessageTool(Tool):
         Telegram message_id (см. известное ограничение в резюме этого шага).
         Если пришла пачка (дебаунс сгруппировал несколько сообщений) — Reply
         ставится на самое последнее из них.
+
+        `force_reply` в payload уведомления делает реплай обязательным,
+        независимо от того, попросила ли о нём модель: под постом в канале
+        комментарий — это ИМЕННО реплай на экземпляр поста в группе
+        обсуждения, и без него сообщение уходит отдельной репликой в группу,
+        никак не привязанной к посту (см. efi/telegram/comments.py).
         """
-        if not bool(arguments.get("reply_to_current", False)):
+        forced = bool(context.notification.payload.get("force_reply"))
+        if not forced and not bool(arguments.get("reply_to_current", False)):
             return None
         message_ids = self._incoming_message_ids(context)
         return message_ids[-1] if message_ids else None

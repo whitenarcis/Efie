@@ -57,7 +57,7 @@ class PromptLoader:
             if cached is not None and cached[0] == mtime:
                 return cached[1]
 
-            async with aiofiles.open(path, mode="r", encoding="utf-8") as f:
+            async with aiofiles.open(path, encoding="utf-8") as f:
                 content = await f.read()
             self._cache[name] = (mtime, content)
             return content
@@ -75,15 +75,30 @@ class PromptLoader:
         кэш затронутых шаблонов сразу при изменении файлов на диске.
         Предназначена для запуска через `asyncio.create_task(loader.watch())`
         при старте приложения; завершается по отмене задачи (CancelledError).
-        Если watchfiles не установлен — просто логирует предупреждение и
-        завершается: ленивая mtime-инвалидация в get() продолжает работать
-        в любом случае, watch() — только оптимизация задержки обновления.
+        Если watchfiles не установлен ИЛИ каталога шаблонов нет — просто
+        логирует предупреждение и завершается: ленивая mtime-инвалидация в
+        get() продолжает работать в любом случае, watch() — только
+        оптимизация задержки обновления.
         """
         try:
             import watchfiles
         except ImportError:
             logger.warning(
                 "prompts: watchfiles is not installed, falling back to lazy mtime-based invalidation only"
+            )
+            return
+
+        # watchfiles.awatch() на несуществующем каталоге падает FileNotFoundError
+        # ("No path was found") — не при первом изменении, а сразу на входе в
+        # цикл. Для фоновой задачи это значило тихую смерть hot-reload'а на весь
+        # срок жизни процесса из-за опечатки в paths.base_dir: правки
+        # personality.md переставали подхватываться, и понять почему было не по
+        # чему. Проверяем заранее и выходим штатно.
+        if not await aiofiles.os.path.isdir(self._templates_dir):
+            logger.warning(
+                "prompts: templates dir %s does not exist, hot-reload is off "
+                "(lazy mtime invalidation in get() still works)",
+                self._templates_dir,
             )
             return
 

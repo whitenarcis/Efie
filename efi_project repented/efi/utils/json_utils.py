@@ -13,7 +13,10 @@ from typing import Any
 
 
 def safe_json_loads(raw: str, *, default: Any = None) -> Any:
-    """Парсит JSON, возвращая `default` вместо исключения при некорректном вводе — для мест, где сбой парсинга не должен ронять вызывающий код."""
+    """
+    Парсит JSON, возвращая `default` вместо исключения при некорректном вводе — для мест, где сбой парсинга не должен
+    ронять вызывающий код.
+    """
     if not raw:
         return default
     try:
@@ -23,7 +26,10 @@ def safe_json_loads(raw: str, *, default: Any = None) -> Any:
 
 
 def compact_json_dumps(value: Any) -> str:
-    """JSON без лишних пробелов (и без экранирования не-ASCII) — компактнее для хранения в БД/логах, чем json.dumps по умолчанию."""
+    """
+    JSON без лишних пробелов (и без экранирования не-ASCII) — компактнее для хранения в БД/логах, чем json.dumps по
+    умолчанию.
+    """
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 

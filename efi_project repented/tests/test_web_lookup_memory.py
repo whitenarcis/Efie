@@ -10,7 +10,7 @@ efi/notifications/worker.py). Значит, ни история, ни новел
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -142,7 +142,7 @@ async def test_lookup_keeps_more_text_than_a_chat_message(tmp_path: Path) -> Non
 
 async def test_context_lines_gather_the_episode_in_chronological_order(tmp_path: Path) -> None:
     store = SocialInteractionStore(Database(tmp_path / "test.db", migrations=MIGRATIONS))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
 
     await store.record(
         SocialInteraction(
@@ -170,7 +170,7 @@ async def test_context_lines_gather_the_episode_in_chronological_order(tmp_path:
 async def test_lines_before_the_window_are_not_replayed(tmp_path: Path) -> None:
     """Иначе один и тот же комментарий подмешивался бы в каждый следующий эпизод."""
     store = SocialInteractionStore(Database(tmp_path / "test.db", migrations=MIGRATIONS))
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     await store.record(
         SocialInteraction(
             kind=SocialInteractionKind.WEB_LOOKUP, text="вчерашнее", chat_id=42, created_at=now - timedelta(days=1)

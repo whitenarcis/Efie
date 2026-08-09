@@ -145,7 +145,9 @@ class LLMRouter:
         return await self._attempt_with_fallback(role, operation)
 
     async def transcribe_audio(self, role: TaskRole, audio_path: Path) -> AudioTranscription:
-        """Транскрибирует аудиофайл в текст, подбирая модель по роли (обычно VISION). Используется efi/telegram/media/."""
+        """
+        Транскрибирует аудиофайл в текст, подбирая модель по роли (обычно VISION). Используется efi/telegram/media/.
+        """
 
         async def operation(provider: LLMProvider, endpoint: EndpointConfig) -> AudioTranscription:
             return await provider.transcribe_audio(endpoint.model, audio_path)
@@ -153,7 +155,10 @@ class LLMRouter:
         return await self._attempt_with_fallback(role, operation)
 
     async def describe_image(self, role: TaskRole, image_path: Path, *, prompt: str) -> str:
-        """Возвращает текстовое описание изображения, подбирая модель по роли (обычно VISION). Используется efi/telegram/media/image.py."""
+        """
+        Возвращает текстовое описание изображения, подбирая модель по роли (обычно VISION). Используется
+        efi/telegram/media/image.py.
+        """
 
         async def operation(provider: LLMProvider, endpoint: EndpointConfig) -> str:
             return await provider.describe_image(endpoint.model, image_path, prompt=prompt)
@@ -291,7 +296,9 @@ def _endpoint_key(endpoint: EndpointConfig) -> _EndpointKey:
     return (endpoint.base_url, endpoint.model)
 
 
-def _dedupe_by_key(items: list[EndpointConfig], *, key: Callable[[EndpointConfig], _EndpointKey]) -> list[EndpointConfig]:
+def _dedupe_by_key(
+    items: list[EndpointConfig], *, key: Callable[[EndpointConfig], _EndpointKey]
+) -> list[EndpointConfig]:
     """
     Убирает повторы, сохраняя порядок первого вхождения — тот же эндпоинт
     может встретиться дважды при деградации между ролями (например, если

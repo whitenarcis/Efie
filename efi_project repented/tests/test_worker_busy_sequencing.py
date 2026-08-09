@@ -64,6 +64,9 @@ class _FakeTelegramNotifier:
     def __init__(self, events: list[str]) -> None:
         self._events = events
         self.typing_calls = 0
+        #: (chat_id, text) каждого реально отправленного сообщения — нужно там,
+        #: где проверяется не порядок событий, а сам факт доставки текста.
+        self.sent: list[tuple[int, str]] = []
 
     async def send_message(
         self,
@@ -76,6 +79,7 @@ class _FakeTelegramNotifier:
         on_bubble_sent: Callable[[str], None] | None = None,
     ) -> None:
         self._events.append("send_message")
+        self.sent.append((chat_id, text))
         # Реальный клиент подтверждает КАЖДЫЙ доставленный баббл — на этом
         # держится и история диалога, и учёт уже сказанного при отмене хода.
         if on_bubble_sent is not None:
@@ -875,3 +879,38 @@ async def test_uninterrupted_turn_persists_the_full_reply_once() -> None:
 
     persisted = [message.content for _chat_id, message in history.appended if message.role is Role.ASSISTANT]
     assert persisted == ["раз\nдва"]
+
+
+# -- "прочитано и тишина" не должно случаться ни при какой ошибке -------------------
+#
+# Регрессия: уведомить собеседника о сбое умел только `except LLMError`. Любая
+# другая ошибка на пути ответа (баг в инструменте, ответ провайдера без choices,
+# сбой БД) проходила мимо — собеседник получал read receipt и полную тишину,
+# то есть ровно то, ради предотвращения чего существуют _ensure_reply_was_sent
+# и _notify_failure.
+
+
+async def test_any_error_still_notifies_the_user_not_just_llm_errors() -> None:
+    events: list[str] = []
+    exploding_router = _FakeLLMRouter(events, error=ValueError("LLM response contains no choices"))
+    worker, telegram, _busy_engine, history = _make_worker(events, llm_router=exploding_router)
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    with pytest.raises(ValueError):
+        await worker._handle(notification)
+
+    assert (42, _FAILURE_NOTICE_TEXT) in telegram.sent, "после 'прочитано' собеседник обязан получить хоть что-то"
+    assert history.appended[-1][1].content == _FAILURE_NOTICE_TEXT
+
+
+async def test_a_superseded_turn_is_not_reported_as_a_glitch() -> None:
+    """Отмена устаревшего хода — не сбой: сообщение о глюке легло бы поверх нового ответа."""
+    events: list[str] = []
+    cancelled_router = _FakeLLMRouter(events, error=asyncio.CancelledError())
+    worker, telegram, _busy_engine, _history = _make_worker(events, llm_router=cancelled_router)
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker._handle(notification)
+
+    assert all(text != _FAILURE_NOTICE_TEXT for _chat_id, text in telegram.sent)

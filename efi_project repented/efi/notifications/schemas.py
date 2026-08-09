@@ -16,14 +16,14 @@ efi/notifications/schemas.py
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 
-class NotificationType(str, Enum):
+class NotificationType(StrEnum):
     """Тип события. Определяет, какой промпт-шаблон/логику возьмёт Worker при обработке."""
 
     #: Входящее сообщение от пользователя в чате — основной реактивный путь.
@@ -72,7 +72,7 @@ class Notification(BaseModel):
     chat_id: int | None = None
     message: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     @property
     def routing_key(self) -> str:

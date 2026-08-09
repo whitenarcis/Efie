@@ -28,8 +28,8 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Iterable, Iterator
-from datetime import datetime, timezone
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -37,7 +37,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 EmbeddingVector: TypeAlias = list[float]
 
 
-class Role(str, Enum):
+class Role(StrEnum):
     """Роль автора сообщения в диалоге с LLM."""
 
     SYSTEM = "system"
@@ -64,7 +64,7 @@ class ToolCallFunction(BaseModel):
             raise ValueError(f"tool call arguments must decode to an object, got {type(parsed).__name__}")
         return parsed
 
-    def accumulate(self, delta: "ToolCallFunction") -> None:
+    def accumulate(self, delta: ToolCallFunction) -> None:
         """Накопление стримингового дельта-чанка (SSE) поверх текущего состояния."""
         self.name += delta.name
         self.arguments += delta.arguments
@@ -78,7 +78,7 @@ class ToolCall(BaseModel):
     type: str = ""
     function: ToolCallFunction = Field(default_factory=ToolCallFunction)
 
-    def accumulate(self, delta: "ToolCall") -> None:
+    def accumulate(self, delta: ToolCall) -> None:
         """
         Накопление стримингового дельта-чанка.
 
@@ -117,7 +117,7 @@ class Message(BaseModel):
     reasoning_content: str = ""  # DeepSeek-style «сырое» поле рассуждений
     tool_calls: list[ToolCall] = Field(default_factory=list)
 
-    def accumulate(self, delta: "Message") -> None:
+    def accumulate(self, delta: Message) -> None:
         """
         Сливает стриминговый дельта-чанк в текущее сообщение.
 
@@ -165,7 +165,7 @@ class Response(BaseModel):
 
     id: str = ""
     object: str = ""
-    created: int = Field(default_factory=lambda: int(datetime.now(timezone.utc).timestamp()))
+    created: int = Field(default_factory=lambda: int(datetime.now(UTC).timestamp()))
     model: str = ""
     provider: str | None = None
     system_fingerprint: str | None = None
@@ -212,7 +212,7 @@ class Session(BaseModel):
 
     session_id: str = Field(default_factory=lambda: f"session_{uuid.uuid4().hex[:12]}")
     messages: list[Message] = Field(default_factory=list)
-    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
     def append(self, message: Message) -> None:
         self.messages.append(message)
@@ -299,13 +299,16 @@ class DiaryEntryMetadata(BaseModel):
         default=0.0,
         ge=-1.0,
         le=1.0,
-        description="-1 = заведомая ложь/шутка, 0 = теория по умолчанию, 1 = подтверждённый факт (не меняется при ночной консолидации)",
+        description=(
+            "-1 = заведомая ложь/шутка, 0 = теория по умолчанию, 1 = подтверждённый факт (не меняется при ночной "
+            "консолидации)"
+        ),
     )
     last_used: datetime | None = Field(default=None, description="None означает «запись ещё ни разу не использовалась»")
     usage_count: int = Field(default=0, ge=0)
     embedding: EmbeddingVector = Field(default_factory=list)
     created_at: datetime = Field(
-        default_factory=lambda: datetime.now(timezone.utc),
+        default_factory=lambda: datetime.now(UTC),
         description=(
             "Когда запись реально появилась в дневнике — НЕ путать с last_used (когда её последний раз "
             "нашли поиском). Записи без last_used (ещё ни разу не использовались) не должны читаться как "
@@ -316,7 +319,7 @@ class DiaryEntryMetadata(BaseModel):
     def touch(self) -> None:
         """Отмечает использование записи: увеличивает счётчик и обновляет last_used. Аналог incrementUsageCount()."""
         self.usage_count += 1
-        self.last_used = datetime.now(timezone.utc)
+        self.last_used = datetime.now(UTC)
 
     @property
     def is_ground_truth(self) -> bool:
@@ -348,9 +351,15 @@ class DiaryEntry(BaseModel):
 
 
 class DiaryQueryOptions(BaseModel):
-    """Параметры запроса к дневнику. Аналог Diary::QueryOpts (без callback-фильтра — он передаётся отдельным аргументом функции)."""
+    """
+    Параметры запроса к дневнику. Аналог Diary::QueryOpts (без callback-фильтра — он передаётся отдельным аргументом
+    функции).
+    """
 
-    confidence_factor: float = Field(default=0.01, ge=0.0, le=1.0, description="Вес confidence при ранжировании относительно чистого cosine similarity")
+    confidence_factor: float = Field(
+        default=0.01, ge=0.0, le=1.0,
+        description="Вес confidence при ранжировании относительно чистого cosine similarity",
+    )
     max_entry_count: int = Field(default=10, ge=1)
     min_relatedness: float = Field(
         default=0.0,
@@ -369,7 +378,7 @@ class DiaryQueryResult(BaseModel):
     entry: DiaryEntry
     relatedness: float = Field(ge=0.0, le=1.0, description="0 = не связано, 1 = дословное совпадение")
 
-    def __lt__(self, other: "DiaryQueryResult") -> bool:
+    def __lt__(self, other: DiaryQueryResult) -> bool:
         return self.relatedness < other.relatedness
 
 

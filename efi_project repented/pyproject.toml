@@ -23,6 +23,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "mypy>=1.9",
     "ruff>=0.4",
+    "types-aiofiles>=23.2",  # без стабов mypy --strict валится на каждом импорте aiofiles
 ]
 local-embeddings = [
     "fastembed>=0.3",
@@ -42,6 +43,18 @@ select = ["E", "F", "I", "UP", "B", "ASYNC"]
 python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
+
+# Pyrogram не поставляет py.typed и собирает часть модулей динамически
+# (pyrogram.errors генерирует классы ошибок на импорте, pyrogram.raw.types —
+# из TL-схемы), поэтому под --strict каждый импорт из него выглядел как
+# "does not explicitly export attribute". Послабление точечное: касается только
+# реэкспорта имён из самого pyrogram, проверка НАШЕГО кода остаётся строгой.
+# fastembed — необязательная зависимость (extra `local-embeddings`), её может
+# просто не быть в окружении, где гоняется тайпчек.
+[[tool.mypy.overrides]]
+module = ["pyrogram.*", "fastembed.*"]
+implicit_reexport = true
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

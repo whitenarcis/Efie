@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import aiosqlite
 
@@ -85,7 +85,7 @@ class BeliefStore:
         закрепление позиции по теме сбрасывает отсчёт "с каких пор так думаю".
         """
         confidence_score = max(0.0, min(confidence_score, 1.0))
-        now = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(UTC).isoformat()
         await self._database.execute(
             """
             INSERT INTO beliefs (topic, stance, confidence_score, origin_date)

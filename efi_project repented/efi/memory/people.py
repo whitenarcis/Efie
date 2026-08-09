@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from efi.behavior.affinity import classify_message
 from efi.db.core import Database
@@ -275,7 +275,7 @@ def _clamp(value: float) -> float:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 __all__ = ["PeopleStore", "PersonProfile"]

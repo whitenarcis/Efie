@@ -24,6 +24,7 @@ from efi.tools.telegram_actions.react_with_emoji import (
     ReactWithEmojiTool,
     normalize_reaction_emoji,
 )
+from efi.tools.telegram_actions.send_message import SendMessageTool
 
 
 def _sticker(*, emoji: str | None = "😂", file_id: str | None = "AAAA_file_id") -> Sticker:
@@ -166,3 +167,51 @@ async def test_rejection_suggests_valid_alternatives() -> None:
     tool = ReactWithEmojiTool(_FakeReactor())
     result = await tool.execute({"emoji": "🫠"}, _context(message_ids=[7]))
     assert "👍" in result and "🔥" in result
+
+
+# -- обязательный reply для публичного комментария --------------------------------
+#
+# Комментарий под постом в канале — это РЕПЛАЙ на экземпляр поста в группе
+# обсуждения (см. efi/telegram/comments.py). Свободное сообщение в ту же группу
+# комментарием под постом не становится, поэтому решать, ставить ли реплай, здесь
+# нельзя оставлять на усмотрение модели — за неё это делает payload.
+
+
+class _RecordingSender:
+    """Запоминает, с каким reply_to_message_id её позвали."""
+
+    def __init__(self) -> None:
+        self.reply_to_message_id: int | None = None
+
+    async def send_message(self, chat_id: int, text: str, **kwargs: object) -> None:
+        self.reply_to_message_id = kwargs.get("reply_to_message_id")  # type: ignore[assignment]
+        on_bubble_sent = kwargs.get("on_bubble_sent")
+        if callable(on_bubble_sent):
+            on_bubble_sent(text)
+
+
+def _send_context(**payload: object) -> ToolContext:
+    return ToolContext(
+        notification=Notification(
+            type=NotificationType.PUBLIC_COMMENT, priority=7, chat_id=-1002, message="повод",
+            payload={"telegram_message_ids": [77], **payload},
+        )
+    )
+
+
+async def test_force_reply_makes_the_comment_a_reply_without_the_model_asking() -> None:
+    sender = _RecordingSender()
+    tool = SendMessageTool(sender)  # type: ignore[arg-type]
+
+    await tool.execute({"text": "интересная мысль"}, _send_context(force_reply=True))
+
+    assert sender.reply_to_message_id == 77
+
+
+async def test_without_force_reply_the_model_still_decides() -> None:
+    sender = _RecordingSender()
+    tool = SendMessageTool(sender)  # type: ignore[arg-type]
+
+    await tool.execute({"text": "просто реплика"}, _send_context())
+
+    assert sender.reply_to_message_id is None

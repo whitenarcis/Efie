@@ -8,7 +8,7 @@ timestamp'ов, которые сложнее интерпретировать �
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def time_ago(moment: datetime, *, now: datetime | None = None) -> str:
@@ -24,7 +24,7 @@ def time_ago(moment: datetime, *, now: datetime | None = None) -> str:
     if moment.tzinfo is None:
         raise ValueError("time_ago() требует timezone-aware datetime")
 
-    reference = now or datetime.now(timezone.utc)
+    reference = now or datetime.now(UTC)
     delta_seconds = (reference - moment).total_seconds()
 
     if delta_seconds < 0:

@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from efi.config.schema import TaskRole
@@ -232,7 +232,7 @@ class DiaryConsolidator:
         лучше оставить дневник как есть, чем потерять записи без сводки).
         """
         entries = await self._diary.all_entries()
-        cutoff = datetime.now(timezone.utc) - older_than
+        cutoff = datetime.now(UTC) - older_than
         # ВАЖНО: критерий устаревания — created_at (когда запись реально
         # появилась), а НЕ last_used. Раньше здесь читался last_used с
         # фолбэком на "максимально старую дату" для записей, которые ещё ни
@@ -256,7 +256,7 @@ class DiaryConsolidator:
 
         average_confidence = sum(entry.metadata.confidence for entry in batch) / len(batch)
         merged_entry = DiaryEntry(
-            id=f"memoir_{int(datetime.now(timezone.utc).timestamp())}",
+            id=f"memoir_{int(datetime.now(UTC).timestamp())}",
             metadata=DiaryEntryMetadata(confidence=average_confidence),
             body=summary_text,
         )
@@ -317,7 +317,7 @@ class DiaryConsolidator:
             if entry is not None:
                 saved += 1
 
-        await facts.upsert(f"chat:{chat_id}", "last_novelized_at", datetime.now(timezone.utc).isoformat())
+        await facts.upsert(f"chat:{chat_id}", "last_novelized_at", datetime.now(UTC).isoformat())
         if memories:
             logger.info(
                 "consolidation: novelized chat_id=%s -> %d candidate memories (%d actually saved, %d external events)",
@@ -355,7 +355,7 @@ class DiaryConsolidator:
         Возвращает число новых записей, реально сохранённых в дневник
         (дубли, отбракованные RAGMemory.remember(), в счёт не идут).
         """
-        chat_ids = await history.get_active_chat_ids(since=datetime.now(timezone.utc) - chat_lookback_ceiling)
+        chat_ids = await history.get_active_chat_ids(since=datetime.now(UTC) - chat_lookback_ceiling)
         created_count = 0
 
         for chat_id in chat_ids:
@@ -374,7 +374,7 @@ class DiaryConsolidator:
     async def resolve_last_novelized_at(self, facts: FactStore, chat_id: int, lookback: timedelta) -> datetime:
         raw = await facts.get(f"chat:{chat_id}", "last_novelized_at")
         if raw is None:
-            return datetime.now(timezone.utc) - lookback
+            return datetime.now(UTC) - lookback
         try:
             return datetime.fromisoformat(raw)
         except ValueError:
@@ -382,7 +382,7 @@ class DiaryConsolidator:
                 "consolidation: unparseable last_novelized_at for chat_id=%s (%r), falling back to lookback",
                 chat_id, raw,
             )
-            return datetime.now(timezone.utc) - lookback
+            return datetime.now(UTC) - lookback
 
     async def _extract_memories(self, session: Session, experience_lines: list[str] | None = None) -> list[str]:
         blocks: list[str] = []
