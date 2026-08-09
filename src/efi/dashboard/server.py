@@ -54,15 +54,15 @@ _TOKEN_PAGE = """<!doctype html>
   :root {{ color-scheme: light dark; }}
   body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
          background:#f2f2f0; color:#1a1a1a;
-         font:300 14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
+         font:300 15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }}
   form {{ width:min(92vw, 380px); text-align:center; }}
-  h1 {{ font-size:13px; font-weight:400; letter-spacing:.42em; text-transform:uppercase; margin:0 0 40px; }}
-  p {{ color:#8a8a86; font-size:11px; letter-spacing:.16em; text-transform:uppercase; margin:0 0 18px; }}
+  h1 {{ font-size:14px; font-weight:400; letter-spacing:.42em; text-transform:uppercase; margin:0 0 40px; }}
+  p {{ color:#8a8a86; font-size:12px; letter-spacing:.16em; text-transform:uppercase; margin:0 0 18px; }}
   input {{ width:100%; padding:14px 0; border:0; border-bottom:1px solid #c9c9c5; background:transparent;
-           font:300 15px/1 inherit; color:inherit; text-align:center; letter-spacing:.1em; outline:none; }}
+           font:300 16px/1 inherit; color:inherit; text-align:center; letter-spacing:.1em; outline:none; }}
   input:focus {{ border-bottom-color:#1a1a1a; }}
   button {{ margin-top:28px; padding:13px 34px; border:1px solid #1a1a1a; background:transparent; color:inherit;
-            font:400 10px/1 inherit; letter-spacing:.28em; text-transform:uppercase; cursor:pointer; }}
+            font:400 11px/1 inherit; letter-spacing:.28em; text-transform:uppercase; cursor:pointer; }}
   button:hover {{ background:#1a1a1a; color:#f2f2f0; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background:#121211; color:#e8e8e4; }}

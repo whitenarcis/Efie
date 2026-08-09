@@ -13,6 +13,15 @@
  */
 
 :root {
+  /* Шкала кегля одним местом. Мелкий конец сознательно НЕ уходит ниже 10px:
+     заглавные надписи с большим межбуквенным интервалом читаются заметно
+     хуже строчных того же кегля, и на 9px они превращались в орнамент —
+     красивый на макете и нечитаемый на реальном мониторе. */
+  --fs-nano: 10px;   /* теги, подпись в подвале, статус связи */
+  --fs-micro: 11px;  /* заглавные микро-подписи карточек, навигация */
+  --fs-small: 13px;  /* пояснения под строками, лента логов */
+  --fs-body: 15px;   /* основной текст */
+
   --bg: #f2f2f0;
   --bg-sunken: #eaeae7;
   --surface: #ffffff;
@@ -72,7 +81,7 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--ink);
-  font: 300 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Roboto, Arial, sans-serif;
+  font: 300 var(--fs-body)/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Roboto, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
 }
@@ -101,7 +110,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .wordmark {
-  font-size: 12px;
+  font-size: 13px;
   letter-spacing: 0.42em;
   text-transform: uppercase;
   white-space: nowrap;
@@ -118,7 +127,7 @@ a { color: inherit; text-decoration: none; }
 .presence { right: 48px; display: none; align-items: center; gap: 8px; }
 
 .presence span {
-  font-size: 9px;
+  font-size: var(--fs-nano);
   letter-spacing: 0.24em;
   text-transform: uppercase;
   color: var(--muted);
@@ -195,7 +204,7 @@ a { color: inherit; text-decoration: none; }
 
 .nav a {
   padding: 13px 20px;
-  font-size: 10px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.28em;
   text-transform: uppercase;
   color: var(--muted);
@@ -220,7 +229,7 @@ a { color: inherit; text-decoration: none; }
 
 .kicker {
   margin: 0 0 18px;
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.34em;
   text-transform: uppercase;
   color: var(--muted);
@@ -240,12 +249,12 @@ a { color: inherit; text-decoration: none; }
   margin: 22px auto 0;
   max-width: 58ch;
   color: var(--ink-soft);
-  font-size: 14px;
+  font-size: var(--fs-body);
 }
 
 .section-title {
   margin: 56px 0 16px;
-  font-size: 10px;
+  font-size: var(--fs-micro);
   font-weight: 400;
   letter-spacing: 0.3em;
   text-transform: uppercase;
@@ -271,7 +280,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .label {
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.24em;
   text-transform: uppercase;
   color: var(--muted);
@@ -287,17 +296,17 @@ a { color: inherit; text-decoration: none; }
   word-break: break-word;
 }
 
-.value.small { font-size: 17px; font-weight: 300; letter-spacing: 0.01em; }
-.value.text { font-size: 15px; font-weight: 300; line-height: 1.6; }
+.value.small { font-size: 18px; font-weight: 300; letter-spacing: 0.01em; }
+.value.text { font-size: var(--fs-body); font-weight: 300; line-height: 1.6; }
 
 .note {
   margin-top: 10px;
-  font-size: 12px;
+  font-size: var(--fs-small);
   color: var(--muted);
   letter-spacing: 0.02em;
 }
 
-.unit { font-size: 12px; color: var(--muted); letter-spacing: 0.16em; text-transform: uppercase; margin-left: 6px; }
+.unit { font-size: var(--fs-small); color: var(--muted); letter-spacing: 0.16em; text-transform: uppercase; margin-left: 6px; }
 
 /* --------------------------------------------------------------- списки */
 
@@ -321,14 +330,14 @@ a { color: inherit; text-decoration: none; }
 .row-main { flex: 1 1 220px; min-width: 0; }
 
 .row-title {
-  font-size: 14px;
+  font-size: var(--fs-body);
   letter-spacing: 0.02em;
   overflow-wrap: anywhere;
 }
 
 .row-sub {
   margin-top: 4px;
-  font-size: 12px;
+  font-size: var(--fs-small);
   color: var(--muted);
   overflow-wrap: anywhere;
 }
@@ -336,7 +345,7 @@ a { color: inherit; text-decoration: none; }
 .row-aside {
   flex: 0 0 auto;
   text-align: right;
-  font-size: 12px;
+  font-size: var(--fs-small);
   color: var(--ink-soft);
   letter-spacing: 0.04em;
 }
@@ -350,7 +359,7 @@ a { color: inherit; text-decoration: none; }
 
 .tag {
   display: inline-block;
-  font-size: 9px;
+  font-size: var(--fs-nano);
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--muted);
@@ -402,7 +411,7 @@ a { color: inherit; text-decoration: none; }
 }
 
 .field label {
-  font-size: 9px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--muted);
@@ -416,7 +425,7 @@ a { color: inherit; text-decoration: none; }
   border: 0;
   background: transparent;
   color: inherit;
-  font: 300 14px/1.4 inherit;
+  font: 300 var(--fs-body)/1.4 inherit;
   outline: none;
   padding: 2px 0;
 }
@@ -427,7 +436,7 @@ button.ghost {
   border: 1px solid var(--line-strong);
   background: transparent;
   color: var(--ink-soft);
-  font: 400 9px/1 inherit;
+  font: 400 var(--fs-nano)/1 inherit;
   letter-spacing: 0.24em;
   text-transform: uppercase;
   padding: 11px 16px;
@@ -454,7 +463,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   gap: 2px 14px;
   padding: 10px 14px;
   border-bottom: 1px solid var(--line);
-  font: 400 12px/1.55 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font: 400 var(--fs-small)/1.6 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
 .log-line:last-child { border-bottom: 0; }
@@ -463,7 +472,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  font-size: 10px;
+  font-size: var(--fs-nano);
   letter-spacing: 0.08em;
   color: var(--muted);
 }
@@ -481,7 +490,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   padding: 10px 12px;
   background: var(--bg-sunken);
   color: var(--err);
-  font-size: 11px;
+  font-size: var(--fs-small);
   white-space: pre;
   overflow-x: auto;
 }
@@ -497,7 +506,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
 .reader-body {
   max-width: 64ch;
   margin: 22px auto 0;
-  font-size: 16px;
+  font-size: calc(var(--fs-body) + 1px);
   line-height: 1.85;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -506,7 +515,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
 
 .reader-title {
   text-align: center;
-  font-size: 11px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.3em;
   text-transform: uppercase;
   color: var(--muted);
@@ -521,19 +530,19 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   padding: 12px 15px;
   border: 1px solid var(--line);
   background: var(--surface);
-  font-size: 14px;
+  font-size: var(--fs-body);
   line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
 .bubble.assistant { align-self: flex-end; background: var(--bg-sunken); border-color: transparent; }
-.bubble.tool, .bubble.system { align-self: center; max-width: 100%; color: var(--muted); font-size: 12px; }
+.bubble.tool, .bubble.system { align-self: center; max-width: 100%; color: var(--muted); font-size: var(--fs-small); }
 
 .bubble-meta {
   display: block;
   margin-top: 8px;
-  font-size: 9px;
+  font-size: var(--fs-nano);
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--muted);
@@ -549,7 +558,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   padding: 46px 20px;
   text-align: center;
   color: var(--muted);
-  font-size: 11px;
+  font-size: var(--fs-micro);
   letter-spacing: 0.24em;
   text-transform: uppercase;
   border: 1px solid var(--line);
@@ -562,7 +571,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   border-top: 1px solid var(--line);
   padding: 22px 16px calc(22px + env(safe-area-inset-bottom));
   text-align: center;
-  font-size: 9px;
+  font-size: var(--fs-nano);
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--muted);
@@ -570,16 +579,28 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
 
 .colophon-sep { margin: 0 10px; }
 
-.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; }
+.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: var(--fs-small); }
 
 /* --------------------------------------------------------- адаптивность */
+
+/* На большом экране расстояние до глаз больше, чем до телефона в руке,
+   поэтому весь мелкий конец шкалы поднимается ещё на ступень — иначе
+   микро-подписи, комфортные на 390px, на мониторе приходится вычитывать. */
+@media (min-width: 900px) {
+  :root {
+    --fs-nano: 11px;
+    --fs-micro: 12px;
+    --fs-small: 14px;
+    --fs-body: 16px;
+  }
+}
 
 @media (min-width: 600px) {
   .view { padding: 0 28px 96px; }
   .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .cell { padding: 26px 24px; }
   .presence { display: flex; }
-  .log-line { grid-template-columns: 150px minmax(0, 1fr); }
+  .log-line { grid-template-columns: 168px minmax(0, 1fr); }
   .log-meta { flex-direction: column; gap: 2px; }
   .colophon { text-align: right; padding-right: 28px; }
 }
