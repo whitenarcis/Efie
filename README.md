@@ -299,16 +299,27 @@ Cooldown ключуется по паре `(base_url, model)`, а не по пр
 ### Linux / macOS
 
 ```bash
-git clone <repo-url>
-cd "efi_project repented"
+git clone https://github.com/whitenarcis/Efie.git
+cd Efie
+python3 -m venv .venv
+bash --rcfile ./.venv/bin/activate
+pip install -e "./src[dev,local-embeddings]"
+```
+#### Отредактируйте значения для Telegram в behavior.toml
+```bash
+nano src/behavior.toml
+```
+<img width="830" height="272" alt="image" src="https://github.com/user-attachments/assets/0ff4a847-2151-4b3d-9a72-2b86c5426856" />
 
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev,local-embeddings]"
+#### Отредактируйте значения API ключей для LLM в behavior.toml
+```bash
+nano src/behavior.toml
+```
+<img width="790" height="775" alt="image" src="https://github.com/user-attachments/assets/72929b59-7d3f-47bc-9aae-eb904aa04106" />
 
-# отредактировать behavior.toml в корне проекта:
-# telegram.api_id / api_hash / owner_id и llm_roles.*.primary.api_key
-python scripts/run.py --log-level INFO
+#### Запуск
+```
+python src/scripts/run.py --log-level INFO
 ```
 
 Конфиг читается строго из `behavior.toml` в корне проекта. Секреты лучше
@@ -321,8 +332,8 @@ python scripts/run.py --log-level INFO
 ### Windows
 
 ```powershell
-git clone <repo-url>
-cd "efi_project repented"
+git clone https://github.com/whitenarcis/Efie.git
+cd "Efie"
 
 py -3.11 -m venv .venv
 .venv\Scripts\Activate.ps1
