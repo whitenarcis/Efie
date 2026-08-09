@@ -3,9 +3,9 @@ efi/app.py
 
 EfiApp — точка сборки всего приложения: связывает Settings, Database,
 LLMRouter, память (Diary/RAGMemory/WorkingMemory/FactStore), очередь событий
-(NotificationManager + N Worker'ов), Telegram-слой и проактивные сервисы
-(Scheduler/SpontaneousPingScheduler/SilenceMonitor) в один управляемый объект
-с корректным graceful shutdown.
+(NotificationManager + N Worker'ов), Telegram-слой, проактивные сервисы
+(Scheduler/SpontaneousPingScheduler/SilenceMonitor) и веб-дашборд
+(efi/dashboard/) в один управляемый объект с корректным graceful shutdown.
 
 EfiApp сам не работает с сигналами ОС (SIGINT/SIGTERM) — это дело точки
 входа (scripts/run.py), которая вызывает `request_stop()` из обработчика
@@ -35,6 +35,10 @@ from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
 from efi.behavior.silence_monitor import SilenceMonitor
 from efi.behavior.spontaneous_ping import SpontaneousPingScheduler
 from efi.config.schema import Settings, TaskRole
+from efi.dashboard.logbus import LogBuffer
+from efi.dashboard.metrics import LLMMetricsCollector
+from efi.dashboard.server import DashboardServer
+from efi.dashboard.snapshot import DashboardContext
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
@@ -113,10 +117,23 @@ class EfiApp:
         self._stop_event = asyncio.Event()
         self._background_tasks: list[asyncio.Task[None]] = []
         self._worker_tasks: list[asyncio.Task[None]] = []
+        self._started_at = datetime.now(UTC)
+
+        # -- наблюдаемость ---------------------------------------------------
+        # Строится ПЕРВОЙ: сборщик метрик нужен LLM-роутеру уже в конструкторе
+        # (он оборачивает провайдеров при создании), а буфер логов должен
+        # встать на корневой логгер до того, как подсистемы начнут писать.
+        dashboard_settings = settings.dashboard
+        self._log_buffer = LogBuffer(
+            capacity=dashboard_settings.log_buffer_size, level=dashboard_settings.log_level_no
+        )
+        self._llm_metrics = LLMMetricsCollector(history=dashboard_settings.metrics_history)
 
         # -- инфраструктура ------------------------------------------------
         self._database = Database(settings.paths.db_path, migrations=MIGRATIONS)
-        self._llm_router = settings.build_router()
+        self._llm_router = settings.build_router(
+            metrics_sink=self._llm_metrics.sink if dashboard_settings.enabled else None
+        )
 
         # -- память ----------------------------------------------------------
         diary_dir = settings.memory.resolve_diary_dir(settings.paths)
@@ -300,6 +317,40 @@ class EfiApp:
         self._tool_registry = ToolRegistry()
         self._tool_registry.register_all(self._build_tools())
 
+        # -- дашборд ------------------------------------------------------------
+        # Конструируется ПОСЛЕДНИМ: он смотрит на всё остальное. Списки задач
+        # передаются вызываемыми, а не значениями — они наполняются в start(),
+        # уже после сборки контекста.
+        self._dashboard: DashboardServer | None = None
+        if settings.dashboard.enabled:
+            self._dashboard = DashboardServer(
+                DashboardContext(
+                    settings=settings,
+                    logs=self._log_buffer,
+                    metrics=self._llm_metrics,
+                    started_at=self._started_at,
+                    database=self._database,
+                    diary=self._diary,
+                    working_memory=self._working_memory,
+                    history=self._history,
+                    beliefs=self._beliefs,
+                    affinity=self._affinity,
+                    people=self._people,
+                    lifecycle=self._lifecycle,
+                    busy_engine=self._busy_engine,
+                    life_engine=self._life_engine,
+                    notifications=self._notification_manager,
+                    orchestrator=self._orchestrator,
+                    telegram=self._telegram_client,
+                    tools=self._tool_registry,
+                    llm_router=self._llm_router,
+                    prompt_loader=self._prompt_loader,
+                    background_tasks=lambda: self._background_tasks,
+                    worker_tasks=lambda: self._worker_tasks,
+                ),
+                settings.dashboard,
+            )
+
     def _build_tools(self) -> list[Tool]:
         return [
             AskDiaryTool(self._rag, min_relatedness=self._settings.memory.min_relatedness),
@@ -357,6 +408,10 @@ class EfiApp:
 
     async def start(self) -> None:
         """Поднимает все подсистемы: Telegram-клиент, обработчики, воркеры, проактивные сервисы."""
+        # Буфер логов встаёт на корневой логгер ПЕРВЫМ делом: иначе ровно то,
+        # что происходит на старте (а падает чаще всего именно там), в ленту
+        # дашборда не попадёт.
+        self._log_buffer.install()
         logger.info("app: starting")
 
         self._telegram_handlers.register(self._pyrogram_client)
@@ -397,6 +452,17 @@ class EfiApp:
 
         if self._settings.memory_pulse.enabled:
             self._background_tasks.append(self._spawn_supervised(self._memory_pulse.run(), name="memory_pulse"))
+
+        if self._dashboard is not None:
+            # Дашборд поднимается ПОСЛЕДНИМ и не через _spawn_supervised: он
+            # не крутит свой цикл, а держит asyncio-сервер, и его падение при
+            # старте (занятый порт) не должно остаться незамеченным — но и
+            # ронять из-за него уже поднятую Эфи неправильно.
+            try:
+                await self._dashboard.start()
+            except OSError as exc:
+                logger.error("app: dashboard failed to start (%s), continuing without it", exc)
+                self._dashboard = None
 
         logger.info(
             "app: started (%d workers, %d background services)",
@@ -502,6 +568,13 @@ class EfiApp:
         """
         logger.info("app: stopping")
 
+        # Дашборд гасится первым: он читает состояние всех подсистем, и его
+        # запрос, пришедший посреди остановки, увидел бы полуразобранное
+        # приложение. Логи при этом продолжают писаться в буфер до самого
+        # конца — обработчик снимается уже после остановки всего остального.
+        if self._dashboard is not None:
+            await self._dashboard.stop()
+
         # Недописанные, ещё не отфлашенные из дебаунсера сообщения (человек
         # написал что-то за секунды до остановки) — сбрасываем в очередь,
         # а не молча теряем.
@@ -537,6 +610,7 @@ class EfiApp:
             await self._stt.aclose()
 
         logger.info("app: stopped")
+        self._log_buffer.uninstall()
 
 
 def _build_scheduled_jobs() -> list[ScheduledJob]:

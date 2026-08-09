@@ -50,6 +50,15 @@ class ToolRegistry:
         """Инструменты, доступные в данном контексте (см. Tool.is_available)."""
         return [tool for tool in self._tools.values() if tool.is_available(context)]
 
+    def all_tools(self) -> list[Tool]:
+        """
+        Все зарегистрированные инструменты, включая недоступные в текущем
+        контексте — в отличие от `available_tools`, это витрина, а не то, что
+        показывают модели. Нужна дашборду (efi/dashboard/), которому важно
+        показать и выключенный инструмент, и причину, по которой он выключен.
+        """
+        return list(self._tools.values())
+
     def as_openai_tools(self, context: ToolContext) -> list[dict[str, Any]]:
         """Список инструментов, доступных в контексте, в формате LLMParams.tools."""
         return [tool.as_openai_schema() for tool in self.available_tools(context)]

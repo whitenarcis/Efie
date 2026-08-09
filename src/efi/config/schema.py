@@ -57,6 +57,8 @@ TOML-файл (``behavior.toml``) > значения по умолчанию, з
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 import os
 from enum import StrEnum
 from functools import lru_cache
@@ -843,6 +845,81 @@ class QuietHoursSettings(BaseModel):
     end_hour: int = Field(default=8, ge=0, le=23, description="Час окончания тихих часов (локальное время сервера)")
 
 
+class DashboardSettings(BaseModel):
+    """
+    Веб-дашборд (efi/dashboard/): подробные логи, состояние подсистем,
+    дневник и вся накопленная память в браузере.
+
+    Дашборд показывает переписку, дневник и профили людей — то же, что
+    README требует не выкладывать наружу. Отсюда два решения по умолчанию:
+    слушать только петлевой интерфейс и НЕ давать выставить себя в сеть без
+    токена (см. валидатор ниже) — забыть про токен, поменяв `host`, не
+    должно быть возможно случайно.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=True, description="Поднимать ли дашборд вместе с приложением")
+    host: str = Field(default="127.0.0.1", description="Интерфейс, который слушает дашборд")
+    port: int = Field(default=8765, ge=0, le=65535, description="Порт дашборда (0 — выбрать свободный, для тестов)")
+    token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Токен доступа. Не нужен, пока дашборд слушает localhost; обязателен, если host выставлен наружу. "
+            "Принимается заголовком X-Efi-Token, cookie или ?token=... в ссылке"
+        ),
+    )
+    log_buffer_size: int = Field(
+        default=2000, ge=100, le=100_000, description="Сколько последних записей лога держать в памяти для ленты"
+    )
+    log_level: str = Field(
+        default="INFO",
+        description=(
+            "Минимальный уровень записей, попадающих в ленту дашборда. DEBUG показывает решения буфера, "
+            "оркестратора и роутера — полезно при отладке, но лента растёт быстро"
+        ),
+    )
+    metrics_history: int = Field(
+        default=200, ge=10, le=5000, description="Сколько последних LLM-вызовов держать в ленте метрик"
+    )
+
+    @model_validator(mode="after")
+    def _validate_exposure(self) -> DashboardSettings:
+        if not self.enabled:
+            return self
+        if self.log_level.upper() not in logging.getLevelNamesMapping():
+            raise ValueError(f"dashboard.log_level: неизвестный уровень логирования {self.log_level!r}")
+        if not _is_loopback_host(self.host) and self.token is None:
+            raise ValueError(
+                "dashboard.host выставлен наружу без dashboard.token — дашборд отдаёт дневник, историю "
+                "переписки и профили людей, поэтому без токена он поднимается только на localhost. "
+                "Задайте EFI_DASHBOARD__TOKEN или верните host = \"127.0.0.1\""
+            )
+        return self
+
+    @property
+    def log_level_no(self) -> int:
+        return logging.getLevelNamesMapping()[self.log_level.upper()]
+
+
+def _is_loopback_host(host: str) -> bool:
+    """
+    Петлевой ли это адрес. Пустой host в asyncio означает «слушать все
+    интерфейсы», поэтому он тоже считается выставленным наружу.
+    """
+    normalized = host.strip().strip("[]").lower()
+    if not normalized:
+        return False
+    if normalized in {"localhost", "::1"}:
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        # Не адрес, а имя (например, доменное) — считаем внешним: угадывать,
+        # куда оно резолвится, безопаснее отказом.
+        return False
+
+
 class Settings(BaseSettings):
     """
     Корневой объект конфигурации приложения.
@@ -885,6 +962,7 @@ class Settings(BaseSettings):
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
     quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
     community: CommunitySettings = Field(default_factory=CommunitySettings)
+    dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -1033,6 +1111,9 @@ __all__ = [
     "SttSettings",
     "LifeEngineSettings",
     "BusyEngineSettings",
+    "CommunitySettings",
+    "QuietHoursSettings",
+    "DashboardSettings",
     "Settings",
     "get_settings",
 ]

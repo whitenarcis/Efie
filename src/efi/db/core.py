@@ -93,18 +93,45 @@ class Database:
                 )
                 await asyncio.sleep(self._acquire_retry_delay_seconds)
                 continue
-            await self._ensure_migrations(conn)
+            try:
+                await self._ensure_migrations(conn)
+            except BaseException:
+                # Соединение уже открыто и, значит, уже держит свой поток
+                # (см. комментарий в _open_and_prepare) — если миграции не
+                # прошли, закрыть его должны мы: наружу уйдёт исключение, и
+                # вызывающая сторона про это соединение уже не узнает.
+                await conn.close()
+                raise
             return conn
         assert last_error is not None  # цикл всегда либо возвращает, либо оставляет last_error перед выходом
         raise last_error
 
     async def _open_and_prepare(self) -> aiosqlite.Connection:
+        """
+        Открывает соединение и выставляет PRAGMA.
+
+        Любой сбой ПОСЛЕ connect() обязан закрыть соединение. aiosqlite под
+        каждое соединение поднимает отдельный НЕ-daemon-поток, и брошенное
+        (не закрытое) соединение навсегда оставляет этот поток жить: процесс
+        после такого не завершается вообще — `threading._shutdown` ждёт его,
+        а тот крутит свой цикл, потому что закрыть его больше некому.
+
+        Ровно это и происходило на ретраях `_acquire`: PRAGMA journal_mode=WAL
+        берёт кратковременную исключительную блокировку, и при двух
+        одновременных первых обращениях к свежей базе один из вызовов ловил
+        "database is locked" — ретрай отрабатывал как задумано, но поток от
+        неудачной попытки оставался.
+        """
         await aiofiles.os.makedirs(self._db_path.parent, exist_ok=True)
         conn = await aiosqlite.connect(self._db_path)
-        conn.row_factory = aiosqlite.Row
-        await conn.execute("PRAGMA journal_mode=WAL")
-        await conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
-        await conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode=WAL")
+            await conn.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
+            await conn.execute("PRAGMA foreign_keys=ON")
+        except BaseException:
+            await conn.close()
+            raise
         return conn
 
     async def _ensure_migrations(self, conn: aiosqlite.Connection) -> None:

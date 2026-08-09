@@ -87,6 +87,15 @@ class TelegramClientWrapper:
         await self._client.start()
         logger.info("telegram: client started")
 
+    @property
+    def is_connected(self) -> bool:
+        """
+        Живо ли соединение с Telegram прямо сейчас. Только для наблюдения
+        (efi/dashboard/): Pyrogram держит признак у себя, а обёртка не даёт
+        к нему добраться иначе как через приватное поле.
+        """
+        return bool(getattr(self._client, "is_connected", False))
+
     async def ensure_peer_known(self, chat_id: int) -> bool:
         """
         Гарантирует, что Pyrogram умеет резолвить `chat_id` в peer, и

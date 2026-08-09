@@ -44,6 +44,7 @@ from typing import Self, TypeVar
 from efi.config.schema import EndpointConfig, RoleRoute, TaskRole
 from efi.llm.base import LLMProvider
 from efi.llm.errors import LLMAuthError, LLMError, LLMRateLimitError, LLMTimeoutError
+from efi.llm.measurable import MeasurableLLMProvider, MetricsSink
 from efi.llm.providers.openai_compatible import OpenAICompatibleProvider
 from efi.llm.schemas import AudioTranscription, EmbeddingVector, LLMParams, Response, Session
 
@@ -72,6 +73,7 @@ class LLMRouter:
         rate_limit_cooldown_seconds: float = 90.0,
         auth_cooldown_seconds: float = 600.0,
         role_timeout_buffer_seconds: float = 5.0,
+        metrics_sink: MetricsSink | None = None,
     ) -> None:
         missing_roles = set(TaskRole) - set(routes)
         if missing_roles:
@@ -84,9 +86,20 @@ class LLMRouter:
         self._rate_limit_cooldown_seconds = rate_limit_cooldown_seconds
         self._auth_cooldown_seconds = auth_cooldown_seconds
         self._role_timeout_buffer_seconds = role_timeout_buffer_seconds
+        self._metrics_sink = metrics_sink
 
         self._cooldowns: dict[_EndpointKey, float] = {}  # endpoint_key -> time.monotonic() дедлайна
         self._providers: dict[_EndpointKey, LLMProvider] = {}
+
+    def cooldown_snapshot(self) -> dict[_EndpointKey, float]:
+        """
+        Сколько секунд каждому эндпоинту ещё осталось «отдыхать» после
+        429/5xx/ошибки авторизации. Только для наблюдения (efi/dashboard/):
+        cooldown хранится в монотонном времени процесса, поэтому наружу
+        отдаётся уже посчитанный остаток, а не абсолютный дедлайн.
+        """
+        now = time.monotonic()
+        return {key: remaining for key, deadline in self._cooldowns.items() if (remaining := deadline - now) > 0.0}
 
     async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
         """Нестриминговый запрос с автоматическим fallback между кандидатами роли."""
@@ -288,6 +301,11 @@ class LLMRouter:
         provider = self._providers.get(key)
         if provider is None:
             provider = OpenAICompatibleProvider(endpoint, name=f"{key[0]}::{key[1]}")
+            if self._metrics_sink is not None:
+                # Ровно тот «следующий шаг», о котором говорит докстринг
+                # efi/llm/measurable.py: провайдеры создаются здесь лениво,
+                # поэтому обернуть их прозрачно можно только в этой точке.
+                provider = MeasurableLLMProvider(provider, self._metrics_sink)
             self._providers[key] = provider
         return provider
 
