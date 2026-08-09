@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 from pyrogram import Client
@@ -30,9 +31,16 @@ from pyrogram.errors import RPCError
 from pyrogram.types import Message as PyrogramMessage
 
 from efi.config.schema import HumanizerSettings
-from efi.humanizer.message_splitting import first_chunk_typing_delay, split_into_messages
+from efi.humanizer.message_splitting import (
+    first_chunk_typing_delay,
+    is_short_bubble,
+    short_bubble_delay,
+    split_into_messages,
+)
+from efi.humanizer.reply_selector import parse_reply_tags
 from efi.humanizer.typing_simulation import simulate_typing_delay
 from efi.humanizer.typos import inject_typo
+from efi.telegram.queue import BubbleQueue, OutboundBubble
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +129,8 @@ class TelegramClientWrapper:
         *,
         reply_to_message_id: int | None = None,
         llm_generation_time: float | None = None,
+        incoming_message_ids: Collection[int] = (),
+        on_bubble_sent: Callable[[str], None] | None = None,
     ) -> None:
         """
         Отправляет текст, предварительно разбив его на цепочку сообщений
@@ -142,9 +152,20 @@ class TelegramClientWrapper:
         поправляет", которого не хватало — раньше опечатки никогда не
         исправлялись, что не похоже на реального человека.
 
-        `reply_to_message_id` (если задан) применяется ТОЛЬКО к первому куску
-        серии — явный Reply-статус имеет смысл один раз, на весь блок реплик,
-        а не на каждый отдельный кусок ("///"-разбивку) по отдельности.
+        Привязка бабблов к конкретным входящим репликам разбирается из тегов
+        `[reply:id]`, которые модель ставит в начале баббла (см.
+        efi/humanizer/reply_selector.py); `incoming_message_ids` — id
+        сообщений текущей входящей пачки, всё остальное считается выдумкой
+        модели и снимается. `reply_to_message_id` остаётся как явное
+        указание «весь ответ — реплай сюда» и применяется к первому бабблу,
+        если своего тега у него нет.
+
+        `on_bubble_sent` вызывается ПОСЛЕ каждого реально доставленного
+        баббла. Это важно именно при отмене хода: серия растянута во времени,
+        и если ход снимут на середине (efi/telegram/chat_orchestrator.py),
+        вызывающая сторона должна знать, что именно собеседник уже прочитал —
+        иначе следующая генерация соберёт контекст без этих реплик и
+        повторит их.
 
         Примечание: параметр Pyrogram называется `reply_to_message_id` в
         классическом MTProto API — в некоторых свежих версиях Pyrogram/Pyrofork
@@ -157,14 +178,37 @@ class TelegramClientWrapper:
             logger.debug("telegram: send_message called with empty text for chat_id=%s, nothing to send", chat_id)
             return
 
+        bubbles = parse_reply_tags(chunks, incoming_message_ids=incoming_message_ids)
+        if bubbles and reply_to_message_id is not None and bubbles[0].reply_to_message_id is None:
+            bubbles[0] = OutboundBubble(bubbles[0].text, reply_to_message_id)
+        queue = BubbleQueue(bubbles)
+
         # Прогреваем peer ДО симуляции печати: иначе весь typing/WPM-цикл
         # отрабатывал бы впустую, а падение случалось бы уже на самой
         # отправке — сырым KeyError наружу через ToolRegistry.
         if not await self.ensure_peer_known(chat_id):
             raise UnknownChatError(chat_id)
 
-        for index, chunk in enumerate(chunks):
-            humanized_chunk = inject_typo(chunk, self._humanizer_settings)
+        try:
+            await self._drain_bubbles(chat_id, queue, llm_generation_time, on_bubble_sent)
+        except asyncio.CancelledError:
+            # Ход сняли как устаревший. Доставленное уже у собеседника и
+            # учтено через on_bubble_sent; остаток молча не уходит — именно
+            # это и значит "не договаривать ответ на неактуальную реплику".
+            queue.log_interruption(chat_id)
+            raise
+
+    async def _drain_bubbles(
+        self,
+        chat_id: int,
+        queue: BubbleQueue,
+        llm_generation_time: float | None,
+        on_bubble_sent: Callable[[str], None] | None,
+    ) -> None:
+        """Последовательная отправка серии: typing -> пауза -> сообщение, с подтверждением каждого баббла в очереди."""
+        while (bubble := queue.next_bubble()) is not None:
+            humanized_chunk = inject_typo(bubble.text, self._humanizer_settings)
+            is_first = queue.is_first
 
             try:
                 await self._client.send_chat_action(chat_id, ChatAction.TYPING)
@@ -174,20 +218,39 @@ class TelegramClientWrapper:
                 # сообщение всё равно должно уйти.
                 logger.debug("telegram: failed to send typing action to chat_id=%s", chat_id, exc_info=True)
 
-            if index == 0 and llm_generation_time is not None:
-                delay = first_chunk_typing_delay(
-                    humanized_chunk, self._humanizer_settings, llm_generation_time=llm_generation_time
-                )
-                if delay > 0:
-                    await asyncio.sleep(delay)
-            else:
-                await simulate_typing_delay(humanized_chunk, self._humanizer_settings)
+            await self._pause_before(humanized_chunk, is_first=is_first, llm_generation_time=llm_generation_time)
 
-            reply_id = reply_to_message_id if index == 0 else None
-            sent_message = await self._client.send_message(chat_id, humanized_chunk, reply_to_message_id=reply_id)
+            sent_message = await self._client.send_message(
+                chat_id, humanized_chunk, reply_to_message_id=bubble.reply_to_message_id
+            )
+            queue.mark_delivered(text=humanized_chunk)
+            if on_bubble_sent is not None:
+                on_bubble_sent(humanized_chunk)
 
-            if humanized_chunk != chunk:
-                self._maybe_schedule_self_correction(chat_id, sent_message, chunk)
+            if humanized_chunk != bubble.text:
+                self._maybe_schedule_self_correction(chat_id, sent_message, bubble.text)
+
+    async def _pause_before(self, chunk: str, *, is_first: bool, llm_generation_time: float | None) -> None:
+        """
+        Сколько «печатать» перед конкретным бабблом.
+
+        Три разных случая, и раньше был только один общий: коротыш в 1-3
+        слова уходит почти встык (иначе серия «прикинь /// я ток щас узнала
+        /// а ты?» растягивалась на полминуты и читалась как медленный бот),
+        первому бабблу засчитывается уже прошедшее ожидание LLM, остальным —
+        обычный расчёт по WPM.
+        """
+        if is_short_bubble(chunk):
+            await asyncio.sleep(short_bubble_delay(self._humanizer_settings))
+            return
+        if is_first and llm_generation_time is not None:
+            delay = first_chunk_typing_delay(
+                chunk, self._humanizer_settings, llm_generation_time=llm_generation_time
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return
+        await simulate_typing_delay(chunk, self._humanizer_settings)
 
     def _maybe_schedule_self_correction(self, chat_id: int, sent_message: PyrogramMessage, correct_text: str) -> None:
         if random.random() >= self._humanizer_settings.typo_self_correct_probability:

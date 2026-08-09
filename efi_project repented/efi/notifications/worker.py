@@ -98,6 +98,7 @@ from efi.memory.social_memory import SocialInteraction, SocialInteractionKind, S
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.security.sanitize import sanitize_text
+from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.tools.base import ToolContext
 from efi.tools.registry import ToolRegistry
 
@@ -191,6 +192,7 @@ class Worker:
         telegram: TelegramNotifier | None = None,
         lifecycle: ConversationLifecycle | None = None,
         social_memory: SocialInteractionStore | None = None,
+        orchestrator: ChatOrchestrator | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -206,6 +208,7 @@ class Worker:
         self._telegram = telegram
         self._lifecycle = lifecycle
         self._social_memory = social_memory
+        self._orchestrator = orchestrator
 
     async def run(self) -> None:
         """
@@ -219,7 +222,7 @@ class Worker:
             while True:
                 notification = await self._manager.get(self._worker_index)
                 try:
-                    await self._handle(notification)
+                    await self._run_cancellable(notification)
                 except Exception:
                     logger.exception(
                         "worker[%d]: unhandled error while processing notification %s (%s)",
@@ -231,7 +234,55 @@ class Worker:
             logger.info("worker[%d]: stopped", self._worker_index)
             raise
 
+    async def _run_cancellable(self, notification: Notification) -> None:
+        """
+        Обработка одного уведомления как отменяемого таска.
+
+        Без оркестратора — обычный await, как было раньше. С ним обработка
+        живёт в отдельном asyncio.Task, который снимается, как только в этом
+        чате появляется новая реплика: пока Эфи думала или печатала серию
+        бабблов, разговор мог уйти вперёд, и договаривать ответ на устаревший
+        вопрос — ровно тот эффект «запоздалого бота», от которого уходим
+        (см. efi/telegram/chat_orchestrator.py).
+
+        Отмена ЭТОЙ генерации не должна выглядеть как ошибка и не должна
+        останавливать воркер: он просто берёт следующее уведомление, которое
+        уже содержит всю актуальную пачку.
+        """
+        if self._orchestrator is None:
+            await self._handle(notification)
+            return
+        await self._orchestrator.run(notification.chat_id, self._handle(notification))
+
     async def _handle(self, notification: Notification) -> None:
+        tool_context = ToolContext(notification=notification)
+        try:
+            await self._handle_inner(notification, tool_context)
+        except asyncio.CancelledError:
+            # Ход сняли как устаревший. Бабблы, которые собеседник УЖЕ
+            # прочитал, отозвать нельзя — значит, они обязаны попасть в
+            # историю: следующая генерация иначе соберёт контекст без них и
+            # повторит сказанное. sent_texts наполняется побаббльно именно
+            # ради этого случая (см. SendMessageTool).
+            await self._persist_partial_reply(notification, tool_context)
+            raise
+
+    async def _persist_partial_reply(self, notification: Notification, tool_context: ToolContext) -> None:
+        """Сохраняет в историю то, что успело уйти до отмены. Ошибка здесь не должна подменять саму отмену."""
+        sent_texts = tool_context.extra.get("sent_texts")
+        if not sent_texts or notification.chat_id is None:
+            return
+        try:
+            await self._history.append(
+                notification.chat_id, Message(role=Role.ASSISTANT, content="\n".join(sent_texts))
+            )
+        except Exception:
+            logger.warning(
+                "worker[%d]: failed to persist %d already-delivered bubbles after interruption",
+                self._worker_index, len(sent_texts), exc_info=True,
+            )
+
+    async def _handle_inner(self, notification: Notification, tool_context: ToolContext) -> None:
         if await self._should_disengage(notification):
             return
 
@@ -281,7 +332,6 @@ class Worker:
 
         system_prompt = await self._system_prompt_builder.build(notification, history)
 
-        tool_context = ToolContext(notification=notification)
         params = LLMParams(
             model="",  # роутер сам подставит модель кандидата по main_role — см. efi.llm.router.LLMRouter
             system_prompt=system_prompt,

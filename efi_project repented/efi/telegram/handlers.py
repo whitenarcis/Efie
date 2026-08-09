@@ -56,7 +56,8 @@ from efi.media.stt_groq import GroqSTT
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.security.access_control import ChatAccessInfo, is_chat_accessible
-from efi.telegram.debounce import MessageDebouncer
+from efi.telegram.buffer import InboundMessageBuffer
+from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.formatting import format_user_message
 from efi.telegram.media.image import describe_photo
 from efi.telegram.media.video import transcribe_video_note
@@ -118,6 +119,12 @@ class TelegramEventHandlers:
     `stt` — необязательный efi.media.stt_groq.GroqSTT: если задан, голосовые
     и видео-кружки транскрибируются им в первую очередь (см. `_transcribe_audio`),
     с откатом на LLMRouter, если Groq не настроен или вернул пустой результат.
+
+    `orchestrator` — efi.telegram.chat_orchestrator.ChatOrchestrator: если
+    задан, приход КАЖДОГО сообщения мгновенно снимает устаревшую генерацию
+    в этом чате (Эфи ещё думает над предыдущей репликой или печатает серию
+    бабблов — и то, и другое становится неактуальным). Прерывание идёт из
+    буфера, в момент приёма, до всякого ожидания: см. efi/telegram/buffer.py.
     """
 
     def __init__(
@@ -135,6 +142,7 @@ class TelegramEventHandlers:
         organic_ping_recorder: Any | None = None,
         people_recorder: Any | None = None,
         stt: GroqSTT | None = None,
+        orchestrator: ChatOrchestrator | None = None,
     ) -> None:
         self._manager = manager
         self._telegram_settings = telegram_settings
@@ -146,16 +154,16 @@ class TelegramEventHandlers:
         self._organic_ping_recorder = organic_ping_recorder
         self._people_recorder = people_recorder
         self._stt = stt
-        self._debouncer: MessageDebouncer[_PendingMessage] = MessageDebouncer(
+        self._buffer: InboundMessageBuffer[_PendingMessage] = InboundMessageBuffer(
             self._flush_debounced,
             typing_tracker=typing_tracker,
-            post_typing_delay_range=(
-                humanizer_settings.debounce_post_typing_min_seconds,
-                humanizer_settings.debounce_post_typing_max_seconds,
+            window_range=(
+                humanizer_settings.debounce_window_min_seconds,
+                humanizer_settings.debounce_window_max_seconds,
             ),
             typing_poll_interval_seconds=humanizer_settings.debounce_typing_poll_interval_seconds,
-            fallback_delay_seconds=humanizer_settings.debounce_fallback_delay_seconds,
             max_wait_seconds=humanizer_settings.debounce_max_wait_seconds,
+            on_interrupt=orchestrator.interrupt if orchestrator is not None else None,
         )
 
     def register(self, client: Client) -> None:
@@ -169,7 +177,7 @@ class TelegramEventHandlers:
 
     async def flush_pending(self) -> None:
         """Принудительно сбрасывает все накопленные в дебаунсере сообщения. Вызывается при graceful shutdown (efi/app.py)."""
-        await self._debouncer.flush_all()
+        await self._buffer.flush_all()
 
     async def _handle_text(self, client: Client, message: PyrogramMessage) -> None:
         access_info = await self._authorize(client, message)
@@ -376,7 +384,7 @@ class TelegramEventHandlers:
                 chat_title=message.chat.title if message.chat is not None else None,
             )
 
-        await self._debouncer.add(
+        await self._buffer.add(
             access_info.chat_id,
             _PendingMessage(message=message, text=text, payload=payload or {}),
         )
@@ -391,7 +399,15 @@ class TelegramEventHandlers:
         last_message = items[-1].message
         combined_text = "\n".join(item.text for item in items)
 
-        merged_payload: dict[str, Any] = {"telegram_message_ids": [item.message.id for item in items]}
+        # incoming_batch — «состояние экрана» для системного промпта: каждая
+        # реплика пачки со своим id, чтобы модель могла привязать баббл к
+        # конкретной строчке тегом [reply:id] (efi/humanizer/reply_selector.py).
+        # Без id в промпте эта разметка была бы невозможна физически: id
+        # входящих сообщений модели больше нигде не показываются.
+        merged_payload: dict[str, Any] = {
+            "telegram_message_ids": [item.message.id for item in items],
+            "incoming_batch": [{"id": item.message.id, "text": item.text} for item in items],
+        }
         for item in items:
             merged_payload.update(item.payload)
         merged_payload.update(_build_chat_context(last_message))
