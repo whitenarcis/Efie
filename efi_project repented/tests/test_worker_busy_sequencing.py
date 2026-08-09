@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from collections.abc import Callable, Collection
 
 import pytest
 
@@ -22,6 +23,7 @@ from efi.memory.social_memory import SocialInteraction, SocialInteractionKind
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.notifications.worker import _FAILURE_NOTICE_TEXT, Worker
+from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.tools.base import Tool, ToolContext
 from efi.tools.registry import ToolRegistry
 from efi.tools.telegram_actions.send_message import SendMessageTool
@@ -70,8 +72,14 @@ class _FakeTelegramNotifier:
         *,
         reply_to_message_id: int | None = None,
         llm_generation_time: float | None = None,
+        incoming_message_ids: Collection[int] = (),
+        on_bubble_sent: Callable[[str], None] | None = None,
     ) -> None:
         self._events.append("send_message")
+        # Реальный клиент подтверждает КАЖДЫЙ доставленный баббл — на этом
+        # держится и история диалога, и учёт уже сказанного при отмене хода.
+        if on_bubble_sent is not None:
+            on_bubble_sent(text)
 
     async def mark_as_read(self, chat_id: int) -> None:
         self._events.append("mark_as_read")
@@ -769,3 +777,101 @@ async def test_owner_conversation_is_not_recorded_as_external_experience() -> No
     await worker._handle(notification)
 
     assert social_memory.recorded == []
+
+
+# -- прерывание устаревшей генерации ------------------------------------------------
+#
+# Между приходом сообщения и последним бабблом проходят десятки секунд.
+# Раньше Эфи договаривала ответ на устаревший вопрос, даже если разговор уже
+# ушёл вперёд, — тот самый эффект «запоздалого бота» с отставанием на реплику.
+
+
+class _SlowSendingTool(Tool):
+    """Инструмент, который «печатает» серию бабблов и подтверждает каждый по отдельности."""
+
+    name = "send_telegram_message"
+    description = "test"
+    parameters = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+
+    def __init__(self, bubbles: list[str], *, per_bubble_delay: float = 0.05) -> None:
+        self._bubbles = bubbles
+        self._per_bubble_delay = per_bubble_delay
+
+    async def execute(self, arguments: dict, context: ToolContext) -> str:
+        delivered = context.extra.setdefault("sent_texts", [])
+        for bubble in self._bubbles:
+            await asyncio.sleep(self._per_bubble_delay)
+            delivered.append(bubble)
+        return "Message sent successfully."
+
+
+def _worker_with_tool(tool: Tool, events: list[str]) -> tuple[Worker, _FakeHistoryRepository, ChatOrchestrator]:
+    registry = ToolRegistry()
+    registry.register(tool)
+    history = _FakeHistoryRepository()
+    orchestrator = ChatOrchestrator()
+
+    class _ToolCallingRouter(_FakeLLMRouter):
+        async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
+            await asyncio.sleep(0.01)
+            call = ToolCall(id="1", function=ToolCallFunction(name=tool.name, arguments="{}"))
+            return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content="", tool_calls=[call]))])
+
+    worker = Worker(
+        0,
+        NotificationManager(worker_count=1),
+        llm_router=_ToolCallingRouter(events),  # type: ignore[arg-type]
+        tool_registry=registry,
+        history=history,
+        system_prompt_builder=_FakeSystemPromptBuilder(events),
+        busy_engine=_FakeBusyEngine(0.0),  # type: ignore[arg-type]
+        telegram=_FakeTelegramNotifier(events),  # type: ignore[arg-type]
+        orchestrator=orchestrator,
+    )
+    return worker, history, orchestrator
+
+
+async def test_interrupting_a_turn_persists_only_what_was_already_delivered() -> None:
+    """
+    Доставленные бабблы отозвать нельзя — собеседник их прочитал. Значит, они
+    обязаны попасть в историю: иначе следующая генерация соберёт контекст без
+    них и повторит сказанное. Раньше история при отмене не получала ничего.
+    """
+    events: list[str] = []
+    worker, history, orchestrator = _worker_with_tool(_SlowSendingTool(["раз", "два", "три"]), events)
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    runner = asyncio.create_task(worker._run_cancellable(notification))
+    await asyncio.sleep(0.09)  # успели уйти примерно первые бабблы, серия ещё идёт
+    await orchestrator.interrupt(42)
+    await runner
+
+    persisted = [message.content for _chat_id, message in history.appended if message.role is Role.ASSISTANT]
+    assert len(persisted) == 1
+    delivered = persisted[0].split("\n")
+    assert delivered == ["раз", "два", "три"][: len(delivered)], "в историю попало ровно доставленное, по порядку"
+    assert len(delivered) < 3, "серию прервали — последний баббл уйти не успел"
+
+
+async def test_interruption_does_not_stop_the_worker() -> None:
+    """Отмена одной генерации — штатное событие, а не сбой: воркер обязан взять следующее уведомление."""
+    events: list[str] = []
+    worker, _history, orchestrator = _worker_with_tool(_SlowSendingTool(["раз", "два"], per_bubble_delay=0.1), events)
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    runner = asyncio.create_task(worker._run_cancellable(notification))
+    await asyncio.sleep(0.05)
+    await orchestrator.interrupt(42)
+
+    await runner  # не должно бросить CancelledError наружу
+
+
+async def test_uninterrupted_turn_persists_the_full_reply_once() -> None:
+    events: list[str] = []
+    worker, history, _orchestrator = _worker_with_tool(_SlowSendingTool(["раз", "два"], per_bubble_delay=0.0), events)
+    notification = Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="привет")
+
+    await worker._run_cancellable(notification)
+
+    persisted = [message.content for _chat_id, message in history.appended if message.role is Role.ASSISTANT]
+    assert persisted == ["раз\nдва"]

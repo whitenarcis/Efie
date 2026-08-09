@@ -33,6 +33,11 @@ _PARAGRAPH_DELIMITER_RE = re.compile(r"\n\s*\n")
 #: телеграм-реплики.
 _DEFAULT_LONG_MESSAGE_THRESHOLD = 280
 
+#: Сколько слов считается «коротышом» — бабблом, который человек с телефона
+#: не набирает, а выстреливает («прикинь», «я ток щас узнала», «а ты?»).
+#: Такие идут почти встык, а не через полноценную паузу по WPM.
+_SHORT_BUBBLE_MAX_WORDS = 3
+
 
 def split_into_messages(
     text: str,
@@ -52,10 +57,20 @@ def split_into_messages(
            длинным ответам, чтобы короткие реплики не резались зря.
         3. Иначе — одно сообщение как есть.
 
-    Результат всегда обрезан до `settings.max_messages_per_burst` элементов
-    (защита от чрезмерного спама, даже если модель расставила разделители
-    слишком щедро) — "лишние" куски склеиваются в последнее сообщение, текст
-    не отбрасывается.
+    `settings.max_messages_per_burst` — не «нормальная длина ответа», а
+    аварийный потолок. Раньше он стоял на 5 и работал как настоящий лимит:
+    «поток мыслей» из 8 коротких реплик («прикинь /// фрустрация, это когда
+    тип не может достичь цели /// я ток щас узнала /// а ты?») схлопывался в
+    5 сообщений, где последнее было слипшимся комом из всего остатка. Живой
+    человек, который делится находкой или эмоционирует, спокойно шлёт
+    подряд 5-10 коротких реплик, поэтому потолок поднят и должен срабатывать
+    только на явно неадекватной разметке. «Лишние» куски по-прежнему
+    склеиваются в последнее сообщение, а не отбрасываются.
+
+    Сколько бабблов уместно в конкретном ответе — решает модель (правила в
+    системном промпте: бытовая переписка — 1-2 сообщения, рассказ или
+    эмоция — свободная серия), а не эта функция: здесь нет контекста, чтобы
+    отличить «ага» от рассказа с форума.
     """
     stripped = text.strip()
     if not stripped:
@@ -83,6 +98,28 @@ def _cap_message_count(parts: list[str], max_count: int) -> list[str]:
     return [*head, tail]
 
 
+def is_short_bubble(text: str, *, max_words: int = _SHORT_BUBBLE_MAX_WORDS) -> bool:
+    """Баббл в 1-3 слова — реплика, которую выстреливают, а не набирают."""
+    return 0 < len(text.split()) <= max_words
+
+
+def short_bubble_delay(settings: HumanizerSettings) -> float:
+    """
+    Задержка перед коротышом — доли секунды вместо полноценной паузы по WPM.
+
+    Без этого серия из коротких реплик шла в том же темпе, что и абзац
+    текста: `calculate_typing_delay` прибавляет паузу «на подумать» (1-2.2с)
+    и зажимает результат снизу `typing_delay_min_seconds` (1.8с), так что
+    «а ты?» уходило через две секунды после предыдущего баббла. Серия из
+    шести таких растягивалась на четверть минуты и читалась как медленный
+    бот, а не как быстрая печать с телефона.
+    """
+    return random.uniform(
+        settings.short_bubble_delay_min_seconds,
+        settings.short_bubble_delay_max_seconds,
+    )
+
+
 def first_chunk_typing_delay(chunk: str, settings: HumanizerSettings, *, llm_generation_time: float) -> float:
     """
     Идеальное время печати первого куска (`target_delay = len(chunk) / chars_per_sec`,
@@ -100,4 +137,4 @@ def first_chunk_typing_delay(chunk: str, settings: HumanizerSettings, *, llm_gen
     return max(target_delay - llm_generation_time, 0.0)
 
 
-__all__ = ["split_into_messages", "first_chunk_typing_delay"]
+__all__ = ["first_chunk_typing_delay", "is_short_bubble", "short_bubble_delay", "split_into_messages"]

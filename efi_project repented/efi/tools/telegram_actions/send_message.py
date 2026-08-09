@@ -42,6 +42,7 @@ Worker._handle.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Collection
 from typing import Any, Protocol
 
 from efi.humanizer.anti_repeat import AntiRepeatTracker
@@ -61,6 +62,8 @@ class MessageSender(Protocol):
         *,
         reply_to_message_id: int | None = None,
         llm_generation_time: float | None = None,
+        incoming_message_ids: Collection[int] = (),
+        on_bubble_sent: Callable[[str], None] | None = None,
     ) -> None: ...
 
 
@@ -130,12 +133,21 @@ class SendMessageTool(Tool):
 
         reply_to_message_id = self._resolve_reply_target(arguments, context)
         llm_generation_time = context.extra.get("llm_generation_time")
+        # sent_texts наполняется ПОБАББЛЬНО, а не одной строкой после успеха
+        # всей серии. Ход может быть снят как устаревший посреди отправки
+        # (efi/telegram/chat_orchestrator.py), и тогда история обязана знать
+        # ровно то, что собеседник успел прочитать: раньше при отмене на
+        # середине она не получала ничего, хотя половина ответа уже висела
+        # в чате, и следующая генерация повторяла сказанное.
+        delivered: list[str] = context.extra.setdefault("sent_texts", [])
         try:
             await self._sender.send_message(
                 context.chat_id,
                 text,
                 reply_to_message_id=reply_to_message_id,
                 llm_generation_time=llm_generation_time,
+                incoming_message_ids=self._incoming_message_ids(context),
+                on_bubble_sent=delivered.append,
             )
         except UnknownChatError:
             # Штатная ситуация, а не сбой: этот аккаунт не видит такой чат
@@ -149,7 +161,6 @@ class SendMessageTool(Tool):
             self._anti_repeat.record(context.chat_id, text)
         if self._activity_recorder is not None:
             self._activity_recorder.record_activity(context.chat_id)
-        context.extra.setdefault("sent_texts", []).append(text)
 
         logger.info("send_message: sent %d chars to chat_id=%s", len(text), context.chat_id)
         return "Message sent successfully. Warning: you have sent a message. Consider not spamming with repeated calls."
@@ -166,10 +177,20 @@ class SendMessageTool(Tool):
         """
         if not bool(arguments.get("reply_to_current", False)):
             return None
-        message_ids = context.notification.payload.get("telegram_message_ids")
-        if not message_ids:
-            return None
-        return int(message_ids[-1])
+        message_ids = self._incoming_message_ids(context)
+        return message_ids[-1] if message_ids else None
+
+    @staticmethod
+    def _incoming_message_ids(context: ToolContext) -> list[int]:
+        """
+        id сообщений текущей входящей пачки — область допустимых целей для
+        reply. Модель может привязать баббл к КОНКРЕТНОЙ реплике из пачки
+        тегом `[reply:id]` (см. efi/humanizer/reply_selector.py); всё, чего
+        в этом списке нет, снимается как выдумка — id старых сообщений ей
+        нигде не показываются, сослаться на них она не может.
+        """
+        raw = context.notification.payload.get("telegram_message_ids") or []
+        return [int(item) for item in raw]
 
 
 __all__ = ["MessageSender", "ActivityRecorder", "SendMessageTool"]

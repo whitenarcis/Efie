@@ -55,6 +55,7 @@ from efi.notifications.manager import NotificationManager
 from efi.notifications.worker import Worker
 from efi.prompts.builder import EfiSystemPromptBuilder
 from efi.prompts.loader import PromptLoader
+from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.client import TelegramClientWrapper
 from efi.telegram.comments import (
     ChannelPostWatcher,
@@ -249,6 +250,10 @@ class EfiApp:
             workdir=str(settings.paths.session_path.parent),
         )
         self._telegram_client = TelegramClientWrapper(self._pyrogram_client, settings.humanizer)
+        # Оркестратор конструируется ДО обработчиков и воркеров: первым он
+        # нужен буферу входящих (снять устаревшую генерацию в момент приёма
+        # сообщения), вторым — чтобы обработка шла отменяемым таском.
+        self._orchestrator = ChatOrchestrator()
         self._typing_tracker = TypingTracker(ttl_seconds=settings.humanizer.debounce_typing_ttl_seconds)
         # -- участие в сообществе (комментарии/треды) ------------------------
         self._thread_state = ThreadStateStore(self._database)
@@ -284,6 +289,7 @@ class EfiApp:
             organic_ping_recorder=self._organic_ping,
             people_recorder=self._people,
             stt=self._stt,
+            orchestrator=self._orchestrator,
         )
 
         # -- реестр инструментов -------------------------------------------------
@@ -368,6 +374,7 @@ class EfiApp:
                 history_limit=self._settings.memory.history_limit,
                 lifecycle=self._lifecycle,
                 social_memory=self._social_memory,
+                orchestrator=self._orchestrator,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 
@@ -495,6 +502,9 @@ class EfiApp:
         # Запланированные, но ещё не сработавшие комментарии — снимаем:
         # они спят минутами, и без отмены shutdown ждал бы их впустую.
         await self._channel_post_watcher.cancel_pending()
+        # Активные генерации: недоговорённая серия бабблов не должна держать
+        # остановку на своих паузах между сообщениями.
+        await self._orchestrator.cancel_all()
 
         for task in self._background_tasks:
             task.cancel()

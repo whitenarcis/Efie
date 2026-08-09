@@ -405,17 +405,42 @@ class HumanizerSettings(BaseModel):
     anti_repeat_max_history: int = Field(default=32, ge=1, description="Глубина истории для проверки на повторы")
 
     # --- Разбивка ответа на несколько сообщений ---
-    max_messages_per_burst: int = Field(default=5, ge=1, description="Максимум сообщений в одной серии (///-разрывы)")
-
-    # --- Anti-interrupt: группировка быстрых сообщений собеседника, ориентируясь
-    # на живой статус "печатает" (efi/telegram/typing_tracker.py + debounce.py) ---
-    debounce_post_typing_min_seconds: float = Field(
-        default=0.1, ge=0.0,
-        description="Минимальная пауза после того, как собеседник перестал печатать, перед реакцией",
+    max_messages_per_burst: int = Field(
+        default=12, ge=1,
+        description=(
+            "АВАРИЙНЫЙ потолок сообщений в серии, а не нормальная длина ответа. Раньше стоял на 5 и "
+            "работал как настоящий лимит: «поток мыслей» из 8 коротких реплик схлопывался в 5, где "
+            "последнее было слипшимся комом из остатка. Сколько бабблов уместно, решает модель по "
+            "правилам системного промпта; здесь — только защита от явно неадекватной разметки."
+        ),
     )
-    debounce_post_typing_max_seconds: float = Field(
-        default=1.0, gt=0.0,
-        description="Максимальная пауза после того, как собеседник перестал печатать, перед реакцией",
+    short_bubble_delay_min_seconds: float = Field(
+        default=0.3, ge=0.0,
+        description=(
+            "Нижняя граница паузы перед коротышом (1-3 слова). Обычный расчёт по WPM прибавляет паузу "
+            "«на подумать» и зажат снизу typing_delay_min_seconds, из-за чего «а ты?» уходило через "
+            "две секунды, а серия коротких реплик растягивалась на полминуты."
+        ),
+    )
+    short_bubble_delay_max_seconds: float = Field(
+        default=0.8, gt=0.0, description="Верхняя граница той же паузы — серия должна читаться как быстрая печать"
+    )
+
+    # --- Сборка быстрых сообщений собеседника в одну пачку: плавающее окно
+    # плюс живой статус "печатает" (efi/telegram/buffer.py + typing_tracker.py) ---
+    debounce_window_min_seconds: float = Field(
+        default=1.5, ge=0.0,
+        description=(
+            "Нижняя граница плавающего окна сборки. Каждое новое сообщение сдвигает окно вперёд, "
+            "поэтому пачка коротких реплик подряд («найду романтику» / «и пох» / «пошел есть») уходит "
+            "в LLM одним входом. Раньше окна не было вовсе: буфер держался ровно столько, сколько "
+            "горел статус «печатает», а между двумя короткими репликами он успевает погаснуть — и "
+            "Эфи запускала генерацию на первую строчку."
+        ),
+    )
+    debounce_window_max_seconds: float = Field(
+        default=2.5, gt=0.0,
+        description="Верхняя граница того же окна — дольше человек не готов ждать реакции на одиночное сообщение",
     )
     debounce_typing_poll_interval_seconds: float = Field(
         default=0.3, gt=0.0,
@@ -424,10 +449,6 @@ class HumanizerSettings(BaseModel):
     debounce_typing_ttl_seconds: float = Field(
         default=6.0, gt=0.0,
         description="Сколько секунд без нового сигнала считать статус 'печатает' ещё актуальным (Telegram обновляет его каждые ~5-6с)",
-    )
-    debounce_fallback_delay_seconds: float = Field(
-        default=2.0, ge=0.0,
-        description="Обычный таймер тишины, если статус 'печатает' вообще не отслеживается (TypingTracker не сработал ни разу для чата)",
     )
     debounce_max_wait_seconds: float = Field(
         default=15.0, gt=0.0,
@@ -442,8 +463,10 @@ class HumanizerSettings(BaseModel):
             raise ValueError("typing_thinking_pause_min_seconds не может быть больше *_max_seconds")
         if self.typing_delay_min_seconds > self.typing_delay_max_seconds:
             raise ValueError("typing_delay_min_seconds не может быть больше typing_delay_max_seconds")
-        if self.debounce_post_typing_min_seconds > self.debounce_post_typing_max_seconds:
-            raise ValueError("debounce_post_typing_min_seconds не может быть больше debounce_post_typing_max_seconds")
+        if self.debounce_window_min_seconds > self.debounce_window_max_seconds:
+            raise ValueError("debounce_window_min_seconds не может быть больше debounce_window_max_seconds")
+        if self.short_bubble_delay_min_seconds > self.short_bubble_delay_max_seconds:
+            raise ValueError("short_bubble_delay_min_seconds не может быть больше short_bubble_delay_max_seconds")
         return self
 
     def characters_per_second_range(self) -> tuple[float, float]:
