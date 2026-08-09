@@ -127,12 +127,20 @@ class BackgroundResearcher:
         if topic is None:
             return
 
-        search_text = await self._web_search.execute({"query": topic}, _make_research_context(topic))
-        if search_text.startswith("error:") or "ничего не нашлось" in search_text:
-            logger.info("researcher: search for %r yielded nothing useful, skipping", topic)
+        # search(), а не execute(): нужен разбор причины, а не текст для
+        # модели. Раньше здесь разбирался именно текст ответа («error:» или
+        # «ничего не нашлось» подстрокой), и в лог уходило одинаковое
+        # «yielded nothing useful» и на сломанный поиск, и на пустую выдачу —
+        # то есть по логу нельзя было понять, что происходит.
+        outcome = await self._web_search.search(topic, journal_context=_make_research_context(topic))
+        if outcome.failed:
+            logger.warning("researcher: search for %r failed (%s), skipping", topic, outcome.error)
+            return
+        if not outcome.results:
+            logger.info("researcher: search for %r returned no results, skipping", topic)
             return
 
-        hypothesis = await self._formulate_hypothesis(topic, search_text)
+        hypothesis = await self._formulate_hypothesis(topic, outcome.render())
         if hypothesis is None:
             return
 

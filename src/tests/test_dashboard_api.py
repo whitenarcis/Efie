@@ -28,7 +28,7 @@ from efi.config.schema import (
 )
 from efi.dashboard.logbus import LogBuffer
 from efi.dashboard.metrics import LLMMetricsCollector
-from efi.dashboard.server import DashboardServer
+from efi.dashboard.server import DashboardServer, _primary_lan_address
 from efi.dashboard.snapshot import DashboardContext
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
@@ -301,6 +301,37 @@ async def test_token_gate(tmp_path: Path) -> None:
         # так работает EventSource, который своих заголовков не умеет.
         async with started.client(cookies={"efi_dashboard_token": "s3cret-token"}) as client:
             assert (await client.get("/api/overview")).status_code == 200
+    finally:
+        await started.server.stop()
+
+
+async def test_listens_on_every_interface_so_other_devices_can_connect(tmp_path: Path) -> None:
+    """
+    Смысл дашборда — смотреть на Эфи, которая крутится в Termux на телефоне,
+    с другого устройства. Значит, он обязан отвечать не только на 127.0.0.1,
+    но и по адресу машины в сети, и сам этот адрес — подсказать в логе.
+    """
+    started = await _harness(tmp_path)
+    address = _primary_lan_address()
+    if address is None:  # pragma: no cover — машина без сетевого интерфейса
+        pytest.skip("у машины нет адреса в локальной сети")
+
+    try:
+        assert started.server.lan_url is not None
+        assert address in started.server.lan_url
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"http://{address}:{started.server._http.port}/api/overview")
+        assert response.status_code == 200
+    finally:
+        await started.server.stop()
+
+
+async def test_loopback_host_has_no_lan_url(tmp_path: Path) -> None:
+    """Если владелец сузил доступ до одной машины, подсказывать сетевой адрес нечестно — его нет."""
+    started = await _harness(tmp_path, host="127.0.0.1")
+    try:
+        assert started.server.lan_url is None
     finally:
         await started.server.stop()
 

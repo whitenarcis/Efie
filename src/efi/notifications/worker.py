@@ -389,7 +389,21 @@ class Worker:
                 await self._notify_failure(notification)
             raise  # даём run() залогировать полный трейсбек, как и раньше
 
-        if notification.chat_id is not None:
+        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not tool_context.extra.get("sent_texts"):
+            # Инициативный пинг, на котором модель ничего не отправила.
+            # Запасной текст здесь подставлять нельзя (в отличие от
+            # USER_MESSAGE): никто ничего не спрашивал, и «уф, у меня
+            # заглючило» из ниоткуда выглядит хуже молчания. Но и тихо
+            # ронять нельзя — иначе это опять неотличимо от «не работает».
+            # В историю тоже ничего не пишем: до собеседника не долетело
+            # ничего, а сохранённая реплика заставила бы Эфи в следующий раз
+            # считать, что она это сказала, и продолжать с несуществующего места.
+            logger.warning(
+                "worker[%d]: proactive %s for chat_id=%s finished without sending anything "
+                "(модель не вызвала send_telegram_message)",
+                self._worker_index, notification.type.value, notification.chat_id,
+            )
+        elif notification.chat_id is not None:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
 
         await self._record_social_interaction(notification, tool_context)
@@ -461,9 +475,16 @@ class Worker:
         sender_id = notification.payload.get("sender_id")
         sender_id = sender_id if isinstance(sender_id, int) else None
 
-        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not self._lifecycle.allows_proactive_ping(sender_id):
-            logger.debug(
-                "worker[%d]: skipping proactive %s for a non-primary user", self._worker_index, notification.type.value
+        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not self._lifecycle.allows_proactive_ping_to_chat(
+            notification.chat_id, sender_id
+        ):
+            # INFO, а не DEBUG: это единственный след того, что инициативный
+            # пинг был отброшен. Пока он был отладочным, «Эфи не пишет первой»
+            # выглядело как отсутствие функции, а не как решение кода.
+            logger.info(
+                "worker[%d]: skipping proactive %s for chat_id=%s — "
+                "чат не в telegram.allowed_chats и это не личка владельца",
+                self._worker_index, notification.type.value, notification.chat_id,
             )
             return True
 

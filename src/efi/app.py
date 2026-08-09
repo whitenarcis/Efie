@@ -172,7 +172,13 @@ class EfiApp:
         # векторную память через RAG, поэтому конструируется ПОСЛЕ _rag.
         self._social_memory = SocialInteractionStore(self._database, rag=self._rag)
         # Жизненный цикл диалога с посторонними (владелец vs остальные).
-        self._lifecycle = ConversationLifecycle(self._database, owner_id=settings.telegram.owner_id)
+        self._lifecycle = ConversationLifecycle(
+            self._database,
+            owner_id=settings.telegram.owner_id,
+            # Куда вообще разрешено писать первой — тот же список, которым
+            # владелец задаёт «свои» чаты. Личка владельца добавляется внутри.
+            proactive_chats=settings.telegram.allowed_chats,
+        )
         # Пульс памяти — превращает прожитое в воспоминания по ходу дня, а не
         # раз в сутки ночью. Зависит и от консолидатора, и от журнала внешнего
         # опыта (тот подмешивается в разбор эпизода), поэтому конструируется

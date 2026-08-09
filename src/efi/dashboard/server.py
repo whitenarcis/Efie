@@ -5,21 +5,21 @@ efi/dashboard/server.py
 доступ по токену. Владелец жизненного цикла — `efi.app.EfiApp`, поэтому
 интерфейс здесь такой же, как у остальных подсистем: `start()`/`stop()`.
 
-Про доступ. Дашборд показывает дневник, историю переписки и профили людей —
-то есть ровно то, что в README помечено как «не коммитить и шифровать
-диск». Поэтому по умолчанию он слушает только петлевой интерфейс, а
-`DashboardSettings` не даёт выставить его наружу без токена (проверка на
-уровне схемы конфигурации, чтобы это нельзя было сделать случайно). Токен
-принимается заголовком, cookie или query-параметром — последнее нужно,
-чтобы открыть дашборд с телефона по ссылке и остаться авторизованным:
-cookie ставится сразу, и SSE-поток (EventSource не умеет свои заголовки)
-дальше работает сам.
+Про доступ. По умолчанию дашборд слушает все интерфейсы — иначе основной
+сценарий (Эфи в Termux на телефоне, дашборд смотрят с ноутбука) не работает
+вовсе. Токен при этом не обязателен в домашней сети и обязателен, если
+`host` — публично маршрутизируемый адрес (проверка в `DashboardSettings`).
+Токен принимается заголовком, cookie или query-параметром — последнее нужно,
+чтобы открыть дашборд по ссылке с другого устройства и остаться
+авторизованным: cookie ставится сразу, и SSE-поток (EventSource не умеет
+свои заголовки) дальше работает сам.
 """
 
 from __future__ import annotations
 
 import hmac
 import logging
+import socket
 from pathlib import Path
 
 import aiofiles
@@ -98,15 +98,39 @@ class DashboardServer:
 
     @property
     def url(self) -> str:
+        """Адрес для самой машины, где запущена Эфи."""
         host = self._settings.host
-        display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host  # noqa: S104 — не bind, а показ ссылки
+        display_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host  # noqa: S104 — не bind, а показ ссылки
         return f"http://{display_host}:{self._http.port}/"
+
+    @property
+    def lan_url(self) -> str | None:
+        """
+        Адрес для ОСТАЛЬНЫХ устройств сети — то, что realistically и нужно
+        открыть: Эфи крутится в Termux на телефоне, а смотрят на неё с
+        ноутбука. Без этой строки в логе пользователю пришлось бы отдельно
+        выяснять адрес телефона в сети.
+        """
+        if self._settings.is_local_only:
+            return None
+        address = _primary_lan_address()
+        if address is None:
+            return None
+        suffix = f"?token={self._settings.token.get_secret_value()}" if self._settings.token is not None else ""
+        return f"http://{address}:{self._http.port}/{suffix}"
 
     async def start(self) -> None:
         await self._http.start()
         logger.info("dashboard: listening on %s (%s)", self._http.sockets_description, self.url)
-        if self._settings.token is None:
-            logger.info("dashboard: доступ без токена — слушает только %s", self._settings.host)
+
+        lan_url = self.lan_url
+        if lan_url is not None:
+            logger.info("dashboard: с других устройств этой сети — %s", lan_url)
+        if self._settings.token is None and not self._settings.is_local_only:
+            logger.warning(
+                "dashboard: токен не задан — дашборд открыт любому устройству вашей сети. "
+                "Если сеть не только ваша, задайте EFI_DASHBOARD__TOKEN"
+            )
 
     async def stop(self) -> None:
         await self._http.stop()
@@ -218,6 +242,30 @@ class DashboardServer:
             body=content,
             content_type=_CONTENT_TYPES.get(path.suffix, "application/octet-stream"),
         )
+
+
+def _primary_lan_address() -> str | None:
+    """
+    Адрес этой машины в локальной сети.
+
+    Через UDP-сокет, а не через `socket.gethostbyname(gethostname())`:
+    последний на Android/Termux и на большинстве Linux-систем отдаёт
+    127.0.0.1 и толку от него нет. UDP-`connect` пакетов не отправляет — он
+    только заставляет ядро выбрать исходящий интерфейс, чей адрес нам и
+    нужен; адрес назначения при этом недостижим и не важен.
+    """
+    for probe in ("192.168.255.255", "10.255.255.255", "8.8.8.8"):
+        probe_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe_socket.connect((probe, 9))
+            address = str(probe_socket.getsockname()[0])
+        except OSError:
+            continue
+        finally:
+            probe_socket.close()
+        if address and not address.startswith("127."):
+            return address
+    return None
 
 
 __all__ = ["DashboardServer"]
