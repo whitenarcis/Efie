@@ -22,20 +22,46 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Callable, Collection
 from pathlib import Path
 
 from pyrogram import Client
 from pyrogram.enums import ChatAction
+from pyrogram.errors import RPCError
 from pyrogram.types import Message as PyrogramMessage
 
 from efi.config.schema import HumanizerSettings
-from efi.humanizer.message_splitting import split_into_messages
+from efi.humanizer.message_splitting import (
+    first_chunk_typing_delay,
+    is_short_bubble,
+    short_bubble_delay,
+    split_into_messages,
+)
+from efi.humanizer.reply_selector import parse_reply_tags
 from efi.humanizer.typing_simulation import simulate_typing_delay
 from efi.humanizer.typos import inject_typo
+from efi.telegram.queue import BubbleQueue, OutboundBubble
 
 logger = logging.getLogger(__name__)
 
 _SELF_CORRECT_DELAY_RANGE = (0.8, 2.5)
+
+
+class UnknownChatError(RuntimeError):
+    """
+    Чат недоступен этому аккаунту: Pyrogram не смог резолвить peer даже
+    после прогрева через get_chat (см. TelegramClientWrapper.ensure_peer_known).
+
+    Отдельный доменный тип, а не сырой KeyError/PeerIdInvalid из недр
+    Pyrogram: efi.tools.registry.ToolRegistry логирует любое исключение
+    инструмента полным трейсбеком как ERROR, из-за чего штатная ситуация
+    "этот чат нам недоступен" выглядела в логах как краш. По этому типу
+    вызывающая сторона может отличить её от настоящей ошибки.
+    """
+
+    def __init__(self, chat_id: int) -> None:
+        super().__init__(f"chat_id={chat_id} is unknown or unreachable for this account")
+        self.chat_id = chat_id
 
 
 class TelegramClientWrapper:
@@ -61,15 +87,63 @@ class TelegramClientWrapper:
         await self._client.start()
         logger.info("telegram: client started")
 
+    async def ensure_peer_known(self, chat_id: int) -> bool:
+        """
+        Гарантирует, что Pyrogram умеет резолвить `chat_id` в peer, и
+        возвращает, удалось ли это.
+
+        Зачем: Pyrogram резолвит chat_id через СВОЙ локальный storage сессии.
+        Для чата, который этот аккаунт ещё не "видел" в текущей сессии,
+        resolve_peer падает `KeyError: 'ID not found: ...'` (или
+        PeerIdInvalid) — а поскольку это происходит внутри send_message,
+        наружу летел сырой трейсбек через tool_registry ("tool
+        send_telegram_message raised during execute()"). Один вызов
+        get_chat() прогревает кэш пиров и снимает проблему на все
+        последующие обращения к этому чату.
+
+        Ошибку НЕ пробрасывает: недоступный чат (бота выкинули из группы,
+        чат удалён) — штатная ситуация, вызывающая сторона по False сама
+        решит, что делать, вместо разбора исключений Pyrogram.
+        """
+        try:
+            await self._client.resolve_peer(chat_id)
+            return True
+        except (KeyError, ValueError, RPCError):
+            logger.debug("telegram: peer for chat_id=%s is not cached yet, warming it up via get_chat", chat_id)
+
+        try:
+            await self._client.get_chat(chat_id)
+        except (KeyError, ValueError, RPCError) as exc:
+            logger.warning("telegram: chat_id=%s is not reachable for this account (%s)", chat_id, exc)
+            return False
+        return True
+
     async def stop(self) -> None:
         await self._client.stop()
         logger.info("telegram: client stopped")
 
-    async def send_message(self, chat_id: int, text: str, *, reply_to_message_id: int | None = None) -> None:
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        llm_generation_time: float | None = None,
+        incoming_message_ids: Collection[int] = (),
+        on_bubble_sent: Callable[[str], None] | None = None,
+    ) -> None:
         """
         Отправляет текст, предварительно разбив его на цепочку сообщений
         (efi.humanizer.message_splitting) — каждое со своим typing-индикатором,
         задержкой по WPM и редкой опечаткой, отправляются последовательно.
+
+        `llm_generation_time` (если передан — см. efi.tools.telegram_actions.
+        send_message.SendMessageTool) засчитывается как время печати ПЕРВОГО
+        куска цепочки (efi.humanizer.message_splitting.first_chunk_typing_delay):
+        Worker уже транслировал TYPING, пока ждал ответ LLM, так что не имеет
+        смысла ждать ЕЩЁ раз с нуля — только оставшуюся разницу, если она
+        вообще есть. Для всех последующих кусков ("///"-разбивка) действует
+        обычный calculate_typing_delay.
 
         Если в конкретном куске случилась опечатка (inject_typo реально
         изменил текст), с вероятностью `typo_self_correct_probability`
@@ -78,9 +152,20 @@ class TelegramClientWrapper:
         поправляет", которого не хватало — раньше опечатки никогда не
         исправлялись, что не похоже на реального человека.
 
-        `reply_to_message_id` (если задан) применяется ТОЛЬКО к первому куску
-        серии — явный Reply-статус имеет смысл один раз, на весь блок реплик,
-        а не на каждый отдельный кусок ("///"-разбивку) по отдельности.
+        Привязка бабблов к конкретным входящим репликам разбирается из тегов
+        `[reply:id]`, которые модель ставит в начале баббла (см.
+        efi/humanizer/reply_selector.py); `incoming_message_ids` — id
+        сообщений текущей входящей пачки, всё остальное считается выдумкой
+        модели и снимается. `reply_to_message_id` остаётся как явное
+        указание «весь ответ — реплай сюда» и применяется к первому бабблу,
+        если своего тега у него нет.
+
+        `on_bubble_sent` вызывается ПОСЛЕ каждого реально доставленного
+        баббла. Это важно именно при отмене хода: серия растянута во времени,
+        и если ход снимут на середине (efi/telegram/chat_orchestrator.py),
+        вызывающая сторона должна знать, что именно собеседник уже прочитал —
+        иначе следующая генерация соберёт контекст без этих реплик и
+        повторит их.
 
         Примечание: параметр Pyrogram называется `reply_to_message_id` в
         классическом MTProto API — в некоторых свежих версиях Pyrogram/Pyrofork
@@ -93,8 +178,37 @@ class TelegramClientWrapper:
             logger.debug("telegram: send_message called with empty text for chat_id=%s, nothing to send", chat_id)
             return
 
-        for index, chunk in enumerate(chunks):
-            humanized_chunk = inject_typo(chunk, self._humanizer_settings)
+        bubbles = parse_reply_tags(chunks, incoming_message_ids=incoming_message_ids)
+        if bubbles and reply_to_message_id is not None and bubbles[0].reply_to_message_id is None:
+            bubbles[0] = OutboundBubble(bubbles[0].text, reply_to_message_id)
+        queue = BubbleQueue(bubbles)
+
+        # Прогреваем peer ДО симуляции печати: иначе весь typing/WPM-цикл
+        # отрабатывал бы впустую, а падение случалось бы уже на самой
+        # отправке — сырым KeyError наружу через ToolRegistry.
+        if not await self.ensure_peer_known(chat_id):
+            raise UnknownChatError(chat_id)
+
+        try:
+            await self._drain_bubbles(chat_id, queue, llm_generation_time, on_bubble_sent)
+        except asyncio.CancelledError:
+            # Ход сняли как устаревший. Доставленное уже у собеседника и
+            # учтено через on_bubble_sent; остаток молча не уходит — именно
+            # это и значит "не договаривать ответ на неактуальную реплику".
+            queue.log_interruption(chat_id)
+            raise
+
+    async def _drain_bubbles(
+        self,
+        chat_id: int,
+        queue: BubbleQueue,
+        llm_generation_time: float | None,
+        on_bubble_sent: Callable[[str], None] | None,
+    ) -> None:
+        """Последовательная отправка серии: typing -> пауза -> сообщение, с подтверждением каждого баббла в очереди."""
+        while (bubble := queue.next_bubble()) is not None:
+            humanized_chunk = inject_typo(bubble.text, self._humanizer_settings)
+            is_first = queue.is_first
 
             try:
                 await self._client.send_chat_action(chat_id, ChatAction.TYPING)
@@ -104,13 +218,39 @@ class TelegramClientWrapper:
                 # сообщение всё равно должно уйти.
                 logger.debug("telegram: failed to send typing action to chat_id=%s", chat_id, exc_info=True)
 
-            await simulate_typing_delay(humanized_chunk, self._humanizer_settings)
+            await self._pause_before(humanized_chunk, is_first=is_first, llm_generation_time=llm_generation_time)
 
-            reply_id = reply_to_message_id if index == 0 else None
-            sent_message = await self._client.send_message(chat_id, humanized_chunk, reply_to_message_id=reply_id)
+            sent_message = await self._client.send_message(
+                chat_id, humanized_chunk, reply_to_message_id=bubble.reply_to_message_id
+            )
+            queue.mark_delivered(text=humanized_chunk)
+            if on_bubble_sent is not None:
+                on_bubble_sent(humanized_chunk)
 
-            if humanized_chunk != chunk:
-                self._maybe_schedule_self_correction(chat_id, sent_message, chunk)
+            if humanized_chunk != bubble.text:
+                self._maybe_schedule_self_correction(chat_id, sent_message, bubble.text)
+
+    async def _pause_before(self, chunk: str, *, is_first: bool, llm_generation_time: float | None) -> None:
+        """
+        Сколько «печатать» перед конкретным бабблом.
+
+        Три разных случая, и раньше был только один общий: коротыш в 1-3
+        слова уходит почти встык (иначе серия «прикинь /// я ток щас узнала
+        /// а ты?» растягивалась на полминуты и читалась как медленный бот),
+        первому бабблу засчитывается уже прошедшее ожидание LLM, остальным —
+        обычный расчёт по WPM.
+        """
+        if is_short_bubble(chunk):
+            await asyncio.sleep(short_bubble_delay(self._humanizer_settings))
+            return
+        if is_first and llm_generation_time is not None:
+            delay = first_chunk_typing_delay(
+                chunk, self._humanizer_settings, llm_generation_time=llm_generation_time
+            )
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return
+        await simulate_typing_delay(chunk, self._humanizer_settings)
 
     def _maybe_schedule_self_correction(self, chat_id: int, sent_message: PyrogramMessage, correct_text: str) -> None:
         if random.random() >= self._humanizer_settings.typo_self_correct_probability:
@@ -131,6 +271,20 @@ class TelegramClientWrapper:
             logger.debug("telegram: self-corrected typo in message_id=%s (chat_id=%s)", message_id, chat_id)
         except Exception:
             logger.debug("telegram: self-correct edit failed for message_id=%s", message_id, exc_info=True)
+
+    async def send_typing_action(self, chat_id: int) -> None:
+        """
+        Разовый пинг статуса "печатает", отдельно от полного send_message
+        цикла — используется efi.notifications.worker.Worker, пока ждёт
+        ответа LLM (может занимать несколько секунд, особенно с несколькими
+        раундами tool-calling), чтобы собеседник видел живой TYPING, а не
+        тишину между "прочитано" и первым сообщением. Не критичная
+        функциональность — сбой не должен ничего ронять.
+        """
+        try:
+            await self._client.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:
+            logger.debug("telegram: failed to send typing pulse to chat_id=%s", chat_id, exc_info=True)
 
     async def send_photo(self, chat_id: int, photo_path: str | Path, *, caption: str = "") -> None:
         await self._client.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
@@ -194,7 +348,20 @@ class TelegramClientWrapper:
         свежий Pyrogram с поддержкой реакций — если метод недоступен в
         установленной версии, вызов бросит AttributeError, и это лучше
         обнаружить сразу при первом использовании, чем проглатывать молча.
+
+        Peer прогревается так же, как перед отправкой сообщения: внутри
+        send_reaction идёт resolve_peer, и для чата, которого нет в локальном
+        storage сессии, он падает сырым KeyError('ID not found') — наружу это
+        уходило невнятным "error: could not react: 'ID not found: ...'"
+        вместо честного "этот чат недоступен".
+
+        Эмодзи сюда обязан приходить уже приведённым к штатному набору
+        реакций Telegram (efi.tools.telegram_actions.react_with_emoji.
+        normalize_reaction_emoji) — сервер принимает нештатный вариант
+        молча, ничего не ставя.
         """
+        if not await self.ensure_peer_known(chat_id):
+            raise UnknownChatError(chat_id)
         await self._client.send_reaction(chat_id, message_id, emoji)
 
 

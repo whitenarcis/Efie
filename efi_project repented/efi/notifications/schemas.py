@@ -36,6 +36,10 @@ class NotificationType(str, Enum):
     FOLLOW_UP = "follow_up"
     #: Реакция на длительное молчание в чате (аналог silence_monitor_lifecycle).
     SILENCE_PING = "silence_ping"
+    #: Публичный комментарий под постом в канале сообщества (efi.telegram.comments).
+    PUBLIC_COMMENT = "public_comment"
+    #: Включение в чужую ветку обсуждения (RandomCommentEngager).
+    THREAD_REPLY = "thread_reply"
 
 
 class Notification(BaseModel):

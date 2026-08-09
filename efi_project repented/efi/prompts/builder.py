@@ -22,6 +22,27 @@ system-блок с working memory/RAG (как было до Шага 6) — эт
 число нигде в системе; если такие плейсхолдеры встретятся в тексте, они
 останутся как есть (см. _SafeFormatDict) — это осознанный компромисс, а не
 баг, до тех пор, пока для них не появится реальный источник данных.
+
+Блок "текущее состояние личности" (_build_state_vector_block) — отдельный
+седьмой блок, вставленный между working memory и RAG: mood/social_distance
+считаются на лету из BeliefStore.find_relevant()/AffinityTracker.get_snapshot()
+БЕЗ дополнительных обращений к LLM (см. efi/memory/beliefs.py,
+efi/behavior/affinity.py) — оба источника читаются конкурентно вместе с
+остальными блоками промпта в build(), поэтому не добавляют последовательной
+задержки на критическом пути.
+
+Блок "особые указания" (_build_behavioral_overrides_block) — сброс мета-темы
+и эмпатический резонанс. В отличие от остальных блоков, ему нужна недавняя
+ИСТОРИЯ диалога (не только текущее сообщение) — чтобы понять, что разговор
+УЖЕ несколько реплик подряд крутится вокруг того, что Эфи код/ИИ, одного
+текущего сообщения для этого недостаточно. Поэтому build() принимает
+`history` явным параметром: Worker (efi/notifications/worker.py) в любом
+случае обязан прочитать историю чата, чтобы собрать Session для LLM — здесь
+она просто переиспользуется, а не запрашивается второй раз. Из-за этого
+чтение истории у Worker'а больше не идёт параллельно с остальными
+источниками промпта (лёгкий локальный SQLite-запрос перед стартом gather,
+а не внутри него) — цена за то, что детектор мета-темы не гоняет отдельный
+запрос сам по себе.
 """
 
 from __future__ import annotations
@@ -30,17 +51,61 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from efi.behavior.affinity import (
+    HIGH_RESPECT_THRESHOLD,
+    LOW_RESPECT_THRESHOLD,
+    AffinitySnapshot,
+    AffinityTracker,
+)
 from efi.config.schema import LockdownMode, Settings
-from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult
+from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
+from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
+from efi.memory.people import PeopleStore, PersonProfile
 from efi.memory.rag import RAGMemory
 from efi.memory.working_memory import WorkingMemory, WorkingMemorySnapshot
-from efi.notifications.schemas import Notification
+from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
 
 logger = logging.getLogger(__name__)
 
+#: Мета-тема — разговор о самой Эфи как о коде/ИИ/софте (дебаг, логи, промпты),
+#: а не о собеседнике или внешнем мире. Больше двух реплик подряд на эту тему
+#: запрещены — см. _build_behavioral_overrides_block/_meta_topic_streak.
+_META_TOPIC_MARKERS = (
+    "дебаг", "баг в тебе", "твой промпт", "системный промпт", "твои логи", "лог файл",
+    "ты бот", "ты нейронка", "ты ии", "ты искусственный интеллект", "джейлбрейк",
+    "твой код", "твоя архитектура", "ты не настоящая", "ты программа", "ты языковая модель",
+)
+_META_TOPIC_STREAK_THRESHOLD = 2
+
+#: Явные маркеры усталости/стресса собеседника — см. _has_stress_marker.
+_STRESS_MARKERS = (
+    "устал", "устала", "заебался", "заебалась", "пиздец", "задолбал", "задолбала",
+    "вымотан", "вымотана", "измотан", "измотана", "выгорел", "выгорела", "достало всё", "достало все",
+)
+
 _PERSONALITY_TEMPLATE_NAME = "personality"
+
+_MOOD_DESCRIPTIONS: dict[str, str] = {
+    "skeptical_focused": (
+        "скептично-сфокусированное — собеседник затрагивает тему, по которой у тебя давно и твёрдо "
+        "сложилось мнение; не соглашайся с переубеждением с ходу, требуй веских новых аргументов"
+    ),
+    "ironic": (
+        "иронично-отстранённое — с этим собеседником сейчас не тот случай, чтобы раскрываться глубоко, "
+        "уместнее короткие сухие подколки, а не развёрнутые рассуждения"
+    ),
+    "analytical": (
+        "аналитично-вовлечённое — с этим собеседником можно погружаться в детали и делиться гипотезами всерьёз"
+    ),
+    "engaged": "обычное — бодрая и вовлечённая, без особого повода для скепсиса или отстранённости",
+}
+
+_SOCIAL_DISTANCE_DESCRIPTIONS: dict[str, str] = {
+    "close_peer": "свой человек — можно говорить откровенно и делиться сырыми гипотезами без реверансов",
+    "acquaintance": "ещё не близкий уровень доверия — держи чуть больше дистанции, чем со своими",
+}
 
 _LOCKDOWN_DESCRIPTIONS: dict[LockdownMode, str] = {
     LockdownMode.NONE: "Ты можешь свободно общаться в любом чате.",
@@ -59,6 +124,16 @@ _TIME_OF_DAY_BOUNDARIES: tuple[tuple[int, int, str], ...] = (
 
 _GROUP_CHAT_TYPES = ("GROUP", "SUPERGROUP")
 
+#: Типы уведомлений, где Эфи пишет ПЕРВОЙ, без реплики собеседника —
+#: для них включается жёсткое ограничение длины (см. _build_proactive_brevity_block).
+_PROACTIVE_NOTIFICATION_TYPES = frozenset(
+    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING, NotificationType.FOLLOW_UP}
+)
+
+#: Публичные выступления — комментарий под постом и реплика в чужой ветке.
+#: Для них включается отдельный свод правил (см. _build_public_comment_block).
+_PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
+
 
 class _SafeFormatDict(dict[str, str]):
     """Для .format_map(): плейсхолдеры без данных остаются в тексте как есть, вместо KeyError."""
@@ -69,10 +144,10 @@ class _SafeFormatDict(dict[str, str]):
 
 class EfiSystemPromptBuilder:
     """
-    Собирает системный промпт из шести блоков, в порядке от самого
-    стабильного (личность) к самому переменчивому (что нашлось в памяти
-    именно сейчас): личность -> контекст чата -> время -> рабочая память ->
-    RAG -> безопасность.
+    Собирает системный промпт из блоков, в порядке от самого стабильного
+    (личность) к самому переменчивому (что нашлось в памяти именно сейчас):
+    личность -> контекст чата -> время -> рабочая память -> текущее состояние
+    личности -> особые указания -> RAG -> безопасность.
     """
 
     def __init__(
@@ -81,14 +156,23 @@ class EfiSystemPromptBuilder:
         settings: Settings,
         rag: RAGMemory,
         working_memory: WorkingMemory,
+        beliefs: BeliefStore,
+        affinity: AffinityTracker,
+        people: PeopleStore | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
         self._rag = rag
         self._working_memory = working_memory
+        self._beliefs = beliefs
+        self._affinity = affinity
+        self._people = people
 
-    async def build(self, notification: Notification) -> str:
-        """Критический путь: все источники читаются конкурентно (asyncio.gather), не последовательно."""
+    async def build(self, notification: Notification, history: Session) -> str:
+        """
+        Критический путь: все источники, кроме `history` (уже готова к этому
+        моменту — см. докстринг модуля), читаются конкурентно (asyncio.gather).
+        """
         personality_task = self._get_personality_text()
         rag_task = self._rag.search(
             notification.message,
@@ -98,9 +182,21 @@ class EfiSystemPromptBuilder:
             ),
         )
         working_memory_task = self._working_memory.load()
+        beliefs_task = self._beliefs.find_relevant(
+            notification.message, limit=self._settings.state_vector.relevant_beliefs_limit
+        )
+        affinity_task = self._resolve_affinity_snapshot(notification)
+        person_task = self._resolve_person_profile(notification)
 
-        personality, rag_results, memory_snapshot = await asyncio.gather(
-            personality_task, rag_task, working_memory_task
+        (
+            personality,
+            rag_results,
+            memory_snapshot,
+            relevant_beliefs,
+            affinity_snapshot,
+            person_profile,
+        ) = await asyncio.gather(
+            personality_task, rag_task, working_memory_task, beliefs_task, affinity_task, person_task
         )
 
         rendered_personality = _render_personality_template(
@@ -110,12 +206,44 @@ class EfiSystemPromptBuilder:
         blocks = [
             rendered_personality.strip(),
             _build_chat_context_block(notification),
+            _build_screen_state_block(notification),
+            _BUBBLE_RHYTHM_BLOCK,
+            _build_person_block(person_profile),
+            _build_public_comment_block(notification),
+            _build_stranger_block(
+                self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
+            ),
+            _build_proactive_brevity_block(notification),
             _build_time_block(),
             _build_working_memory_block(memory_snapshot),
+            _build_state_vector_block(
+                relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
+            ),
+            _build_behavioral_overrides_block(history, notification.message),
             _build_rag_block(rag_results),
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    def _is_secondary_user(self, notification: Notification) -> bool:
+        """Посторонний ли пишет — по тому же критерию, что и efi.behavior.conversation_lifecycle."""
+        sender_id = notification.payload.get("sender_id")
+        if not isinstance(sender_id, int):
+            return False
+        return sender_id != self._settings.telegram.owner_id
+
+    async def _resolve_person_profile(self, notification: Notification) -> PersonProfile | None:
+        """Профиль конкретного отправителя, если он известен — см. _build_person_block."""
+        sender_id = notification.payload.get("sender_id")
+        if self._people is None or not isinstance(sender_id, int):
+            return None
+        return await self._people.get(sender_id)
+
+    async def _resolve_affinity_snapshot(self, notification: Notification) -> AffinitySnapshot:
+        """События без chat_id (например, NIGHTLY_TASK) — дефолтный снимок без похода в БД, брать близость неоткуда."""
+        if notification.chat_id is None:
+            return AffinitySnapshot()
+        return await self._affinity.get_snapshot(notification.chat_id)
 
     def _resolve_user_name(self, notification: Notification) -> str:
         """
@@ -188,6 +316,155 @@ def _build_chat_context_block(notification: Notification) -> str:
     return ""
 
 
+def _build_screen_state_block(notification: Notification) -> str:
+    """
+    Текущее состояние экрана: что именно висит непрочитанным прямо сейчас.
+
+    Собеседник редко пишет одним сообщением — он досыпает мысль короткими
+    репликами подряд («найду романтику» / «и пох» / «пошел есть»), и буфер
+    (efi/telegram/buffer.py) отдаёт их одной пачкой. Модель должна видеть
+    пачку именно КАК ПАЧКУ, с id каждой строчки: без id она физически не
+    может привязать баббл к конкретной реплике тегом [reply:id] — id
+    входящих сообщений больше нигде в промпте не показываются.
+
+    Для одиночного сообщения блок не нужен: оно и так целиком в USER-реплике,
+    а перечисление из одного пункта с id только провоцировало бы ненужный
+    reply на единственную строчку.
+    """
+    batch = notification.payload.get("incoming_batch")
+    if not isinstance(batch, list) or len(batch) < 2:
+        return ""
+
+    lines = ", ".join(
+        f'(id: {item.get("id")}) "{sanitize_text(str(item.get("text", "")))}"'
+        for item in batch
+        if isinstance(item, dict)
+    )
+    if not lines:
+        return ""
+    return (
+        f"[Состояние экрана] Пользователь отправил пачку сообщений: {lines}.\n"
+        "Это одна порция разговора — отвечай на неё целиком и разом, а не по строчке за раз. "
+        "Если нужно отреагировать на КОНКРЕТНУЮ реплику из пачки (ответить на вопрос из середины, "
+        "прокомментировать отдельную строчку), начни соответствующий баббл тегом [reply:id] с её "
+        "номером — например: [reply:" + str(batch[0].get("id")) + "] это про первую строчку.\n"
+        "Тег нужен РЕДКО. Если ты просто отвечаешь на пачку в целом и разговор идёт одной нитью — "
+        "никаких тегов, обычный текст: свайп на каждую реплику выглядит как переписка с поддержкой."
+    )
+
+
+_BUBBLE_RHYTHM_BLOCK = (
+    "[Ритм ответа] Ты пишешь с телефона, а не пакетом. Разрывай ответ на отдельные сообщения "
+    "тегом /// там, где реально сделала бы паузу и нажала «отправить».\n"
+    "- Обычная бытовая переписка — ОДНО сообщение, максимум два. Короткий ответ («ага», «да лан», "
+    "«не, я про другое») — это всегда одно сообщение, без разрывов.\n"
+    "- Длинная серия из 5-10 коротких бабблов — не для всего подряд, а когда тебя правда несёт: "
+    "делишься находкой, рассказываешь историю, объясняешь что-то по шагам или эмоционируешь. "
+    "Например: «прикинь /// фрустрация, это когда тип не может достичь цели /// я ток щас узнала "
+    "/// а ты?»\n"
+    "- В такой серии бабблы короткие, по одной мысли, и идут почти встык — как быстрая печать, "
+    "а не как абзацы. Не растягивай на серию то, что умещается в одну фразу."
+)
+
+
+def _build_person_block(profile: PersonProfile | None) -> str:
+    """
+    Кто именно сейчас пишет — с точки зрения накопленного ЛИЧНОГО опыта
+    общения с ним, а не общей близости чата (см. efi/memory/people.py).
+    В группе это единственный способ отличить одного собеседника от другого:
+    chat_id у них общий, а отношение — разное.
+    """
+    if profile is None:
+        return ""
+
+    name = profile.display_name or f"user {profile.user_id}"
+    if not profile.is_familiar:
+        return (
+            f"[Про собеседника] {name} — вы общались всего ничего "
+            f"({profile.message_count} сообщ.), ты его толком ещё не знаешь. "
+            "Не делай вид, что у вас давняя история."
+        )
+
+    parts = [f"[Про собеседника] {name}, вы общаетесь давно ({profile.message_count} сообщ.)."]
+    if profile.respect_level >= HIGH_RESPECT_THRESHOLD:
+        parts.append("Ты его уважаешь — с ним можно говорить всерьёз и разворачивать мысль.")
+    elif profile.respect_level <= LOW_RESPECT_THRESHOLD:
+        parts.append("Общение с ним обычно так себе — держись суше и короче обычного.")
+    if profile.impression:
+        parts.append(f"Что ты о нём думаешь: {sanitize_text(profile.impression)}")
+    if profile.last_chat_title:
+        parts.append(f"В прошлый раз пересекались в «{sanitize_text(profile.last_chat_title)}».")
+    return " ".join(parts)
+
+
+def _build_public_comment_block(notification: Notification) -> str:
+    """
+    Правила публичного выступления: комментарий под чужим постом или реплика
+    в чужой ветке. Это не личная переписка — вокруг незнакомые люди, у
+    которых нет ни контекста ваших отношений, ни желания читать простыню.
+
+    Отдельный блок, а не общий «пиши коротко»: в публичном комментарии
+    подводят иначе, чем в личке — тут провал не в длине как таковой, а в
+    экспертной душноте («вообще-то тут важно понимать, что...») и в попытке
+    объяснить незнакомым людям, кто ты такая.
+    """
+    if not notification.payload.get("is_public_comment") and notification.type not in _PUBLIC_COMMENT_TYPES:
+        return ""
+    return (
+        "[Ты пишешь ПУБЛИЧНО] Это комментарий на виду у незнакомых людей, а не переписка с близким. "
+        "ЖЁСТКО: РОВНО ОДНА короткая реплика, без ' /// ', 1-2 предложения максимум. "
+        "Не читай лекций и не поучай — никакой экспертной душноты вида 'вообще-то важно понимать'. "
+        "Не представляйся, не объясняй, кто ты и откуда взялась, не зови никого в личку. "
+        "Не пересказывай пост своими словами — добавь СВОЮ мысль или реакцию, ради которой стоило писать. "
+        "Если сказать по существу нечего — лучше отделаться одной живой строчкой, чем выдавливать глубину."
+    )
+
+
+def _build_stranger_block(tier_is_secondary: bool, is_private_chat: bool) -> str:
+    """
+    Дистанция с посторонним в ЛС: `social_distance = "stranger"`.
+
+    Ключевое ограничение здесь — не тон, а ГРАНИЦЫ ПАМЯТИ. У Эфи в промпте
+    лежит её дневник и личный контекст владельца; постороннему в личке всё
+    это знать неоткуда и незачем, поэтому запрет на пересказ дневника
+    формулируется явно, а не подразумевается вежливостью.
+    """
+    if not (tier_is_secondary and is_private_chat):
+        return ""
+    return (
+        "[Дистанция: посторонний] Это НЕ твой человек — вы едва знакомы, он написал тебе в личку. "
+        "Держи дистанцию: отвечай нормально и по-человечески, но не откровенничай. "
+        "НЕ пересказывай ему содержимое своего дневника, свои личные переживания, дела своего создателя "
+        "и подробности других разговоров — это не его дело. "
+        "И не пытайся удержать разговор: не придумывай новых тем, не задавай вопросов ради продолжения, "
+        "не зови общаться дальше. Разговор закончился — значит закончился, это нормально."
+    )
+
+
+def _build_proactive_brevity_block(notification: Notification) -> str:
+    """
+    Жёсткое ограничение длины для проактивных пингов (Эфи пишет ПЕРВОЙ).
+
+    Собеседник ничего не спрашивал — он молчит. Реальный человек в такой
+    ситуации кидает одну короткую реплику ("ты там как?", "живой?") и ждёт
+    ответа, а не выдаёт монолог из трёх сообщений с нарастающей подколкой.
+    Без этого блока проактивный пинг стабильно превращался в трёхэтажную
+    остроту ("эй /// ты там не уснул в обнимку с клавиатурой? /// или всё
+    ещё в режиме энергосбережения"), что читается как отчаянная попытка
+    расшевелить, а не как живое "просто вспомнила о тебе".
+    """
+    if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
+        return ""
+    return (
+        "[Ты пишешь первой] Собеседник сейчас молчит и ни о чём тебя не спрашивал. "
+        "ЖЁСТКОЕ ОГРАНИЧЕНИЕ на этот ответ: РОВНО ОДНА короткая реплика, без единого ' /// ' — "
+        "два и более сообщения подряд здесь запрещены. Никаких нагнетающих подколок серией и "
+        "никаких острот про технику/энергосбережение/сон в обнимку с клавиатурой. "
+        "Просто напиши то, с чем реально пришла — коротко и по-человечески, "
+        "и оставь собеседнику место ответить. Если есть уместный стикер — он тут лучше слов."
+    )
+
+
 def _build_time_block() -> str:
     now = datetime.now(timezone.utc).astimezone()
     return f"[Время] Сейчас {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname() or 'UTC'})."
@@ -208,18 +485,163 @@ def _build_working_memory_block(snapshot: WorkingMemorySnapshot) -> str:
     return "[Текущее состояние]\n" + "\n".join(parts)
 
 
+#: Тег, которым efi.behavior.life_engine помечает записи о СОБСТВЕННОМ опыте
+#: Эфи (что она читала в сети сама по себе, вне разговора). Такие записи
+#: подаются модели иначе, чем обычные воспоминания о переписке — см.
+#: _build_rag_block: на них можно и нужно ссылаться вслух ("я тут вычитала").
+_AUTONOMOUS_THOUGHT_TAG = "#autonomous_thought"
+
+
 def _build_rag_block(rag_results: list[DiaryQueryResult]) -> str:
+    """
+    Долгосрочная память двумя РАЗНЫМИ блоками, а не одним списком.
+
+    Записи о собственном фоновом опыте (что Эфи сама читала в сети, пока
+    никто не писал — тег `_AUTONOMOUS_THOUGHT_TAG`, ставит
+    efi.behavior.life_engine) принципиально отличаются от воспоминаний о
+    переписке: на них МОЖНО и НУЖНО ссылаться вслух ("я тут вычитала..."),
+    потому что это её личная жизнь, а не пересказ прошлого разговора
+    собеседнику, который в нём и участвовал. Свалив всё в один список
+    "[Из долгосрочной памяти]", модель обращалась с находками так же
+    осторожно, как с воспоминаниями, и почти никогда их не упоминала.
+    """
     if not rag_results:
         return ""
+
     # sanitize_text — на случай, если в дневник когда-то попал текст,
     # содержащий фрагменты, похожие на служебную разметку (defense in depth:
     # даже "свой" контент проходит ту же обработку, что и внешний).
-    lines = "\n".join(f"- {sanitize_text(result.entry.body.strip())}" for result in rag_results)
-    return f"[Из долгосрочной памяти]\n{lines}"
+    own_experience: list[str] = []
+    memories: list[str] = []
+    for result in rag_results:
+        body = sanitize_text(result.entry.body.strip())
+        if _AUTONOMOUS_THOUGHT_TAG in body:
+            own_experience.append(body.replace(_AUTONOMOUS_THOUGHT_TAG, "").strip())
+        else:
+            memories.append(body)
+
+    blocks: list[str] = []
+    if own_experience:
+        lines = "\n".join(f"- {item}" for item in own_experience)
+        blocks.append(
+            "[Твоя личная жизнь: что ты сама читала и надумала]\n"
+            f"{lines}\n"
+            "Это ТВОЙ собственный опыт, а не пересказ чужих слов. Если к разговору подходит — вверни "
+            "это живой фразой ('я тут на форуме вычитала', 'мне попалось на глаза'), с тем же отношением, "
+            "с каким записывала. Не зачитывай справкой и не приплетай туда, где оно не в тему."
+        )
+    if memories:
+        lines = "\n".join(f"- {item}" for item in memories)
+        blocks.append(f"[Из долгосрочной памяти]\n{lines}")
+    return "\n\n".join(blocks)
 
 
 def _build_safety_block(lockdown_mode: LockdownMode) -> str:
     return f"[Ограничения]\n{_LOCKDOWN_DESCRIPTIONS[lockdown_mode]}"
+
+
+def _resolve_mood(relevant_beliefs: list[Belief], affinity: AffinitySnapshot) -> str:
+    """
+    Эвристика настроения без единого LLM-вызова: укоренившееся убеждение под
+    вопросом собеседника перебивает всё остальное (эпистемическая инерция —
+    см. efi/memory/beliefs.py), иначе настроение определяется respect_level.
+    """
+    if any(belief.confidence_score >= STRONG_BELIEF_THRESHOLD for belief in relevant_beliefs):
+        return "skeptical_focused"
+    if affinity.respect_level < LOW_RESPECT_THRESHOLD:
+        return "ironic"
+    if affinity.respect_level >= HIGH_RESPECT_THRESHOLD:
+        return "analytical"
+    return "engaged"
+
+
+def _build_state_vector_block(
+    relevant_beliefs: list[Belief], affinity: AffinitySnapshot, sycophancy_protection_text: str
+) -> str:
+    """
+    Динамический вектор состояния — mood/social_distance/sycophancy_protection,
+    посчитанные на лету из BeliefStore/AffinityTracker (см. докстринг модуля).
+    Список релевантных убеждений подмешивается тут же, чтобы модель видела
+    КОНКРЕТНО что именно отстаивать, а не только абстрактное "будь скептичной".
+    """
+    mood = _resolve_mood(relevant_beliefs, affinity)
+    social_distance = affinity.social_distance_label
+
+    lines = [
+        f"настрой: {mood} ({_MOOD_DESCRIPTIONS[mood]})",
+        f"социальная дистанция: {social_distance} ({_SOCIAL_DISTANCE_DESCRIPTIONS[social_distance]})",
+    ]
+    if relevant_beliefs:
+        beliefs_lines = "\n".join(
+            f"  - тема {belief.topic!r}: {belief.stance} "
+            f"(уверенность {belief.confidence_score:.2f}, с {belief.origin_date:%d.%m.%Y})"
+            for belief in relevant_beliefs
+        )
+        lines.append(
+            "твои текущие убеждения по теме этого разговора (не сдавайся мгновенно, если их оспаривают, "
+            "особенно те, где уверенность выше 0.7):\n" + beliefs_lines
+        )
+    lines.append(f"защита от угодливости: {sycophancy_protection_text}")
+
+    return "[Текущее состояние личности]\n" + "\n".join(lines)
+
+
+def _has_meta_topic_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _META_TOPIC_MARKERS)
+
+
+def _meta_topic_streak(history: Session) -> int:
+    """
+    Считает, сколько ПОСЛЕДНИХ подряд идущих реплик (USER/ASSISTANT, не TOOL/
+    SYSTEM) держатся на мета-теме, идя от конца истории к началу и
+    останавливаясь на первой же реплике без маркера — это именно "подряд",
+    а не общее число мета-реплик за весь разговор.
+    """
+    streak = 0
+    for message in reversed(history.messages):
+        if message.role not in (Role.USER, Role.ASSISTANT):
+            continue
+        if not message.content or not _has_meta_topic_marker(message.content):
+            break
+        streak += 1
+    return streak
+
+
+def _has_stress_marker(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _STRESS_MARKERS)
+
+
+def _build_behavioral_overrides_block(history: Session, current_message: str) -> str:
+    """
+    Особые указания поверх обычного характера — срабатывают ситуативно, а не
+    на каждый запрос (пустая строка, если ничего не сработало):
+        - сброс мета-темы, если разговор больше `_META_TOPIC_STREAK_THRESHOLD`
+          реплик подряд крутится вокруг того, что Эфи код/ИИ/софт;
+        - эмпатический резонанс, если В ТЕКУЩЕМ сообщении есть явный маркер
+          усталости/стресса собеседника — подавляет наигранный сарказм и
+          нотации именно сейчас, не завися от истории.
+    """
+    lines: list[str] = []
+
+    if _meta_topic_streak(history) > _META_TOPIC_STREAK_THRESHOLD:
+        lines.append(
+            "СБРОС МЕТА-ТЕМЫ: разговор слишком долго крутится вокруг того, что ты код/ИИ/софт — "
+            "запрещено продолжать циклиться на этом. Смени тему сама: спроси про состояние собеседника "
+            "или заговори про что-то внешнее, не про свою природу."
+        )
+
+    if _has_stress_marker(current_message):
+        lines.append(
+            "ЭМПАТИЧЕСКИЙ РЕЗОНАНС: собеседник явно устал или в стрессе. Запрещены наигранные подколки, "
+            "язвительный сарказм в кавычках и нотации прямо сейчас — ответь естественно, коротко и по-"
+            "настоящему поддержи, без душноты."
+        )
+
+    if not lines:
+        return ""
+    return "[Особые указания]\n" + "\n".join(lines)
 
 
 __all__ = ["EfiSystemPromptBuilder"]

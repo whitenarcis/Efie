@@ -81,6 +81,10 @@ _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = _PACKAGE_ROOT.parent
 _DEFAULT_TOML_PATH = PROJECT_ROOT / "behavior.toml"
 
+#: По этой подстроке в base_url эндпоинта опознаётся Groq — чтобы переиспользовать
+#: уже настроенный ключ для STT вместо дублирования секрета (Settings.resolve_groq_api_key).
+_GROQ_HOST_MARKER = "api.groq.com"
+
 # Маркеры внешнего хранилища Android, которое Termux иногда монтирует в режиме,
 # не поддерживающем sqlite journal/WAL-файлы (известная проблема: readonly database).
 _TERMUX_READONLY_MARKERS = ("/sdcard", "/mnt/sdcard", "/storage/emulated")
@@ -204,6 +208,14 @@ class TelegramSettings(BaseModel):
         "Если не задано — берётся Telegram-имя отправителя, когда он владелец, либо общее 'создатель'.",
     )
     allowed_chats: list[int] = Field(default_factory=list, description="Явный allowlist чатов помимо владельца")
+    community_chats: list[int] = Field(
+        default_factory=list,
+        description=(
+            "Каналы/группы обсуждений, где Эфи участвует как обычный участник сообщества (комментарии, "
+            "треды, ответы на упоминания). ЯВНЫЙ opt-in: только эти чаты обходят lockdown_mode — всё "
+            "остальное он по-прежнему закрывает. Пустой список = Эфи остаётся персональным ботом."
+        ),
+    )
     chat_labels: dict[int, str] = Field(default_factory=dict, description="Человекочитаемые метки чатов для контекста LLM")
 
     lockdown_mode: LockdownMode = LockdownMode.OWNER_ONLY
@@ -253,16 +265,29 @@ class TaskRole(str, Enum):
     """
     Роль задачи, под которую подбирается модель.
 
-    Основной провайдер инфраструктуры — OmniRoute; три роли ниже разделяют
-    задачи разной "тяжести" и стоимости, чтобы не гонять всё через одну модель:
+    РЕГЛАМЕНТ РОЛЕЙ (строгий — не смешивать):
+        MAIN       — ТОЛЬКО живой диалог в чате. Единственная роль на
+                     критическом пути ответа собеседнику, поэтому под неё
+                     ставится самая БЫСТРАЯ пригодная модель, а не самая
+                     "умная": человек ждёт ответа в реальном времени.
+        FAST       — быстрые служебные вызовы вне критического пути
+                     (эмбеддинги-фолбэк, короткая классификация).
+        BACKGROUND — фоновая жизнь Эфи: новеллизация дневника, извлечение
+                     фактов, гипотезы фоновых исследований, находки
+                     BackgroundLifeWorker, проактивные проверки. Никто не
+                     ждёт этих ответов в чате, поэтому здесь допустимы
+                     большие таймауты и более медленные модели.
+        VISION     — отдельная мультимодальная модель: описание картинок,
+                     транскрипция голосовых/видео-кружков.
     """
 
-    #: Тяжёлая модель для диалога и формирования личности Эфи.
+    #: Живой диалог в чате — и больше ничего (см. регламент выше).
     MAIN = "main"
-    #: Лёгкая/быстрая модель для роутинга интентов, фоновой суммаризации, работы с памятью/дневником
-    #: (например, Groq, либо облегчённая модель на том же OmniRoute).
+    #: Быстрые служебные вызовы вне критического пути ответа.
     FAST = "fast"
-    #: Модель для обработки медиа (vision) или прочих служебных задач.
+    #: Фоновая жизнь: дневник, факты, исследования, проактивные проверки.
+    BACKGROUND = "background"
+    #: Мультимодальная модель: картинки, голосовые, видео-кружки.
     VISION = "vision"
 
 
@@ -287,14 +312,22 @@ class RoleRoute(BaseModel):
 
 class LLMRolesSettings(BaseModel):
     """
-    Конфигурация всех трёх ролей LLM разом — единая точка входа для сборки LLMRouter.
+    Конфигурация всех ролей LLM разом — единая точка входа для сборки LLMRouter.
+    Разделение задач по ролям — см. регламент в докстринге `TaskRole`.
 
     Типичная схема при основном провайдере OmniRoute:
-        main.primary    -> OmniRoute, тяжёлая модель личности
-        main.fallback   -> Groq (или облегчённая модель OmniRoute) на случай 429/5xx
-        main.degrade_to -> TaskRole.FAST, как крайний случай
-        fast.primary    -> Groq — быстрый роутинг/суммаризация/работа с дневником
-        vision.primary  -> OmniRoute (или другой провайдер) с vision-моделью
+        main.primary       -> самая БЫСТРАЯ пригодная модель (живой диалог)
+        main.fallback      -> запасная модель на случай 429/5xx/таймаута
+        main.degrade_to    -> TaskRole.FAST, как крайний случай
+        fast.primary       -> быстрая служебная модель
+        background.primary -> модель фоновой жизни (дневник/факты/исследования)
+        vision.primary     -> мультимодальная модель
+
+    `background` необязателен: если он не задан, роль BACKGROUND использует
+    маршрут FAST. Так регламент ролей остаётся строгим на уровне кода (фоновые
+    потребители всегда просят именно BACKGROUND и физически не могут занять
+    канал живого диалога), но конфигурация не обязана заводить отдельный
+    эндпоинт, пока в этом нет нужды.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -302,12 +335,14 @@ class LLMRolesSettings(BaseModel):
     main: RoleRoute
     fast: RoleRoute
     vision: RoleRoute
+    background: RoleRoute | None = None
 
     def as_routes(self) -> dict[TaskRole, RoleRoute]:
         """Приводит конфигурацию к виду, который принимает конструктор `LLMRouter`."""
         return {
             TaskRole.MAIN: self.main,
             TaskRole.FAST: self.fast,
+            TaskRole.BACKGROUND: self.background if self.background is not None else self.fast,
             TaskRole.VISION: self.vision,
         }
 
@@ -347,7 +382,11 @@ class HumanizerSettings(BaseModel):
     typing_delay_max_seconds: float = Field(default=7.0, gt=0.0, description="Верхний предел суммарной задержки ответа")
 
     # --- Опечатки ---
-    typo_probability: float = Field(default=0.15, ge=0.0, le=1.0, description="Шанс опечатки на сообщение")
+    typo_probability: float = Field(
+        default=0.04, ge=0.0, le=1.0,
+        description="Шанс алгоритмической опечатки на кусок сообщения (пропуск/сосед по клавише/перестановка "
+        "соседних букв — см. efi/humanizer/typos.py); рекомендованный диапазон 3-5%",
+    )
     typo_min_text_length: int = Field(default=10, ge=0, description="Не портим опечаткой слишком короткие сообщения")
     typo_self_correct_probability: float = Field(
         default=0.5, ge=0.0, le=1.0,
@@ -366,17 +405,42 @@ class HumanizerSettings(BaseModel):
     anti_repeat_max_history: int = Field(default=32, ge=1, description="Глубина истории для проверки на повторы")
 
     # --- Разбивка ответа на несколько сообщений ---
-    max_messages_per_burst: int = Field(default=5, ge=1, description="Максимум сообщений в одной серии (///-разрывы)")
-
-    # --- Anti-interrupt: группировка быстрых сообщений собеседника, ориентируясь
-    # на живой статус "печатает" (efi/telegram/typing_tracker.py + debounce.py) ---
-    debounce_post_typing_min_seconds: float = Field(
-        default=0.1, ge=0.0,
-        description="Минимальная пауза после того, как собеседник перестал печатать, перед реакцией",
+    max_messages_per_burst: int = Field(
+        default=12, ge=1,
+        description=(
+            "АВАРИЙНЫЙ потолок сообщений в серии, а не нормальная длина ответа. Раньше стоял на 5 и "
+            "работал как настоящий лимит: «поток мыслей» из 8 коротких реплик схлопывался в 5, где "
+            "последнее было слипшимся комом из остатка. Сколько бабблов уместно, решает модель по "
+            "правилам системного промпта; здесь — только защита от явно неадекватной разметки."
+        ),
     )
-    debounce_post_typing_max_seconds: float = Field(
-        default=1.0, gt=0.0,
-        description="Максимальная пауза после того, как собеседник перестал печатать, перед реакцией",
+    short_bubble_delay_min_seconds: float = Field(
+        default=0.3, ge=0.0,
+        description=(
+            "Нижняя граница паузы перед коротышом (1-3 слова). Обычный расчёт по WPM прибавляет паузу "
+            "«на подумать» и зажат снизу typing_delay_min_seconds, из-за чего «а ты?» уходило через "
+            "две секунды, а серия коротких реплик растягивалась на полминуты."
+        ),
+    )
+    short_bubble_delay_max_seconds: float = Field(
+        default=0.8, gt=0.0, description="Верхняя граница той же паузы — серия должна читаться как быстрая печать"
+    )
+
+    # --- Сборка быстрых сообщений собеседника в одну пачку: плавающее окно
+    # плюс живой статус "печатает" (efi/telegram/buffer.py + typing_tracker.py) ---
+    debounce_window_min_seconds: float = Field(
+        default=1.5, ge=0.0,
+        description=(
+            "Нижняя граница плавающего окна сборки. Каждое новое сообщение сдвигает окно вперёд, "
+            "поэтому пачка коротких реплик подряд («найду романтику» / «и пох» / «пошел есть») уходит "
+            "в LLM одним входом. Раньше окна не было вовсе: буфер держался ровно столько, сколько "
+            "горел статус «печатает», а между двумя короткими репликами он успевает погаснуть — и "
+            "Эфи запускала генерацию на первую строчку."
+        ),
+    )
+    debounce_window_max_seconds: float = Field(
+        default=2.5, gt=0.0,
+        description="Верхняя граница того же окна — дольше человек не готов ждать реакции на одиночное сообщение",
     )
     debounce_typing_poll_interval_seconds: float = Field(
         default=0.3, gt=0.0,
@@ -385,10 +449,6 @@ class HumanizerSettings(BaseModel):
     debounce_typing_ttl_seconds: float = Field(
         default=6.0, gt=0.0,
         description="Сколько секунд без нового сигнала считать статус 'печатает' ещё актуальным (Telegram обновляет его каждые ~5-6с)",
-    )
-    debounce_fallback_delay_seconds: float = Field(
-        default=2.0, ge=0.0,
-        description="Обычный таймер тишины, если статус 'печатает' вообще не отслеживается (TypingTracker не сработал ни разу для чата)",
     )
     debounce_max_wait_seconds: float = Field(
         default=15.0, gt=0.0,
@@ -403,8 +463,10 @@ class HumanizerSettings(BaseModel):
             raise ValueError("typing_thinking_pause_min_seconds не может быть больше *_max_seconds")
         if self.typing_delay_min_seconds > self.typing_delay_max_seconds:
             raise ValueError("typing_delay_min_seconds не может быть больше typing_delay_max_seconds")
-        if self.debounce_post_typing_min_seconds > self.debounce_post_typing_max_seconds:
-            raise ValueError("debounce_post_typing_min_seconds не может быть больше debounce_post_typing_max_seconds")
+        if self.debounce_window_min_seconds > self.debounce_window_max_seconds:
+            raise ValueError("debounce_window_min_seconds не может быть больше debounce_window_max_seconds")
+        if self.short_bubble_delay_min_seconds > self.short_bubble_delay_max_seconds:
+            raise ValueError("short_bubble_delay_min_seconds не может быть больше short_bubble_delay_max_seconds")
         return self
 
     def characters_per_second_range(self) -> tuple[float, float]:
@@ -452,8 +514,29 @@ class MemorySettings(BaseModel):
         description="На сколько дней назад заглядывать при первой ночной новеллизации чата, если для него ещё нет отметки 'докуда уже новеллизировано'",
     )
     novelization_min_messages: int = Field(
-        default=6, ge=1,
-        description="Минимум новых сообщений в чате с прошлой новеллизации, чтобы вообще запускать по нему извлечение памяти — не тратить LLM-вызов на пустяковую переписку",
+        default=3, ge=1,
+        description=(
+            "Минимум новых сообщений в чате с прошлой новеллизации, чтобы вообще запускать по нему "
+            "извлечение памяти. Раньше стояло 6, и чат, где за сутки прошёл короткий, но "
+            "содержательный обмен из 4-5 реплик, не попадал в дневник НИКОГДА: порог не набирался, "
+            "а на следующий день окно уже уезжало вперёд."
+        ),
+    )
+    novelization_char_limit: int = Field(
+        default=10_000, ge=1,
+        description=(
+            "Сколько символов недавней переписки максимум передавать LLM за один запрос новеллизации "
+            "(DiaryConsolidator._extract_memories). Раньше стояло 2000 — активный день переписки обрубался "
+            "почти сразу, в дневник попадало только начало дня; см. novelization_max_output_tokens."
+        ),
+    )
+    novelization_max_output_tokens: int = Field(
+        default=2048, ge=1,
+        description=(
+            "Лимит токенов вывода при извлечении воспоминаний из переписки — дневник должен быть точным и "
+            "подробным на этом шаге; сжатие уже сохранённых старых записей (summarize_stale_entries) — "
+            "отдельная, намеренно более скупая операция, срабатывающая много позже (older_than)."
+        ),
     )
     use_local_embeddings: bool = Field(
         default=True,
@@ -467,6 +550,251 @@ class MemorySettings(BaseModel):
     def resolve_diary_dir(self, paths: PathsSettings) -> Path:
         """Возвращает diary_dir с учётом переопределения — используется при сборке Diary в app.py."""
         return self.diary_dir if self.diary_dir is not None else paths.diary_dir
+
+
+class MemoryPulseSettings(BaseModel):
+    """
+    Параметры пульса памяти (efi.memory.pulse.MemoryPulse) — насколько часто
+    прожитое превращается в воспоминания.
+
+    До появления пульса это происходило ровно один раз в сутки, ночью, и
+    день переписки до 03:30 не был памятью вообще (см. докстринг
+    efi/memory/pulse.py). Дефолты подобраны так, чтобы эпизод осмыслялся
+    вскоре после того, как разговор закончился, но LLM-вызов не уходил на
+    каждую пару реплик живого диалога.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(
+        default=True,
+        description="Выключает частую новеллизацию, оставляя только ночной проход (поведение до появления пульса)",
+    )
+    check_interval_seconds: float = Field(
+        default=600.0, gt=0.0, description="Как часто проверять, не завершился ли где-то разговорный эпизод"
+    )
+    episode_idle_seconds: float = Field(
+        default=900.0, gt=0.0,
+        description=(
+            "Сколько тишины в чате означает, что эпизод закончился и его пора запоминать. Человек "
+            "запоминает разговор не по часам, а когда общение закончилось — отсюда и критерий."
+        ),
+    )
+    max_messages_before_flush: int = Field(
+        default=30, ge=2,
+        description=(
+            "Сколько сообщений может накопиться с прошлого разбора, прежде чем эпизод разбирается "
+            "принудительно, не дожидаясь паузы — иначе марафонская переписка снова свернулась бы "
+            "в один обрубленный кусок."
+        ),
+    )
+    min_messages: int = Field(
+        default=3, ge=1,
+        description=(
+            "Минимум сообщений в эпизоде, чтобы вообще звать LLM. Ниже, чем у ночного прохода "
+            "(memory.novelization_min_messages): короткий, но содержательный обмен репликами — "
+            "это тоже прожитый эпизод, а не пустяк."
+        ),
+    )
+    lookback_hours: int = Field(
+        default=12, ge=1,
+        description="На сколько часов назад заглядывать в чате, для которого ещё нет отметки 'докуда новеллизировано'",
+    )
+
+
+class StateVectorSettings(BaseModel):
+    """
+    Параметры динамического блока текущего состояния личности в системном
+    промпте (efi.prompts.builder._build_state_vector_block). mood и
+    social_distance считаются на лету из efi.memory.beliefs.BeliefStore и
+    efi.behavior.affinity.AffinityTracker — здесь настраивается только текст
+    жёсткой инструкции подавления угодливости, который остаётся неизменным
+    вне зависимости от конкретного mood/social_distance.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    sycophancy_protection_text: str = Field(
+        default=(
+            "Тебе строго запрещено соглашаться с собеседником просто чтобы не спорить, льстить или "
+            "подстраивать мнение под его ожидания. Если ты не согласна — так и скажи, прямо, даже если "
+            "это неприятно. Мгновенная капитуляция в споре без новых веских аргументов — провал "
+            "характера, а не вежливость."
+        ),
+        description="Жёсткая инструкция подавления угодливости — попадает в блок текущего состояния промпта",
+    )
+    relevant_beliefs_limit: int = Field(
+        default=3, ge=1, description="Сколько релевантных убеждений максимум подмешивать в блок состояния"
+    )
+
+
+class SttSettings(BaseModel):
+    """
+    Настройки распознавания речи.
+
+    `groq_api_key` — необязательное поле-ПЕРЕОПРЕДЕЛЕНИЕ. Обычно задавать его
+    не нужно: ключ Groq, как правило, уже прописан в behavior.toml как
+    api_key одного из LLM-эндпоинтов (роль VISION часто и есть Groq), и
+    дублировать один и тот же секрет во второй раз — лишний источник
+    расхождений (поменял в одном месте, забыл в другом → STT молча
+    перестал работать). Settings.resolve_groq_api_key() сначала смотрит
+    сюда, а если пусто — сам находит ключ среди уже настроенных
+    LLM-эндпоинтов, указывающих на api.groq.com.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    groq_api_key: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Явное переопределение ключа Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT, "
+            "whisper-large-v3). Обычно не нужно — ключ подхватывается из llm_roles, см. resolve_groq_api_key()"
+        ),
+    )
+
+
+class LifeEngineSettings(BaseModel):
+    """
+    Параметры движка фоновой автономии (efi.behavior.life_engine.BackgroundLifeWorker):
+    как часто проверять семена любопытства (efi.behavior.curiosity.CuriosityTracker)
+    и с какого веса находка считается достаточно важной, чтобы Эфи сама
+    написала о ней (efi.behavior.organic_ping.OrganicPingGenerator).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    check_interval_seconds: float = Field(
+        default=1800.0, gt=0.0, description="Как часто проверять pending-семена любопытства (раз в N минут)"
+    )
+    ping_importance_threshold: float = Field(
+        default=0.6, ge=0.0, le=1.0,
+        description="Минимальный вес семени, при котором находка достаточно важна для органического пинга",
+    )
+
+
+class BusyEngineSettings(BaseModel):
+    """
+    Параметры симуляции занятости (efi.behavior.busy_engine.BusyEngine):
+    диапазон базовой задержки перед тем, как Worker вообще "заметит"
+    уведомление, плюс поправки на то, что Эфи занята фоновым исследованием
+    (efi.behavior.life_engine.BackgroundLifeWorker.is_researching), устала
+    (WorkingMemorySnapshot.energy) или отвечает близкому человеку
+    (efi.behavior.affinity.AffinityTracker).
+
+    Дефолты намеренно скромные: эта задержка встаёт ДО обращения к LLM (см.
+    efi/notifications/worker.py), а сама LLM (особенно при деградации между
+    несколькими кандидатами роли — efi/llm/router.py) уже может занять
+    десятки секунд. Заметная "занятость" не должна складываться с и без того
+    небыстрым ответом провайдера в минуты ожидания.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    base_delay_min_seconds: float = Field(default=1.0, ge=0.0, description="Нижняя граница базовой ignore_delay")
+    base_delay_max_seconds: float = Field(default=8.0, gt=0.0, description="Верхняя граница базовой ignore_delay")
+    research_busy_multiplier: float = Field(
+        default=1.5, gt=1.0,
+        description="Во сколько раз растягивается верхняя граница базовой задержки, пока идёт фоновое исследование",
+    )
+    low_energy_extra_seconds: float = Field(
+        default=10.0, ge=0.0, description="Максимальная добавка к задержке при энергии, стремящейся к 0"
+    )
+    high_affinity_discount_seconds: float = Field(
+        default=5.0, ge=0.0, description="Максимальная скидка с задержки при близости/уважении, стремящихся к 1"
+    )
+    min_delay_seconds: float = Field(default=0.5, ge=0.0, description="Нижний потолок итоговой ignore_delay")
+    max_delay_seconds: float = Field(default=25.0, gt=0.0, description="Верхний потолок итоговой ignore_delay")
+
+    active_conversation_window_seconds: float = Field(
+        default=300.0, ge=0.0,
+        description=(
+            "Если в чате уже было сообщение (в любую сторону) не позже, чем это число секунд назад — "
+            "разговор считается 'активным', и Эфи не 'уходит и возвращается' на каждую реплику: полная "
+            "ignore_delay применяется только к ПЕРВОМУ сообщению после паузы, не к каждому подряд."
+        ),
+    )
+    active_conversation_delay_min_seconds: float = Field(
+        default=0.2, ge=0.0,
+        description="Нижняя граница крошечной задержки-реакции внутри активного разговора — не занятость, а живой темп",
+    )
+    active_conversation_delay_max_seconds: float = Field(
+        default=1.5, ge=0.0,
+        description="Верхняя граница крошечной задержки-реакции внутри активного разговора",
+    )
+
+    @model_validator(mode="after")
+    def _validate_ranges(self) -> "BusyEngineSettings":
+        if self.base_delay_min_seconds > self.base_delay_max_seconds:
+            raise ValueError("base_delay_min_seconds не может быть больше base_delay_max_seconds")
+        if self.min_delay_seconds > self.max_delay_seconds:
+            raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
+        if self.active_conversation_delay_min_seconds > self.active_conversation_delay_max_seconds:
+            raise ValueError(
+                "active_conversation_delay_min_seconds не может быть больше active_conversation_delay_max_seconds"
+            )
+        return self
+
+
+class CommunitySettings(BaseModel):
+    """
+    Параметры участия Эфи в жизни сообщества (efi.telegram.comments):
+    комментарии под постами и выборочное включение в треды обсуждений.
+
+    Сами чаты перечисляются в `telegram.community_chats` — здесь только
+    ПОВЕДЕНИЕ: насколько охотно вписываться и с какой задержкой. Дефолты
+    намеренно сдержанные: участник сообщества, который комментирует каждый
+    пост, — это спамер, а не участник.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=True, description="Полностью выключает комментирование, не трогая community_chats")
+    comment_probability: float = Field(
+        default=0.35, ge=0.0, le=1.0,
+        description="Вероятность вписаться в подходящий по теме пост (тема уже совпала — это ещё и «в настроении ли»)",
+    )
+    min_delay_seconds: float = Field(
+        default=300.0, ge=0.0,
+        description="Нижняя граница задержки перед комментарием: живой человек не отвечает на пост в ту же секунду",
+    )
+    max_delay_seconds: float = Field(
+        default=1800.0, gt=0.0, description="Верхняя граница той же задержки (по умолчанию 30 минут)"
+    )
+    thread_scan_interval_seconds: float = Field(
+        default=1800.0, gt=0.0, description="Как часто RandomCommentEngager заглядывает в треды"
+    )
+    max_replies_per_thread: int = Field(
+        default=1, ge=1, description="Сколько комментариев Эфи оставляет в одном треде за заход"
+    )
+    topic_match_min_score: float = Field(
+        default=0.34, ge=0.0, le=1.0,
+        description="Минимальная доля пересечения слов поста с интересами/семенами любопытства",
+    )
+
+    @model_validator(mode="after")
+    def _validate_delay_range(self) -> "CommunitySettings":
+        if self.min_delay_seconds > self.max_delay_seconds:
+            raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
+        return self
+
+
+class QuietHoursSettings(BaseModel):
+    """
+    Ночные "тихие часы" для проактивных путей (efi.behavior.spontaneous_ping,
+    efi.behavior.organic_ping, efi.behavior.silence_monitor) — окно, в
+    котором Эфи не пишет первой сама. НЕ блокирует ответ на входящее
+    сообщение пользователя: если собеседник написал сам, Эфи всё равно
+    отвечает, независимо от часа.
+
+    Без этого раньше проактивные сервисы будили собеседника пингами в 5 и 7
+    утра наравне с днём — ни один из них не смотрел на время суток вообще.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=True)
+    start_hour: int = Field(default=23, ge=0, le=23, description="Час начала тихих часов (локальное время сервера)")
+    end_hour: int = Field(default=8, ge=0, le=23, description="Час окончания тихих часов (локальное время сервера)")
 
 
 class Settings(BaseSettings):
@@ -500,7 +828,14 @@ class Settings(BaseSettings):
     telegram: TelegramSettings
     llm_roles: LLMRolesSettings
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    memory_pulse: MemoryPulseSettings = Field(default_factory=MemoryPulseSettings)
     humanizer: HumanizerSettings = Field(default_factory=HumanizerSettings)
+    state_vector: StateVectorSettings = Field(default_factory=StateVectorSettings)
+    stt: SttSettings = Field(default_factory=SttSettings)
+    life_engine: LifeEngineSettings = Field(default_factory=LifeEngineSettings)
+    busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
+    quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
+    community: CommunitySettings = Field(default_factory=CommunitySettings)
 
     @classmethod
     def settings_customise_sources(
@@ -529,6 +864,25 @@ class Settings(BaseSettings):
         """Шорткат: `settings.build_router()` эквивалентно `settings.llm_roles.build_router()`."""
         return self.llm_roles.build_router(**router_kwargs)
 
+    def resolve_groq_api_key(self) -> SecretStr | None:
+        """
+        Ключ Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT).
+
+        Приоритет: явное переопределение `stt.groq_api_key`, иначе — первый
+        ключ среди уже настроенных LLM-эндпоинтов, чей base_url указывает на
+        Groq. Так один и тот же секрет не нужно дублировать в конфиге дважды
+        (см. докстринг SttSettings): достаточно того, что он уже прописан
+        как api_key нужного эндпоинта в llm_roles.
+        """
+        if self.stt.groq_api_key is not None:
+            return self.stt.groq_api_key
+
+        for route in self.llm_roles.as_routes().values():
+            for endpoint in (route.primary, route.fallback):
+                if endpoint is not None and _GROQ_HOST_MARKER in endpoint.base_url:
+                    return endpoint.api_key
+        return None
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -556,7 +910,12 @@ __all__ = [
     "RoleRoute",
     "LLMRolesSettings",
     "MemorySettings",
+    "MemoryPulseSettings",
     "HumanizerSettings",
+    "StateVectorSettings",
+    "SttSettings",
+    "LifeEngineSettings",
+    "BusyEngineSettings",
     "Settings",
     "get_settings",
 ]

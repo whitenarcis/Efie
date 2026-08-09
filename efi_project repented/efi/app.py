@@ -17,10 +17,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Coroutine
+from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
+from typing import Any
 
 from pyrogram import Client
 
+from efi.behavior.affinity import AffinityTracker
+from efi.behavior.busy_engine import BusyEngine
+from efi.behavior.conversation_lifecycle import ConversationLifecycle
+from efi.behavior.curiosity import CuriosityTracker
+from efi.behavior.life_engine import BackgroundLifeWorker
+from efi.behavior.organic_ping import OrganicPingGenerator
+from efi.behavior.researcher import BackgroundResearcher
 from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
 from efi.behavior.silence_monitor import SilenceMonitor
 from efi.behavior.spontaneous_ping import SpontaneousPingScheduler
@@ -29,18 +39,30 @@ from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.media.stt_groq import GroqSTT
+from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
 from efi.memory.local_embeddings import LocalEmbeddingEngine
+from efi.memory.people import PeopleStore
+from efi.memory.pulse import MemoryPulse
 from efi.memory.rag import RAGMemory
+from efi.memory.social_memory import SocialInteractionStore
 from efi.memory.tfidf_fallback import TfidfFallbackIndex
 from efi.memory.working_memory import WorkingMemory
 from efi.notifications.manager import NotificationManager
 from efi.notifications.worker import Worker
 from efi.prompts.builder import EfiSystemPromptBuilder
 from efi.prompts.loader import PromptLoader
+from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.client import TelegramClientWrapper
+from efi.telegram.comments import (
+    ChannelPostWatcher,
+    RandomCommentEngager,
+    ThreadStateStore,
+    build_community_interests,
+)
 from efi.telegram.handlers import TelegramEventHandlers
 from efi.telegram.typing_tracker import TypingTracker
 from efi.tools.base import Tool
@@ -48,9 +70,13 @@ from efi.tools.chat_management.join_chat import JoinChatTool
 from efi.tools.chat_management.leave_chat import LeaveChatTool
 from efi.tools.chat_management.search_chats import SearchChatsTool
 from efi.tools.memory_tools.ask_diary import AskDiaryTool
+from efi.tools.memory_tools.manage_belief import UpdateBeliefTool
+from efi.tools.memory_tools.manage_promises import CompletePromiseTool, RememberPromiseTool
 from efi.tools.memory_tools.recall_fact import RecallFactTool
 from efi.tools.memory_tools.remember_diary_entry import RememberDiaryEntryTool
 from efi.tools.memory_tools.remember_fact import RememberFactTool
+from efi.tools.memory_tools.remember_person import RememberPersonTool
+from efi.tools.memory_tools.update_self_state import UpdateSelfStateTool
 from efi.tools.registry import ToolRegistry
 from efi.tools.system_tools.device import GetBatteryStatusTool, TriggerVibrationTool
 from efi.tools.telegram_actions.edit_message import EditMessageTool
@@ -66,6 +92,9 @@ logger = logging.getLogger(__name__)
 _DEFAULT_WORKER_COUNT = 3
 _QUEUE_DRAIN_TIMEOUT_SECONDS = 30.0
 _CONSOLIDATION_TRIGGER_AT = dt_time(hour=3, minute=30)
+#: "С начала времён" — для get_active_chat_ids(since=...) в _active_chat_candidates,
+#: где нужны ВСЕ чаты с известной историей, а не только недавние.
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class EfiApp:
@@ -102,19 +131,113 @@ class EfiApp:
         self._working_memory = WorkingMemory(settings.paths.data_dir / "working_memory.json")
         self._facts = FactStore(self._database)
         self._history = SqliteHistoryRepository(self._database)
-        self._consolidator = DiaryConsolidator(self._diary, self._llm_router, self._rag)
+        self._consolidator = DiaryConsolidator(
+            self._diary,
+            self._llm_router,
+            self._rag,
+            novelization_char_limit=settings.memory.novelization_char_limit,
+            novelization_max_output_tokens=settings.memory.novelization_max_output_tokens,
+        )
+
+        # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
+        # Все три — только Database как зависимость, поэтому конструируются
+        # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
+        # ДО телеграм-обработчиков (которым нужны все три как *_recorder).
+        self._beliefs = BeliefStore(self._database)
+        self._affinity = AffinityTracker(self._database)
+        self._curiosity = CuriosityTracker(self._database)
+        # Социальная память по КОНКРЕТНЫМ людям (в группе chat_id общий,
+        # а собеседники разные) — см. efi/memory/people.py. Зависит от
+        # BeliefStore: устойчивое отношение к человеку перетекает в общую
+        # матрицу убеждений, поэтому конструируется ПОСЛЕ него.
+        self._people = PeopleStore(self._database, beliefs=self._beliefs)
+        # Социальная память внешнего опыта: журнал в SQLite + индексация в
+        # векторную память через RAG, поэтому конструируется ПОСЛЕ _rag.
+        self._social_memory = SocialInteractionStore(self._database, rag=self._rag)
+        # Жизненный цикл диалога с посторонними (владелец vs остальные).
+        self._lifecycle = ConversationLifecycle(self._database, owner_id=settings.telegram.owner_id)
+        # Пульс памяти — превращает прожитое в воспоминания по ходу дня, а не
+        # раз в сутки ночью. Зависит и от консолидатора, и от журнала внешнего
+        # опыта (тот подмешивается в разбор эпизода), поэтому конструируется
+        # после обоих. См. докстринг efi/memory/pulse.py.
+        pulse_settings = settings.memory_pulse
+        self._memory_pulse = MemoryPulse(
+            self._consolidator,
+            self._history,
+            self._facts,
+            experience=self._social_memory,
+            check_interval_seconds=pulse_settings.check_interval_seconds,
+            episode_idle_seconds=pulse_settings.episode_idle_seconds,
+            max_messages_before_flush=pulse_settings.max_messages_before_flush,
+            min_messages=pulse_settings.min_messages,
+            lookback=timedelta(hours=pulse_settings.lookback_hours),
+        )
+
+        # -- инструменты, нужные фоновым исследователям (см. ниже) -------------
+        # Вынесены выше "промптов"/"проактивности", т.к. BackgroundResearcher/
+        # BackgroundLifeWorker должны быть готовы ДО SpontaneousPingScheduler
+        # (тому нужен consume_incubated_thought как incubated_thought_provider)
+        # и до телеграм-обработчиков (которым нужен GroqSTT).
+        # journal=social_memory: каждый поход в интернет откладывается в
+        # память сразу. Без этого веб-поиск внутри разговора не сохранялся
+        # НИГДЕ — результаты приходят модели TOOL-сообщением, а оно в таблицу
+        # `messages` не пишется (см. SocialInteractionKind.WEB_LOOKUP).
+        self._web_search_tool = WebSearchTool(journal=self._social_memory)
+        self._weather_tool = GetWeatherTool()
+        # Ключ Groq для STT не дублируется отдельным полем в конфиге — берётся
+        # из уже настроенных LLM-эндпоинтов, если явного переопределения нет
+        # (см. Settings.resolve_groq_api_key и докстринг SttSettings).
+        groq_api_key = settings.resolve_groq_api_key()
+        self._stt = GroqSTT(groq_api_key.get_secret_value()) if groq_api_key is not None else None
 
         # -- промпты -----------------------------------------------------
         templates_dir = settings.paths.base_dir / "efi" / "prompts" / "templates"
         self._prompt_loader = PromptLoader(templates_dir)
-        self._prompt_builder = EfiSystemPromptBuilder(self._prompt_loader, settings, self._rag, self._working_memory)
+        self._prompt_builder = EfiSystemPromptBuilder(
+            self._prompt_loader,
+            settings,
+            self._rag,
+            self._working_memory,
+            self._beliefs,
+            self._affinity,
+            self._people,
+        )
 
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
-        self._silence_monitor = SilenceMonitor(self._notification_manager)
+        self._silence_monitor = SilenceMonitor(self._notification_manager, quiet_hours=settings.quiet_hours)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
-        self._spontaneous_ping = SpontaneousPingScheduler(self._notification_manager, self._active_chat_candidates)
+        self._researcher = BackgroundResearcher(
+            templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
+        )
+        self._spontaneous_ping = SpontaneousPingScheduler(
+            self._notification_manager,
+            self._active_chat_candidates,
+            incubated_thought_provider=self._researcher.consume_incubated_thought,
+            quiet_hours=settings.quiet_hours,
+        )
+        self._organic_ping = OrganicPingGenerator(
+            self._notification_manager,
+            self._affinity,
+            importance_threshold=settings.life_engine.ping_importance_threshold,
+            quiet_hours=settings.quiet_hours,
+        )
+        self._life_engine = BackgroundLifeWorker(
+            self._curiosity,
+            self._web_search_tool,
+            self._rag,
+            self._llm_router,
+            self._organic_ping,
+            check_interval_seconds=settings.life_engine.check_interval_seconds,
+        )
+        self._busy_engine = BusyEngine(
+            self._working_memory,
+            self._affinity,
+            self._life_engine,
+            settings.busy_engine,
+            last_message_source=self._history,
+        )
 
         # -- telegram --------------------------------------------------------
         self._pyrogram_client = Client(
@@ -127,7 +250,32 @@ class EfiApp:
             workdir=str(settings.paths.session_path.parent),
         )
         self._telegram_client = TelegramClientWrapper(self._pyrogram_client, settings.humanizer)
+        # Оркестратор конструируется ДО обработчиков и воркеров: первым он
+        # нужен буферу входящих (снять устаревшую генерацию в момент приёма
+        # сообщения), вторым — чтобы обработка шла отменяемым таском.
+        self._orchestrator = ChatOrchestrator()
         self._typing_tracker = TypingTracker(ttl_seconds=settings.humanizer.debounce_typing_ttl_seconds)
+        # -- участие в сообществе (комментарии/треды) ------------------------
+        self._thread_state = ThreadStateStore(self._database)
+        self._community_interests = build_community_interests(self._database, templates_dir / "worldview.json")
+        self._channel_post_watcher = ChannelPostWatcher(
+            self._notification_manager,
+            settings.telegram,
+            settings.community,
+            self._community_interests,
+            self._thread_state,
+            self._social_memory,
+        )
+        self._random_comment_engager = RandomCommentEngager(
+            self._notification_manager,
+            self._pyrogram_client,
+            settings.telegram,
+            settings.community,
+            self._community_interests,
+            self._thread_state,
+            self._social_memory,
+        )
+
         self._telegram_handlers = TelegramEventHandlers(
             self._notification_manager,
             settings.telegram,
@@ -136,12 +284,15 @@ class EfiApp:
             settings.humanizer,
             self._typing_tracker,
             activity_recorder=self._silence_monitor,
-            read_receipt_sender=self._telegram_client,
+            affinity_recorder=self._affinity,
+            curiosity_recorder=self._curiosity,
+            organic_ping_recorder=self._organic_ping,
+            people_recorder=self._people,
+            stt=self._stt,
+            orchestrator=self._orchestrator,
         )
 
-        # -- инструменты -------------------------------------------------
-        self._web_search_tool = WebSearchTool()
-        self._weather_tool = GetWeatherTool()
+        # -- реестр инструментов -------------------------------------------------
         self._tool_registry = ToolRegistry()
         self._tool_registry.register_all(self._build_tools())
 
@@ -151,6 +302,11 @@ class EfiApp:
             RememberFactTool(self._facts),
             RecallFactTool(self._facts),
             RememberDiaryEntryTool(self._rag),
+            UpdateBeliefTool(self._beliefs),
+            UpdateSelfStateTool(self._working_memory),
+            RememberPromiseTool(self._working_memory),
+            CompletePromiseTool(self._working_memory),
+            RememberPersonTool(self._people),
             SendMessageTool(
                 self._telegram_client,
                 anti_repeat=self._anti_repeat,
@@ -177,20 +333,30 @@ class EfiApp:
 
     async def _active_chat_candidates(self) -> list[int]:
         """
-        Список чатов-кандидатов для спонтанного пинга.
+        Список чатов-кандидатов для спонтанного пинга: allowed_chats из
+        конфига, пересечённые с чатами, где реально было хоть одно
+        сообщение (efi.db.history_repository.SqliteHistoryRepository.
+        get_active_chat_ids).
 
-        TODO: как только появится полноценный реестр известных диалогов
-        (например, через Pyrogram get_dialogs, кэшируемый в efi/telegram/),
-        заменить на реальный источник. Сейчас — allowed_chats из конфига;
-        этого достаточно, чтобы функциональность была рабочей с первого дня.
+        Раньше отдавался «сырой» allowed_chats целиком. chat_id, который
+        туда попал (например, руками в behavior.toml), но с которым этот
+        Telegram-аккаунт ещё ни разу не обменивался сообщением, Pyrogram
+        локально не резолвит (peer неизвестен его storage) — попытка
+        send_message для такого чата падает изнутри Pyrogram KeyError'ом
+        ("ID not found: ...", resolve_peer/get_peer_by_id) на КАЖДОЙ
+        попытке пинга, без единого шанса на успех. Пересечение с историей —
+        дешёвая гарантия, что peer уже засветился хотя бы раз и кэш есть.
         """
-        return list(self._settings.telegram.allowed_chats)
+        allowed = set(self._settings.telegram.allowed_chats)
+        active = await self._history.get_active_chat_ids(since=_EPOCH)
+        return [chat_id for chat_id in active if chat_id in allowed]
 
     async def start(self) -> None:
         """Поднимает все подсистемы: Telegram-клиент, обработчики, воркеры, проактивные сервисы."""
         logger.info("app: starting")
 
         self._telegram_handlers.register(self._pyrogram_client)
+        self._channel_post_watcher.register(self._pyrogram_client)
         self._typing_tracker.register(self._pyrogram_client)
         await self._telegram_client.start()
 
@@ -202,35 +368,72 @@ class EfiApp:
                 tool_registry=self._tool_registry,
                 history=self._history,
                 system_prompt_builder=self._prompt_builder,
+                busy_engine=self._busy_engine,
                 main_role=TaskRole.MAIN,
-                fallback_notifier=self._telegram_client,
+                telegram=self._telegram_client,
                 history_limit=self._settings.memory.history_limit,
+                lifecycle=self._lifecycle,
+                social_memory=self._social_memory,
+                orchestrator=self._orchestrator,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 
         self._background_tasks.extend(
             [
-                asyncio.create_task(self._scheduler.run(), name="scheduler"),
-                asyncio.create_task(self._silence_monitor.run(), name="silence_monitor"),
-                asyncio.create_task(self._spontaneous_ping.run(), name="spontaneous_ping"),
-                asyncio.create_task(self._prompt_loader.watch(), name="prompt_loader_watch"),
-                asyncio.create_task(self._run_consolidation_loop(), name="diary_consolidation"),
+                self._spawn_supervised(self._scheduler.run(), name="scheduler"),
+                self._spawn_supervised(self._silence_monitor.run(), name="silence_monitor"),
+                self._spawn_supervised(self._spontaneous_ping.run(), name="spontaneous_ping"),
+                self._spawn_supervised(self._researcher.run(), name="background_researcher"),
+                self._spawn_supervised(self._life_engine.run(), name="life_engine"),
+                self._spawn_supervised(self._prompt_loader.watch(), name="prompt_loader_watch"),
+                self._spawn_supervised(self._run_consolidation_loop(), name="diary_consolidation"),
+                self._spawn_supervised(self._random_comment_engager.run(), name="random_comment_engager"),
             ]
         )
 
+        if self._settings.memory_pulse.enabled:
+            self._background_tasks.append(self._spawn_supervised(self._memory_pulse.run(), name="memory_pulse"))
+
         logger.info("app: started (%d workers, %d background services)", len(self._worker_tasks), len(self._background_tasks))
+
+    def _spawn_supervised(self, coro: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
+        """
+        Создаёт фоновую задачу с логированием её падения В МОМЕНТ падения.
+
+        Голый asyncio.create_task() для долгоживущего сервиса — тихая дыра:
+        если корутина упадёт (сбой БД, баг в цикле), задача просто перестаёт
+        существовать, а исключение всплывает либо на shutdown при gather(),
+        либо вообще только сборщиком мусора как "Task exception was never
+        retrieved". С точки зрения наблюдателя фоновый сервис молча
+        переставал работать, и в логах на этот счёт не было ничего.
+        """
+
+        def _log_failure(task: asyncio.Task[None]) -> None:
+            if task.cancelled():
+                return
+            exception = task.exception()
+            if exception is not None:
+                logger.error("app: background task %r died", name, exc_info=exception)
+
+        task = asyncio.create_task(coro, name=name)
+        task.add_done_callback(_log_failure)
+        return task
 
     async def _run_consolidation_loop(self) -> None:
         """
-        Программная (не диалоговая) консолидация памяти: автоматическое
-        пополнение дневника из недавней переписки (novelize_recent_history —
-        без него Diary никогда не заполняется сам по себе), dedup
-        существующих записей + сжатие старых записей в мемуары через LLM
-        (см. efi/memory/consolidation.py). Идёт своим отдельным ежедневным
-        расписанием, НЕ через NotificationManager — это обслуживание данных,
-        а не разговорный ответ модели. Дополняет, а не заменяет
-        "nightly_consolidation" ScheduledJob (та даёт личности повод
+        Ночное обслуживание корпуса памяти: подбор хвостов новеллизации,
+        dedup существующих записей + сжатие старых записей в мемуары через
+        LLM (см. efi/memory/consolidation.py). Идёт своим отдельным
+        ежедневным расписанием, НЕ через NotificationManager — это
+        обслуживание данных, а не разговорный ответ модели. Дополняет, а не
+        заменяет "nightly_consolidation" ScheduledJob (та даёт личности повод
         отрефлексировать день в разговорном формате).
+
+        Новеллизация здесь БОЛЬШЕ НЕ ОСНОВНОЙ путь пополнения дневника: по
+        ходу дня её делает efi.memory.pulse.MemoryPulse, эпизодами, сразу
+        после того, как разговор закончился. Ночью остаётся только то, до
+        чего пульс не добрался — чаты, где эпизод так и не закрылся, и, если
+        пульс выключен настройкой, вообще всё за сутки (прежнее поведение).
         """
         try:
             while True:
@@ -239,7 +442,17 @@ class EfiApp:
                 # Новеллизация — ПЕРВОЙ: она создаёт новые записи из дня, а
                 # dedup ниже заодно подчистит и их, если что-то похожее уже
                 # было записано вручную через remember_diary_entry за день.
-                novelized = await self._consolidator.novelize_recent_history(history=self._history, facts=self._facts)
+                # Под общим локом с пульсом: оба пути двигают одну и ту же
+                # отметку last_novelized_at, и без взаимного исключения могли
+                # бы прочитать её одновременно и разобрать одно окно дважды.
+                async with self._memory_pulse.novelization_lock:
+                    novelized = await self._consolidator.novelize_recent_history(
+                        history=self._history,
+                        facts=self._facts,
+                        lookback=timedelta(days=self._settings.memory.novelization_lookback_days),
+                        min_messages=self._settings.memory.novelization_min_messages,
+                        experience=self._social_memory,
+                    )
                 logger.info("app: nightly novelization saved %d new diary entries", novelized)
 
                 removed = await self._consolidator.deduplicate(
@@ -286,6 +499,12 @@ class EfiApp:
         # написал что-то за секунды до остановки) — сбрасываем в очередь,
         # а не молча теряем.
         await self._telegram_handlers.flush_pending()
+        # Запланированные, но ещё не сработавшие комментарии — снимаем:
+        # они спят минутами, и без отмены shutdown ждал бы их впустую.
+        await self._channel_post_watcher.cancel_pending()
+        # Активные генерации: недоговорённая серия бабблов не должна держать
+        # остановку на своих паузах между сообщениями.
+        await self._orchestrator.cancel_all()
 
         for task in self._background_tasks:
             task.cancel()
@@ -307,6 +526,8 @@ class EfiApp:
         await self._llm_router.aclose()
         await self._web_search_tool.aclose()
         await self._weather_tool.aclose()
+        if self._stt is not None:
+            await self._stt.aclose()
 
         logger.info("app: stopped")
 

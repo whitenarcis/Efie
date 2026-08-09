@@ -49,6 +49,13 @@ def is_chat_accessible(chat: ChatAccessInfo, telegram_settings: TelegramSettings
     if chat.is_owner:
         return True, None
 
+    # Чаты сообщества — ЯВНЫЙ opt-in владельца (telegram.community_chats):
+    # он сам перечислил, где Эфи участвует как обычный участник, поэтому
+    # lockdown их не закрывает. Всё, чего в этом списке нет, lockdown
+    # закрывает как раньше — список сужает исключение, а не отменяет режим.
+    if chat.chat_id in telegram_settings.community_chats:
+        return True, None
+
     if telegram_settings.lockdown_mode is LockdownMode.OWNER_ONLY:
         return False, AccessDeniedReason.LOCKDOWN_OWNER_ONLY
 

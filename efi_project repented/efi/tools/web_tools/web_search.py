@@ -25,7 +25,7 @@ instant-answer инфобоксы, как было в предыдущей ве�
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from bs4 import BeautifulSoup, Tag
@@ -33,6 +33,22 @@ from bs4 import BeautifulSoup, Tag
 from efi.tools.base import Tool, ToolContext
 
 logger = logging.getLogger(__name__)
+
+
+class SearchJournal(Protocol):
+    """
+    Куда откладывается сам факт похода в интернет. Конкретная реализация —
+    efi.memory.social_memory.SocialInteractionStore.
+
+    Протокол объявлен здесь, а не импортируется из memory/, намеренно:
+    инструмент не должен знать про подсистему памяти (см. принцип изоляции
+    инструментов в efi/tools/base.py) — ему достаточно знать, что кто-то
+    умеет принять «искала X, нашла Y».
+    """
+
+    async def record_web_lookup(
+        self, *, query: str, digest: str, chat_id: int | None = None, thread_id: int | None = None
+    ) -> int: ...
 
 _SEARCH_URL = "https://lite.duckduckgo.com/lite/"
 _REQUEST_TIMEOUT_SECONDS = 10.0
@@ -60,12 +76,13 @@ class WebSearchTool(Tool):
         "additionalProperties": False,
     }
 
-    def __init__(self, *, client: httpx.AsyncClient | None = None) -> None:
+    def __init__(self, *, client: httpx.AsyncClient | None = None, journal: SearchJournal | None = None) -> None:
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             timeout=httpx.Timeout(_REQUEST_TIMEOUT_SECONDS),
             headers={"User-Agent": _USER_AGENT},
         )
+        self._journal = journal
 
     async def aclose(self) -> None:
         if self._owns_client:
@@ -88,7 +105,31 @@ class WebSearchTool(Tool):
             return f"По запросу {query!r} ничего не нашлось."
 
         lines = [f"- {title}: {snippet} ({url})" for title, snippet, url in results[:_MAX_RESULTS]]
-        return "Результаты поиска:\n" + "\n".join(lines)
+        digest = "\n".join(lines)
+        await self._journal_lookup(query, digest, context)
+        return "Результаты поиска:\n" + digest
+
+    async def _journal_lookup(self, query: str, digest: str, context: ToolContext) -> None:
+        """
+        Откладывает поход в интернет в память. Пустой результат сюда не
+        доходит (см. вызывающую сторону): «ничего не нашлось» — не опыт.
+
+        Сбой журнала не должен превращаться в ошибку поиска: модель уже
+        получила результаты, и терять их из-за проблемы с записью в память —
+        худший из возможных обменов.
+        """
+        if self._journal is None:
+            return
+        thread_id = context.notification.payload.get("thread_id")
+        try:
+            await self._journal.record_web_lookup(
+                query=query,
+                digest=digest,
+                chat_id=context.chat_id,
+                thread_id=thread_id if isinstance(thread_id, int) else None,
+            )
+        except Exception:
+            logger.warning("web_search: failed to journal lookup for %r", query, exc_info=True)
 
 
 def _parse_results(html: str) -> list[tuple[str, str, str]]:
@@ -128,4 +169,4 @@ def _extract_snippet_near(link: Tag) -> str:
     return next_row.get_text(strip=True)[:_SNIPPET_MAX_LENGTH]
 
 
-__all__ = ["WebSearchTool"]
+__all__ = ["SearchJournal", "WebSearchTool"]
