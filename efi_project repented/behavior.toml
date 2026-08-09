@@ -19,10 +19,10 @@ personality_prompt = """
 """
 
 [telegram]
-api_id = 38386496
-api_hash = "REPLACEME"
-owner_id = 2129889949
-allowed_chats = [2129889949, -2041871692, -4404120219]
+api_id = HERE
+api_hash = ""
+owner_id = HERE
+allowed_chats = []
 # Каналы/группы обсуждений, где Эфи участвует как обычный участник сообщества.
 # ЯВНЫЙ opt-in: только эти чаты обходят lockdown_mode. Пустой список (по
 # умолчанию) = Эфи остаётся персональным ботом и никуда не выходит.
@@ -43,22 +43,22 @@ can_leave_chats = true
 degrade_to = "fast"
 
 [llm_roles.main.primary]
-base_url = "https://omnigoy.mooo.com/v1"
-api_key = "REPLACEME"
-model = "ollamacloud/gemma4:31b"
+base_url = ""
+api_key = ""
+model = ""
 timeout_seconds = 15.0
 
 [llm_roles.main.fallback]
-base_url = "https://omnigoy.mooo.com/v1"
-api_key = "REPLACEME"
-model = "ollamacloud/nemotron-3-super"
+base_url = ""
+api_key = ""
+model = ""
 timeout_seconds = 15.0
 
 # FAST — быстрые служебные вызовы вне критического пути ответа.
 [llm_roles.fast.primary]
-base_url = "https://omnigoy.mooo.com/v1"
-api_key = "REPLACEME"
-model = "ollamacloud/minimax-m3"
+base_url = ""
+api_key = ""
+model = ""
 timeout_seconds = 15.0
 
 # BACKGROUND — фоновая жизнь: новеллизация дневника, извлечение фактов,
@@ -67,15 +67,15 @@ timeout_seconds = 15.0
 # FAST (см. LLMRolesSettings.as_routes). Здесь таймаут заведомо больше —
 # эти задачи никого не заставляют ждать в чате.
 [llm_roles.background.primary]
-base_url = "https://omnigoy.mooo.com/v1"
-api_key = "REPLACEME"
-model = "ollamacloud/minimax-m3"
+base_url = ""
+api_key = ""
+model = ""
 timeout_seconds = 45.0
 
 [llm_roles.vision.primary]
-base_url = "https://api.groq.com/openai/v1"
-api_key = "REPLACEME"
-model = "qwen/qwen3.6-27b"
+base_url = ""
+api_key = ""
+model = ""
 timeout_seconds = 60.0
 
 [memory]
