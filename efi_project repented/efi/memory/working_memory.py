@@ -49,6 +49,11 @@ class WorkingMemorySnapshot(BaseModel):
 
     emotional_state: str = ""
     physical_state: str = ""
+    energy: float = Field(
+        default=0.7, ge=0.0, le=1.0,
+        description="Текущий уровень бодрости (0..1) — вход для efi.behavior.busy_engine.BusyEngine "
+        "(низкая энергия удлиняет ignore_delay перед ответом).",
+    )
     items: list[WorkingMemoryItem] = Field(default_factory=list)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -121,13 +126,16 @@ class WorkingMemory:
         *,
         emotional_state: str | None = None,
         physical_state: str | None = None,
+        energy: float | None = None,
     ) -> WorkingMemorySnapshot:
-        """Обновляет эмоциональное и/или физическое состояние персонажа."""
+        """Обновляет эмоциональное/физическое состояние и/или уровень энергии персонажа."""
         snapshot = await self.load()
         if emotional_state is not None:
             snapshot.emotional_state = emotional_state
         if physical_state is not None:
             snapshot.physical_state = physical_state
+        if energy is not None:
+            snapshot.energy = max(0.0, min(energy, 1.0))
         return await self.save(snapshot)
 
     async def add_item(self, text: str) -> WorkingMemoryItem:
@@ -155,6 +163,30 @@ class WorkingMemory:
         if 0 <= index < len(snapshot.items):
             snapshot.items[index].done = True
             await self.save(snapshot)
+
+    async def find_and_mark_done(self, text_query: str) -> WorkingMemoryItem | None:
+        """
+        Находит первый ОТКРЫТЫЙ пункт, чей текст содержит `text_query`
+        (регистронезависимая подстрока), и помечает его выполненным.
+        Возвращает найденный пункт, либо None, если подходящего не нашлось.
+
+        Текстовый поиск, а не индекс — предназначен для вызова инструментом
+        модели (efi.tools.memory_tools.manage_promises.CompletePromiseTool),
+        которой удобнее сослаться на обещание по смыслу, чем помнить его
+        порядковый номер в списке; для короткого списка из нескольких
+        открытых пунктов точного/подстрочного совпадения достаточно — тот же
+        компромисс "дёшево и без ML", что и у memory/tfidf_fallback.py.
+        """
+        query = text_query.strip().lower()
+        if not query:
+            return None
+        snapshot = await self.load()
+        for item in snapshot.items:
+            if not item.done and query in item.text.lower():
+                item.done = True
+                await self.save(snapshot)
+                return item
+        return None
 
     async def prune(self) -> int:
         """

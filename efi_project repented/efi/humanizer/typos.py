@@ -1,16 +1,22 @@
 """
 efi/humanizer/typos.py
 
-Генерация редких "человеческих" опечаток — замена буквы на соседнюю по
-раскладке клавиатуры, а не случайный символ (так на самом деле печатают
-люди). Использует HumanizerSettings.keyboard_neighbors (заполняется из
-behavior.toml, см. efi/config/schema.py); если он не задан — используется
-встроенная раскладка ЙЦУКЕН+QWERTY по умолчанию.
+Генерация редких "человеческих" опечаток — пост-обработка уже чистого текста
+от LLM перед отправкой (модель сама опечатки не имитирует, это осознанно
+отдельный, детерминированно тестируемый слой). Три равновероятных вида,
+имитирующих реальные ошибки набора текста, а не случайный шум:
+    - пропуск символа (не успела нажать клавишу);
+    - замена буквы на соседнюю по раскладке клавиатуры (промахнулась мимо
+      клавиши — использует HumanizerSettings.keyboard_neighbors, заполняется
+      из behavior.toml, см. efi/config/schema.py; если не задан — встроенная
+      раскладка ЙЦУКЕН+QWERTY по умолчанию);
+    - перестановка двух соседних букв (напечатала не в том порядке).
 """
 
 from __future__ import annotations
 
 import random
+from enum import Enum
 
 from efi.config.schema import HumanizerSettings
 
@@ -44,12 +50,26 @@ _DEFAULT_KEYBOARD_NEIGHBORS: dict[str, list[str]] = {
 }
 
 
+class TypoKind(str, Enum):
+    """Вид алгоритмической опечатки — см. докстринг модуля."""
+
+    SKIP = "skip"
+    NEIGHBOR = "neighbor"
+    TRANSPOSE = "transpose"
+
+
 def inject_typo(text: str, settings: HumanizerSettings) -> str:
     """
-    С вероятностью `settings.typo_probability` заменяет один случайный
-    буквенный символ текста на соседнюю по раскладке клавишу. Короткие тексты
-    (короче `typo_min_text_length`) не трогает — опечатка в короткой реплике
-    выглядит неестественно чаще, чем естественно.
+    С вероятностью `settings.typo_probability` (рекомендованный диапазон —
+    3-5%, см. HumanizerSettings.typo_probability) накладывает ОДНУ
+    случайно выбранную опечатку одного из трёх видов (TypoKind). Короткие
+    тексты (короче `typo_min_text_length`) не трогает — опечатка в короткой
+    реплике выглядит неестественно чаще, чем естественно.
+
+    Если для выбранного вида в тексте не нашлось подходящей позиции
+    (например, текст без единой известной буквы раскладки) — возвращает
+    текст как есть, не пытаясь силой применить другой вид: редкий частичный
+    промах не стоит того, чтобы усложнять эту в остальном простую функцию.
 
     Чистая функция (кроме обращения к random) — без I/O, легко тестируется
     отдельно от Worker'а/отправки сообщений.
@@ -60,17 +80,46 @@ def inject_typo(text: str, settings: HumanizerSettings) -> str:
         return text
 
     keyboard_neighbors = settings.keyboard_neighbors or _DEFAULT_KEYBOARD_NEIGHBORS
-    candidate_positions = [i for i, ch in enumerate(text) if ch.lower() in keyboard_neighbors]
-    if not candidate_positions:
-        return text
+    kind = random.choice(list(TypoKind))
 
-    position = random.choice(candidate_positions)
+    if kind is TypoKind.SKIP:
+        return _skip_character(text)
+    if kind is TypoKind.NEIGHBOR:
+        return _replace_with_neighbor(text, keyboard_neighbors)
+    return _transpose_adjacent(text)
+
+
+def _skip_character(text: str) -> str:
+    """Пропускает один случайный буквенный символ — как будто не успела нажать клавишу."""
+    positions = [i for i, ch in enumerate(text) if ch.isalpha()]
+    if not positions:
+        return text
+    position = random.choice(positions)
+    return text[:position] + text[position + 1 :]
+
+
+def _replace_with_neighbor(text: str, keyboard_neighbors: dict[str, list[str]]) -> str:
+    """Заменяет один случайный буквенный символ на соседнюю по раскладке клавишу."""
+    positions = [i for i, ch in enumerate(text) if ch.lower() in keyboard_neighbors]
+    if not positions:
+        return text
+    position = random.choice(positions)
     original_char = text[position]
     replacement = random.choice(keyboard_neighbors[original_char.lower()])
     if original_char.isupper():
         replacement = replacement.upper()
-
     return text[:position] + replacement + text[position + 1 :]
 
 
-__all__ = ["inject_typo"]
+def _transpose_adjacent(text: str) -> str:
+    """Меняет местами два соседних буквенных символа — как будто напечатала не в том порядке."""
+    positions = [i for i in range(len(text) - 1) if text[i].isalpha() and text[i + 1].isalpha()]
+    if not positions:
+        return text
+    position = random.choice(positions)
+    chars = list(text)
+    chars[position], chars[position + 1] = chars[position + 1], chars[position]
+    return "".join(chars)
+
+
+__all__ = ["TypoKind", "inject_typo"]

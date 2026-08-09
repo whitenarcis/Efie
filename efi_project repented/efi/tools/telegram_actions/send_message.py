@@ -18,14 +18,35 @@ efi/tools/telegram_actions/send_message.py
 Дополнительно уведомляет SilenceMonitor об исходящей активности — иначе
 собственные сообщения Эфи не засчитывались бы как "активность" в чате, и
 монитор тишины мог бы запинговать чат сразу после того, как она сама в нём написала.
+
+`context.extra["llm_generation_time"]` (если есть — кладёт туда
+efi.notifications.worker.Worker._run_with_tool_calls) прокидывается в
+send_message как есть: сколько реально заняла генерация ответа LLM до этого
+момента, чтобы TelegramClientWrapper мог зачесть это время как "печать"
+первого баббла (efi/humanizer/message_splitting.py::first_chunk_typing_delay)
+вместо того, чтобы наслаивать ещё одну искусственную паузу поверх уже
+прошедшего ожидания.
+
+Каждый успешно отправленный текст ЕЩЁ И накапливается в
+`context.extra["sent_texts"]` — это единственное место, где реально видно,
+что модель сказала собеседнику. Личность обязана вызывать этот инструмент
+как ПОСЛЕДНЕЕ действие хода (см. personality.md), поэтому финальный ответ
+LLM в цикле tool-calling (после TOOL-результата этого вызова) часто пустой
+или служебный ("готово") — если сохранять в историю именно его (как было
+раньше), персистентная память вообще не видела бы реального текста ответа
+Эфи. efi.notifications.worker.Worker читает `sent_texts` после цикла
+tool-calling и сохраняет ИХ, а не последнее сырое сообщение модели — см.
+Worker._handle.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Collection
 from typing import Any, Protocol
 
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.telegram.client import UnknownChatError
 from efi.tools.base import Tool, ToolContext
 
 logger = logging.getLogger(__name__)
@@ -34,7 +55,16 @@ logger = logging.getLogger(__name__)
 class MessageSender(Protocol):
     """Абстракция отправки сообщения. Конкретная реализация — efi.telegram.client.TelegramClientWrapper."""
 
-    async def send_message(self, chat_id: int, text: str, *, reply_to_message_id: int | None = None) -> None: ...
+    async def send_message(
+        self,
+        chat_id: int,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        llm_generation_time: float | None = None,
+        incoming_message_ids: Collection[int] = (),
+        on_bubble_sent: Callable[[str], None] | None = None,
+    ) -> None: ...
 
 
 class ActivityRecorder(Protocol):
@@ -102,7 +132,30 @@ class SendMessageTool(Tool):
             )
 
         reply_to_message_id = self._resolve_reply_target(arguments, context)
-        await self._sender.send_message(context.chat_id, text, reply_to_message_id=reply_to_message_id)
+        llm_generation_time = context.extra.get("llm_generation_time")
+        # sent_texts наполняется ПОБАББЛЬНО, а не одной строкой после успеха
+        # всей серии. Ход может быть снят как устаревший посреди отправки
+        # (efi/telegram/chat_orchestrator.py), и тогда история обязана знать
+        # ровно то, что собеседник успел прочитать: раньше при отмене на
+        # середине она не получала ничего, хотя половина ответа уже висела
+        # в чате, и следующая генерация повторяла сказанное.
+        delivered: list[str] = context.extra.setdefault("sent_texts", [])
+        try:
+            await self._sender.send_message(
+                context.chat_id,
+                text,
+                reply_to_message_id=reply_to_message_id,
+                llm_generation_time=llm_generation_time,
+                incoming_message_ids=self._incoming_message_ids(context),
+                on_bubble_sent=delivered.append,
+            )
+        except UnknownChatError:
+            # Штатная ситуация, а не сбой: этот аккаунт не видит такой чат
+            # (никогда в нём не был, его удалили, Эфи оттуда вышли). Раньше
+            # сюда прилетал сырой KeyError из недр Pyrogram и ToolRegistry
+            # печатал полный трейсбек как ERROR на каждой попытке пинга.
+            logger.warning("send_message: chat_id=%s is unreachable, dropping the message", context.chat_id)
+            return "error: this chat is not reachable — do not retry sending here"
 
         if self._anti_repeat is not None:
             self._anti_repeat.record(context.chat_id, text)
@@ -124,10 +177,20 @@ class SendMessageTool(Tool):
         """
         if not bool(arguments.get("reply_to_current", False)):
             return None
-        message_ids = context.notification.payload.get("telegram_message_ids")
-        if not message_ids:
-            return None
-        return int(message_ids[-1])
+        message_ids = self._incoming_message_ids(context)
+        return message_ids[-1] if message_ids else None
+
+    @staticmethod
+    def _incoming_message_ids(context: ToolContext) -> list[int]:
+        """
+        id сообщений текущей входящей пачки — область допустимых целей для
+        reply. Модель может привязать баббл к КОНКРЕТНОЙ реплике из пачки
+        тегом `[reply:id]` (см. efi/humanizer/reply_selector.py); всё, чего
+        в этом списке нет, снимается как выдумка — id старых сообщений ей
+        нигде не показываются, сослаться на них она не может.
+        """
+        raw = context.notification.payload.get("telegram_message_ids") or []
+        return [int(item) for item in raw]
 
 
 __all__ = ["MessageSender", "ActivityRecorder", "SendMessageTool"]

@@ -22,7 +22,11 @@ personality_prompt = """
 api_id = 38386496
 api_hash = "2ce23e6d116b9473b8026912448daed2"
 owner_id = 2129889949
-allowed_chats = [2129889949, -2060387666, -2041871692, -4404120219]
+allowed_chats = [2129889949, -2041871692, -4404120219]
+# Каналы/группы обсуждений, где Эфи участвует как обычный участник сообщества.
+# ЯВНЫЙ opt-in: только эти чаты обходят lockdown_mode. Пустой список (по
+# умолчанию) = Эфи остаётся персональным ботом и никуда не выходит.
+community_chats = []
 lockdown_mode = "owner_only"      # none | contacts_only | owner_only
 check_chats_on_startup = true
 can_join_chats = false
@@ -31,6 +35,10 @@ can_leave_chats = true
 # Основной провайдер инфраструктуры — OmniRoute; три роли (MAIN/FAST/VISION)
 # покрывают задачи разной "тяжести". См. efi/config/schema.py::LLMRolesSettings.
 
+# MAIN — ТОЛЬКО живой диалог в чате. Gemma здесь первой сознательно: она
+# заметно быстрее отвечает, а задержка ответа собеседнику критичнее качества
+# фоновой аналитики. nemotron оставлен резервом (он регулярно упирался в
+# таймаут 15с, из-за чего ответ уходил на второй круг по цепочке).
 [llm_roles.main]
 degrade_to = "fast"
 
@@ -38,19 +46,31 @@ degrade_to = "fast"
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
 model = "ollamacloud/gemma4:31b"
-timeout_seconds = 30.0
+timeout_seconds = 15.0
 
 [llm_roles.main.fallback]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
 model = "ollamacloud/nemotron-3-super"
-timeout_seconds = 30.0
+timeout_seconds = 15.0
 
+# FAST — быстрые служебные вызовы вне критического пути ответа.
 [llm_roles.fast.primary]
 base_url = "https://omnigoy.mooo.com/v1"
 api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
 model = "ollamacloud/minimax-m3"
-timeout_seconds = 30.0
+timeout_seconds = 15.0
+
+# BACKGROUND — фоновая жизнь: новеллизация дневника, извлечение фактов,
+# гипотезы/находки фоновых исследований, проактивные проверки. Секция
+# необязательная: если её не задать, роль автоматически использует маршрут
+# FAST (см. LLMRolesSettings.as_routes). Здесь таймаут заведомо больше —
+# эти задачи никого не заставляют ждать в чате.
+[llm_roles.background.primary]
+base_url = "https://omnigoy.mooo.com/v1"
+api_key = "sk-bd2fb98a6c86ce62-85f447-b6260a2"
+model = "ollamacloud/minimax-m3"
+timeout_seconds = 45.0
 
 [llm_roles.vision.primary]
 base_url = "https://api.groq.com/openai/v1"
@@ -63,6 +83,24 @@ plagiarism_threshold = 0.97
 min_relatedness = 0.80
 max_rag_results = 10
 # diary_dir можно не задавать — по умолчанию берётся paths.diary_dir
+novelization_min_messages = 3      # короткий, но содержательный обмен — тоже эпизод
+novelization_char_limit = 10000
+novelization_max_output_tokens = 2048
+
+# Пульс памяти (efi/memory/pulse.py) — как часто прожитое становится
+# воспоминанием. Раньше это происходило РОВНО ОДИН РАЗ в сутки, ночью: день
+# переписки до 03:30 не был памятью вообще, а перезапуск до этого часа
+# оставлял его неосмысленным. Теперь эпизод разбирается вскоре после того,
+# как разговор закончился, вместе с тем, что Эфи делала параллельно (гуглёж,
+# комментарии) — это и есть техническая форма «единой личности».
+# enabled = false вернёт прежнее поведение (только ночной проход).
+[memory_pulse]
+enabled = true
+check_interval_seconds = 600.0     # как часто смотреть, не закончился ли где эпизод
+episode_idle_seconds = 900.0       # 15 минут тишины = разговор закончен, пора запоминать
+max_messages_before_flush = 30     # длинный живой разговор разбираем частями, не дожидаясь паузы
+min_messages = 3
+lookback_hours = 12
 
 [humanizer]
 typing_wpm_min = 120
@@ -71,14 +109,51 @@ typing_thinking_pause_min_seconds = 1.0
 typing_thinking_pause_max_seconds = 2.2
 typing_delay_min_seconds = 1.8
 typing_delay_max_seconds = 7.0
-typo_probability = 0.15
+typo_probability = 0.04
 typo_min_text_length = 10
 anti_repeat_trigger_max = 0.95
 anti_repeat_trigger_avg = 0.85
 anti_repeat_max_history = 32
-max_messages_per_burst = 5
+
+# АВАРИЙНЫЙ потолок бабблов, а не нормальная длина ответа. Раньше стоял на 5
+# и работал как настоящий лимит: «поток мыслей» из 8 коротких реплик
+# схлопывался в 5, где последнее было слипшимся комом из остатка. Сколько
+# бабблов уместно, решает модель по правилам системного промпта.
+max_messages_per_burst = 12
+
+# Коротыш (1-3 слова) уходит почти встык. Обычный расчёт по WPM зажат снизу
+# typing_delay_min_seconds, из-за чего «а ты?» шло через две секунды, и серия
+# коротких реплик растягивалась на полминуты, читаясь как медленный бот.
+short_bubble_delay_min_seconds = 0.3
+short_bubble_delay_max_seconds = 0.8
+
+# Плавающее окно сборки входящих: каждое новое сообщение сдвигает его вперёд,
+# поэтому пачка коротких реплик подряд уходит в LLM одним входом.
+debounce_window_min_seconds = 1.5
+debounce_window_max_seconds = 2.5
 
 # Раскладка соседних клавиш для опечаток — необязательно, есть встроенный
 # дефолт (ЙЦУКЕН+QWERTY) в efi/humanizer/typos.py. Пример переопределения:
 # [humanizer.keyboard_neighbors]
 # а = ["к", "е", "в", "п", "с", "м"]
+
+# Блок текущего состояния личности (mood/social_distance/sycophancy_protection,
+# см. efi/prompts/builder.py) — необязательная секция, есть дефолты. Здесь
+# настраивается только жёсткая инструкция подавления угодливости; mood и
+# social_distance считаются на лету из efi/memory/beliefs.py и
+# efi/behavior/affinity.py.
+# [state_vector]
+# sycophancy_protection_text = "..."
+# relevant_beliefs_limit = 3
+
+# Поведение в сообществе (efi/telegram/comments.py). Сами чаты — в
+# telegram.community_chats выше; здесь только насколько охотно вписываться.
+# Дефолты сдержанные: участник, комментирующий каждый пост, — это спамер.
+[community]
+enabled = true
+comment_probability = 0.35        # шанс вписаться в подходящий по теме пост
+min_delay_seconds = 300.0         # 5 минут: живой человек не отвечает мгновенно
+max_delay_seconds = 1800.0        # ...и не позже получаса
+thread_scan_interval_seconds = 1800.0
+max_replies_per_thread = 1        # одна реплика за заход, а не проход по всей ветке
+topic_match_min_score = 0.34
