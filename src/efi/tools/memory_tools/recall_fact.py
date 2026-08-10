@@ -4,13 +4,20 @@ efi/tools/memory_tools/recall_fact.py
 Инструмент поиска фактов о сущности — точечного (по конкретному ключу) или
 полного (все факты про entity_id разом). Дополняет remember_fact.py: пишет
 туда, читает отсюда.
+
+Читает из строгого хранилища знаний (efi/memory/dedup.py::KnowledgeStore) —
+того же, куда пишет remember_fact после валидации. Вместе со значением
+возвращает и число подтверждений: «упомянуто 9 раз» — часть факта, а не
+служебная метрика, и без неё модель не отличает устойчивую черту от
+однажды услышанного.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from efi.memory.facts import FactStore
+from efi.memory.dedup import KnowledgeStore
+from efi.memory.validator import FactValidator
 from efi.tools.base import Tool, ToolContext
 
 
@@ -35,26 +42,33 @@ class RecallFactTool(Tool):
         "additionalProperties": False,
     }
 
-    def __init__(self, facts: FactStore) -> None:
-        self._facts = facts
+    def __init__(self, store: KnowledgeStore, validator: FactValidator) -> None:
+        self._store = store
+        self._validator = validator
 
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
-        entity_id = str(arguments.get("entity_id", "")).strip()
-        if not entity_id:
+        raw_entity = str(arguments.get("entity_id", "")).strip()
+        if not raw_entity:
             return "error: entity_id must not be empty"
 
-        key = arguments.get("key")
-        if key:
-            value = await self._facts.get(entity_id, str(key).strip())
-            if value is None:
-                return f"Факт {entity_id}.{key} не найден."
-            return f"{entity_id}.{key} = {value}"
+        # Через тот же нормализатор, что и запись: модель зовёт сущность то
+        # «Рома», то «user:625207005», то «я» — и без приведения к общему
+        # виду чтение промахивалось бы мимо собственной же записи.
+        entity_id = self._validator.normalize_entity_for_lookup(raw_entity)
+        facts = await self._store.recall(entity_ids=[entity_id], limit=30)
 
-        all_facts = await self._facts.get_all(entity_id)
-        if not all_facts:
-            return f"О {entity_id} пока ничего не известно."
-        lines = "\n".join(f"- {fact_key}: {fact_value}" for fact_key, fact_value in all_facts.items())
-        return f"Известные факты о {entity_id}:\n{lines}"
+        requested_key = str(arguments.get("key", "") or "").strip()
+        if requested_key:
+            normalized_key = self._validator.normalize_attribute_for_lookup(requested_key)
+            matching = [fact for fact in facts if fact.attribute == normalized_key]
+            if not matching:
+                return f"Факт {raw_entity}.{requested_key} не найден."
+            return "\n".join(fact.render_for_prompt() for fact in matching)
+
+        if not facts:
+            return f"О {raw_entity} пока ничего не известно."
+        lines = "\n".join(fact.render_for_prompt() for fact in facts)
+        return f"Известные факты о {raw_entity}:\n{lines}"
 
 
 __all__ = ["RecallFactTool"]

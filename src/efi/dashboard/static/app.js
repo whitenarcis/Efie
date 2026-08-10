@@ -552,6 +552,23 @@
     const query = state.memoryQuery || '';
     const data = await api('/api/memory', { q: query, limit: 200 });
 
+    const domainTitles = { C: 'о мире', P: 'о человеке', H: 'её опыт' };
+    const knowledge = (data.knowledge || []).map((fact) =>
+      row(
+        `<span class="mono">${esc(fact.entity_id)}</span> · ${esc(String(fact.attribute).replace(/_/g, ' '))}`,
+        `${esc(fact.value)}<br>домен ${esc(domainTitles[fact.domain] || fact.domain)} · впервые ${esc(fmtDateTime(fact.first_seen_at))}`,
+        `${fact.occurrence_count > 1 ? `<span class="tag ok">подтверждено ${num(fact.occurrence_count)}×</span>` : '<span class="tag mute">однажды</span>'} ${fixed(fact.confidence)}`,
+      ),
+    );
+
+    const rejections = (data.rejections || []).map((item) =>
+      row(
+        `${esc(item.entity_id || '—')} · ${esc(item.attribute || '—')}`,
+        `${esc(item.value || '')}<br>${esc(fmtDateTime(item.created_at))}`,
+        `<span class="tag warn">${esc(item.reason)}</span>`,
+      ),
+    );
+
     const facts = (data.facts || []).map((fact) =>
       row(
         `<span class="mono">${esc(fact.entity_id)}</span> · ${esc(fact.fact_key)}`,
@@ -609,7 +626,11 @@
         </div>
         <button class="ghost" id="memory-refresh" type="button">Обновить</button>
       </div>
-      ${title('Факты')}
+      ${title('Проверенные знания')}
+      ${rows(knowledge, 'Проверенных фактов пока нет')}
+      ${title('Отклонено на входе')}
+      ${rows(rejections, 'Отклонённых кандидатов нет')}
+      ${title('Служебные факты')}
       ${rows(facts, 'Фактов нет')}
       ${title('Семена любопытства')}
       ${rows(seeds, 'Любопытство пока ни за что не зацепилось')}

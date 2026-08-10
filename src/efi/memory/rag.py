@@ -32,6 +32,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Iterable
 
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMError
@@ -39,9 +40,13 @@ from efi.llm.router import LLMRouter
 from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata, DiaryQueryOptions, DiaryQueryResult, EmbeddingVector
 from efi.memory.diary import Diary
 from efi.memory.local_embeddings import LocalEmbeddingEngine
+from efi.memory.router import MemoryDomain, MemoryRouter
 from efi.memory.tfidf_fallback import TfidfFallbackIndex, should_use_tfidf_shortcut
 
 logger = logging.getLogger(__name__)
+
+#: Роутер без состояния — один на модуль, чтобы не плодить объекты на каждый поиск.
+_MEMORY_ROUTER = MemoryRouter()
 
 
 class RAGMemory:
@@ -70,7 +75,13 @@ class RAGMemory:
         self._local_embeddings = local_embeddings
         self._embedding_role = embedding_role
 
-    async def search(self, query_text: str, options: DiaryQueryOptions | None = None) -> list[DiaryQueryResult]:
+    async def search(
+        self,
+        query_text: str,
+        options: DiaryQueryOptions | None = None,
+        *,
+        domains: Iterable[MemoryDomain] | None = None,
+    ) -> list[DiaryQueryResult]:
         """
         Критический путь: короткие/фатические сообщения уходят в дешёвый
         TF-IDF напрямую (см. should_use_tfidf_shortcut), для остальных
@@ -78,17 +89,36 @@ class RAGMemory:
         модуля) и делается семантический поиск по Diary; если эмбеддинг
         получить не удалось никаким путём — деградирует до TF-IDF вместо
         того, чтобы пробрасывать исключение и срывать ответ пользователю.
+
+        `domains` сужает выборку до нужных доменов памяти (см.
+        efi/memory/router.py). Фильтр применяется ДО ранжирования, а не
+        после: иначе десять релевантных записей чужого домена вытеснили бы
+        своим сходством единственную нужную, и до неё бы просто не дошло.
+        None — без фильтрации (обратная совместимость и явный «ищи везде»).
         """
+        filter_fn = _MEMORY_ROUTER.diary_filter(domains) if domains is not None else None
+
         if should_use_tfidf_shortcut(query_text):
-            return await self._tfidf.search(query_text, options)
+            return await self._tfidf.search(query_text, options, filter_fn=filter_fn)
 
         query_embedding = await self._compute_embedding(query_text, is_query=True)
         if query_embedding is None:
-            return await self._tfidf.search(query_text, options)
+            return await self._tfidf.search(query_text, options, filter_fn=filter_fn)
 
-        return await self._diary.query(query_embedding, options)
+        return await self._diary.query(query_embedding, options, filter_fn=filter_fn)
 
-    async def remember(self, body: str, *, confidence: float = 0.0) -> DiaryEntry | None:
+    async def embed(self, text: str) -> EmbeddingVector | None:
+        """
+        Публичный доступ к тому же источнику эмбеддингов, которым пользуется
+        сам RAG. Нужен семантической дедупликации (efi/memory/dedup.py):
+        сравнивать факты вектором, полученным другим движком, чем дневник, —
+        значит сравнивать несравнимое.
+        """
+        return await self._compute_embedding(text, is_query=False)
+
+    async def remember(
+        self, body: str, *, confidence: float = 0.0, domain: MemoryDomain = MemoryDomain.HISTORY
+    ) -> DiaryEntry | None:
         """
         Добавляет новую запись в долгосрочную память: считает эмбеддинг,
         проверяет на дубль/плагиат (Diary.is_duplicate_of, аналог
@@ -110,7 +140,11 @@ class RAGMemory:
             logger.warning(
                 "rag: no embedding available for new entry (local and cloud both failed), storing without one"
             )
-            entry = DiaryEntry(id=_generate_entry_id(), metadata=DiaryEntryMetadata(confidence=confidence), body=body)
+            entry = DiaryEntry(
+                id=_generate_entry_id(),
+                metadata=DiaryEntryMetadata(confidence=confidence, domain=domain.value),
+                body=body,
+            )
             await self._diary.save(entry)
             await self._tfidf.add(entry)
             return entry
@@ -126,7 +160,7 @@ class RAGMemory:
 
         entry = DiaryEntry(
             id=_generate_entry_id(),
-            metadata=DiaryEntryMetadata(confidence=confidence, embedding=embedding),
+            metadata=DiaryEntryMetadata(confidence=confidence, embedding=embedding, domain=domain.value),
             body=body,
         )
         await self._diary.save(entry)

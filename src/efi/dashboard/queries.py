@@ -58,6 +58,8 @@ async def table_counts(database: Database) -> dict[str, int]:
         "social_interactions",
         "conversation_state",
         "thread_state",
+        "knowledge_facts",
+        "knowledge_rejections",
     )
     selects = " UNION ALL ".join(f"SELECT '{table}' AS name, COUNT(*) AS total FROM {table}" for table in tables)
     rows = await database.fetch_all(selects)
@@ -145,6 +147,48 @@ async def facts(database: Database, *, limit: int = 200, query: str = "") -> lis
         LIMIT ?
         """,
         (*params, _limit(limit, 200)),
+    )
+    return _rows_to_dicts(rows)
+
+
+async def knowledge_facts(database: Database, *, limit: int = 200, query: str = "") -> list[dict[str, Any]]:
+    """
+    Строгое хранилище знаний (efi/memory/dedup.py).
+
+    Сортировка по числу подтверждений, а не по свежести: витрина должна
+    первым делом показывать то, что Эфи считает устойчивым, — именно это
+    уезжает в промпт и определяет её поведение.
+    """
+    condition = ""
+    params: tuple[Any, ...] = ()
+    if query:
+        condition = "WHERE entity_id LIKE ? OR attribute LIKE ? OR value LIKE ?"
+        pattern = f"%{query}%"
+        params = (pattern, pattern, pattern)
+    rows = await database.fetch_all(
+        f"""
+        SELECT id, domain, entity_id, attribute, value, confidence, occurrence_count,
+               source, first_seen_at, last_seen_at
+        FROM knowledge_facts
+        {condition}
+        ORDER BY occurrence_count DESC, last_seen_at DESC
+        LIMIT ?
+        """,
+        (*params, _limit(limit, 200)),
+    )
+    return _rows_to_dicts(rows)
+
+
+async def knowledge_rejections(database: Database, *, limit: int = 100) -> list[dict[str, Any]]:
+    """Что модель предлагала запомнить, а валидатор не пропустил — витрина границы доверия."""
+    rows = await database.fetch_all(
+        """
+        SELECT id, domain, entity_id, attribute, value, reason, source, created_at
+        FROM knowledge_rejections
+        ORDER BY created_at DESC
+        LIMIT ?
+        """,
+        (_limit(limit, 100),),
     )
     return _rows_to_dicts(rows)
 
@@ -273,6 +317,8 @@ __all__ = [
     "conversation_states",
     "curiosity_seeds",
     "facts",
+    "knowledge_facts",
+    "knowledge_rejections",
     "messages",
     "messages_per_day",
     "people",

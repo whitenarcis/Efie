@@ -25,6 +25,7 @@ from typing import Any
 from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
+from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
@@ -46,14 +47,18 @@ from efi.humanizer.anti_repeat import AntiRepeatTracker
 from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
+from efi.memory.dedup import KnowledgeStore
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
+from efi.memory.ingest import MemoryIngestor
 from efi.memory.local_embeddings import LocalEmbeddingEngine
+from efi.memory.parser import PerceptionParser
 from efi.memory.people import PeopleStore
 from efi.memory.pulse import MemoryPulse
 from efi.memory.rag import RAGMemory
 from efi.memory.social_memory import SocialInteractionStore
 from efi.memory.tfidf_fallback import TfidfFallbackIndex
+from efi.memory.validator import FactValidator
 from efi.memory.working_memory import WorkingMemory
 from efi.notifications.manager import NotificationManager
 from efi.notifications.worker import Worker
@@ -147,6 +152,20 @@ class EfiApp:
         self._rag = RAGMemory(self._diary, self._llm_router, self._tfidf, local_embeddings=self._local_embeddings)
         self._working_memory = WorkingMemory(settings.paths.data_dir / "working_memory.json")
         self._facts = FactStore(self._database)
+        # -- строгое хранилище знаний (границы доверия + домены C/P/H) --------
+        # Собирается ЗДЕСЬ, сразу за RAG: дедупликации нужен тот же источник
+        # эмбеддингов, что и дневнику (сравнивать факты вектором другого
+        # движка — значит сравнивать несравнимое, см. efi/memory/dedup.py).
+        self._knowledge = KnowledgeStore(self._database, embedder=self._rag)
+        self._fact_validator = FactValidator(owner_id=settings.telegram.owner_id)
+        self._perception = PerceptionParser(self._llm_router)
+        self._pending_clarifications = PendingClarifications()
+        self._memory_ingestor = MemoryIngestor(
+            self._perception,
+            self._fact_validator,
+            self._knowledge,
+            pending=self._pending_clarifications,
+        )
         self._history = SqliteHistoryRepository(self._database)
         self._consolidator = DiaryConsolidator(
             self._diary,
@@ -224,6 +243,7 @@ class EfiApp:
             self._beliefs,
             self._affinity,
             self._people,
+            knowledge=self._knowledge,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -360,8 +380,8 @@ class EfiApp:
     def _build_tools(self) -> list[Tool]:
         return [
             AskDiaryTool(self._rag, min_relatedness=self._settings.memory.min_relatedness),
-            RememberFactTool(self._facts),
-            RecallFactTool(self._facts),
+            RememberFactTool(self._knowledge, self._fact_validator),
+            RecallFactTool(self._knowledge, self._fact_validator),
             RememberDiaryEntryTool(self._rag),
             UpdateBeliefTool(self._beliefs),
             UpdateSelfStateTool(self._working_memory),

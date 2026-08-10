@@ -11,7 +11,12 @@ efi/db/models.py
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import aiosqlite
+
+#: DDL хранилища знаний живёт отдельным файлом — см. _migration_011_knowledge.
+_SCHEMA_SQL_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 _MESSAGES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -180,6 +185,65 @@ async def _migration_010_thread_state(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_THREAD_STATE_SCHEMA)
 
 
+async def _migration_011_knowledge(conn: aiosqlite.Connection) -> None:
+    """
+    Строгое хранилище знаний — DDL лежит в efi/db/schema.sql (см. его шапку
+    про домены C/P/H и про то, почему оно вынесено в отдельный файл).
+    """
+    await conn.executescript(_SCHEMA_SQL_PATH.read_text(encoding="utf-8"))
+
+
+#: Домен по умолчанию для каждой таблицы памяти, у которой его исторически не
+#: было. Значения выбраны по природе таблицы, а не «чтобы не было NULL»:
+#:   facts               — тройки о сущностях, то есть модель людей -> 'P';
+#:   beliefs             — взгляды на мир; про людей их пишет PeopleStore и
+#:                         сам проставляет 'P' -> по умолчанию 'C';
+#:   social_interactions — журнал прожитого Эфи опыта -> всегда 'H';
+#:   curiosity_seeds     — «хочу разобраться в теме», знание о мире -> 'C'.
+#:
+#: Таблиц `people`, `chat_affinity`, `conversation_state`, `thread_state`
+#: здесь намеренно нет: это не память о содержании, а состояние отношений и
+#: поведения. Их домен постоянен по построению ('P' у первых двух), и колонка
+#: с одним и тем же значением в каждой строке ничего бы не давала ни поиску,
+#: ни фильтрации — только создавала бы вид, что он там варьируется.
+_DOMAIN_DEFAULTS = {
+    "facts": "P",
+    "beliefs": "C",
+    "social_interactions": "H",
+    "curiosity_seeds": "C",
+}
+
+
+async def _migration_012_memory_domains(conn: aiosqlite.Connection) -> None:
+    """
+    Добавляет обязательный `domain` в таблицы памяти, созданные до появления
+    доменной маршрутизации.
+
+    Через ALTER TABLE с ручной проверкой наличия колонки, а не через
+    CREATE TABLE IF NOT EXISTS: у людей уже есть базы с накопленным дневником
+    и историей, и пересоздавать таблицы ради новой колонки означало бы либо
+    потерю данных, либо миграцию с копированием — несоразмерно тому, что
+    ALTER TABLE ADD COLUMN в SQLite мгновенен и не переписывает файл.
+    `ADD COLUMN` не идемпотентен (второй раз падает с "duplicate column
+    name"), поэтому наличие колонки проверяется через PRAGMA.
+    """
+    for table, default_domain in _DOMAIN_DEFAULTS.items():
+        if await _has_column(conn, table, "domain"):
+            continue
+        await conn.execute(
+            f"ALTER TABLE {table} ADD COLUMN domain TEXT NOT NULL DEFAULT '{default_domain}'"  # noqa: S608
+        )
+        await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_domain ON {table} (domain)")
+
+
+async def _has_column(conn: aiosqlite.Connection, table: str, column: str) -> bool:
+    # Имя таблицы подставляется в SQL текстом: PRAGMA не принимает параметры,
+    # а сами имена — литералы из _DOMAIN_DEFAULTS, а не внешний ввод.
+    async with conn.execute(f"PRAGMA table_info({table})") as cursor:  # noqa: S608
+        rows = await cursor.fetchall()
+    return any(row[1] == column for row in rows)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -192,6 +256,8 @@ MIGRATIONS = [
     _migration_008_social_interactions,
     _migration_009_conversation_state,
     _migration_010_thread_state,
+    _migration_011_knowledge,
+    _migration_012_memory_domains,
 ]
 
 __all__ = ["MIGRATIONS"]

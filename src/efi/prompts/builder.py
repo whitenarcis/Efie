@@ -60,8 +60,10 @@ from efi.behavior.affinity import (
 from efi.config.schema import LockdownMode, Settings
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
 from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
+from efi.memory.dedup import KnowledgeStore, StoredFact, render_facts_block
 from efi.memory.people import PeopleStore, PersonProfile
 from efi.memory.rag import RAGMemory
+from efi.memory.router import MemoryDomain, MemoryRouter
 from efi.memory.working_memory import WorkingMemory, WorkingMemorySnapshot
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
@@ -163,6 +165,7 @@ class EfiSystemPromptBuilder:
         beliefs: BeliefStore,
         affinity: AffinityTracker,
         people: PeopleStore | None = None,
+        knowledge: KnowledgeStore | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -171,12 +174,21 @@ class EfiSystemPromptBuilder:
         self._beliefs = beliefs
         self._affinity = affinity
         self._people = people
+        self._knowledge = knowledge
+        #: Без состояния — один на билдер, см. efi/memory/router.py.
+        self._memory_router = MemoryRouter()
 
     async def build(self, notification: Notification, history: Session) -> str:
         """
         Критический путь: все источники, кроме `history` (уже готова к этому
         моменту — см. докстринг модуля), читаются конкурентно (asyncio.gather).
         """
+        # Какие домены памяти вообще уместны под этот повод — решает
+        # MemoryRouter (см. efi/memory/router.py). Без этого на технический
+        # вопрос всплывали воспоминания о позапрошлом вторнике просто потому,
+        # что они оказались близки по вектору.
+        domains = self._memory_router.domains_for_message(notification.message, notification.type)
+
         personality_task = self._get_personality_text()
         rag_task = self._rag.search(
             notification.message,
@@ -184,7 +196,9 @@ class EfiSystemPromptBuilder:
                 max_entry_count=self._settings.memory.max_rag_results,
                 min_relatedness=self._settings.memory.min_relatedness,
             ),
+            domains=domains,
         )
+        knowledge_task = self._resolve_knowledge(notification, domains)
         working_memory_task = self._working_memory.load()
         beliefs_task = self._beliefs.find_relevant(
             notification.message, limit=self._settings.state_vector.relevant_beliefs_limit
@@ -192,6 +206,10 @@ class EfiSystemPromptBuilder:
         affinity_task = self._resolve_affinity_snapshot(notification)
         person_task = self._resolve_person_profile(notification)
 
+        # Вложенный gather, а не один на семь задач: у asyncio.gather
+        # перегрузки с точными типами заканчиваются на шести аргументах, и
+        # седьмой превращает результат в список union'ов — тайпчекер после
+        # этого перестаёт видеть, что где лежит. Конкурентность при этом та же.
         (
             personality,
             rag_results,
@@ -199,8 +217,16 @@ class EfiSystemPromptBuilder:
             relevant_beliefs,
             affinity_snapshot,
             person_profile,
-        ) = await asyncio.gather(
-            personality_task, rag_task, working_memory_task, beliefs_task, affinity_task, person_task
+        ), known_facts = await asyncio.gather(
+            asyncio.gather(
+                personality_task,
+                rag_task,
+                working_memory_task,
+                beliefs_task,
+                affinity_task,
+                person_task,
+            ),
+            knowledge_task,
         )
 
         rendered_personality = _render_personality_template(
@@ -224,10 +250,46 @@ class EfiSystemPromptBuilder:
                 relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
             ),
             _build_behavioral_overrides_block(history, notification.message),
+            render_facts_block(known_facts),
             _build_rag_block(rag_results),
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    async def _resolve_knowledge(
+        self, notification: Notification, domains: tuple[MemoryDomain, ...]
+    ) -> list[StoredFact]:
+        """
+        Проверенные факты под этот повод — только те домены, что уместны, и
+        только про тех, кто участвует в разговоре.
+
+        Сужение по сущностям обязательно: без него в промпт уезжали бы самые
+        часто подтверждённые факты вообще обо всех, и разговор с одним
+        человеком тянул бы за собой привычки другого. Домен C сущностью не
+        ограничивается — знание о мире ничьё.
+        """
+        if self._knowledge is None:
+            return []
+
+        entity_ids: list[str] = []
+        sender_id = notification.payload.get("sender_id")
+        if isinstance(sender_id, int):
+            entity_ids.append(f"user:{sender_id}")
+        entity_ids.append("self")
+
+        personal_domains = [domain for domain in domains if domain is not MemoryDomain.COMMON]
+        try:
+            facts: list[StoredFact] = []
+            if personal_domains:
+                facts.extend(await self._knowledge.recall(entity_ids=entity_ids, domains=personal_domains, limit=8))
+            if MemoryDomain.COMMON in domains:
+                facts.extend(await self._knowledge.recall(domains=[MemoryDomain.COMMON], limit=4))
+            return facts
+        except Exception:
+            # Блок фактов — приятное дополнение, а не условие ответа: сбой
+            # чтения не должен срывать генерацию (тот же принцип, что у RAG).
+            logger.warning("prompts: не удалось прочитать проверенные факты", exc_info=True)
+            return []
 
     def _is_secondary_user(self, notification: Notification) -> bool:
         """Посторонний ли пишет — по тому же критерию, что и efi.behavior.conversation_lifecycle."""

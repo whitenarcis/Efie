@@ -307,6 +307,15 @@ class DiaryEntryMetadata(BaseModel):
     last_used: datetime | None = Field(default=None, description="None означает «запись ещё ни разу не использовалась»")
     usage_count: int = Field(default=0, ge=0)
     embedding: EmbeddingVector = Field(default_factory=list)
+    domain: str = Field(
+        default="H",
+        description=(
+            "Домен памяти записи: 'C' — знание о мире, 'P' — модель человека, 'H' — личный эпизодический "
+            "опыт (см. efi/memory/router.py). Дефолт 'H' не случаен: именно эпизодическим опытом дневник "
+            "был целиком до появления доменов, поэтому записи, созданные раньше, читаются как H и не "
+            "исчезают из выдачи после обновления."
+        ),
+    )
     created_at: datetime = Field(
         default_factory=lambda: datetime.now(UTC),
         description=(

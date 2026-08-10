@@ -617,9 +617,20 @@ def _preview(body: str) -> str:
 async def build_memory(context: DashboardContext, *, limit: int = 100, query: str = "") -> dict[str, Any]:
     """Факты, семена любопытства, журнал внешнего опыта и состояния диалогов — одним снимком."""
     if context.database is None:
-        return {"facts": [], "seeds": [], "social": [], "conversations": [], "threads": [], "tasks": []}
+        return {
+            "knowledge": [],
+            "rejections": [],
+            "facts": [],
+            "seeds": [],
+            "social": [],
+            "conversations": [],
+            "threads": [],
+            "tasks": [],
+        }
 
-    facts, seeds, social, conversations, threads, tasks = await asyncio.gather(
+    knowledge, rejections, facts, seeds, social, conversations, threads, tasks = await asyncio.gather(
+        queries.knowledge_facts(context.database, limit=limit, query=query),
+        queries.knowledge_rejections(context.database, limit=limit),
         queries.facts(context.database, limit=limit, query=query),
         queries.curiosity_seeds(context.database, limit=limit),
         queries.social_interactions(context.database, limit=limit),
@@ -632,6 +643,8 @@ async def build_memory(context: DashboardContext, *, limit: int = 100, query: st
     for row in tasks:
         row["chat_label"] = _chat_label(context, row["chat_id"])
     return {
+        "knowledge": knowledge,
+        "rejections": rejections,
         "facts": facts,
         "seeds": seeds,
         "social": social,
