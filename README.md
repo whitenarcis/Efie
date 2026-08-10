@@ -302,8 +302,7 @@ Cooldown ключуется по паре `(base_url, model)`, а не по пр
 git clone https://github.com/whitenarcis/Efie.git
 cd Efie
 python3 -m venv .venv
-bash --rcfile ./.venv/bin/activate
-pip install -e "./src[dev,local-embeddings]"
+.venv/bin/pip install -e ".[dev,local-embeddings]"
 ```
 #### Отредактируйте значения для Telegram в behavior.toml
 ```bash
@@ -319,7 +318,7 @@ nano src/behavior.toml
 
 #### Запуск
 ```
-python src/scripts/run.py --log-level INFO
+.venv/bin/python scripts/run.py --log-level INFO
 ```
 
 Конфиг читается строго из `behavior.toml` в корне проекта. Секреты лучше
@@ -333,13 +332,12 @@ python src/scripts/run.py --log-level INFO
 
 ```powershell
 git clone https://github.com/whitenarcis/Efie.git
-cd "Efie"
-
+cd Efie
 py -3.11 -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -e ".[dev,local-embeddings]"
-
-python scripts\run.py --log-level INFO
+```
+```
+.\.venv\Scripts\pip.exe install -e ".[dev,local-embeddings]"
+.\.venv\Scripts\python.exe scripts\run.py --log-level INFO
 ```
 
 Особенности:
@@ -357,14 +355,15 @@ python scripts\run.py --log-level INFO
 вибрации.
 
 ```bash
-pkg update && pkg upgrade
-pkg install python git binutils
+pkg update && pkg upgrade -y
+pkg install python git clang make rust libffi openssl libjpeg-turbo
 
-git clone <repo-url>
-cd "efi_project repented"
+git clone https://github.com/whitenarcis/Efie.git
+cd Efie
 
-pip install -e ".[dev]"
-python scripts/run.py --log-level INFO
+python -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/python scripts/run.py --log-level INFO
 ```
 
 Особенности:
