@@ -318,7 +318,7 @@ nano src/behavior.toml
 
 #### Запуск
 ```
-.venv/bin/python scripts/run.py --log-level INFO
+.venv/bin/python src/scripts/run.py --log-level INFO
 ```
 
 Конфиг читается строго из `behavior.toml` в корне проекта. Секреты лучше
