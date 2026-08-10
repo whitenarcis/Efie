@@ -31,6 +31,7 @@ from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
+from efi.behavior.reminders import ReminderScheduler, ReminderStore
 from efi.behavior.researcher import BackgroundResearcher
 from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
 from efi.behavior.silence_monitor import SilenceMonitor
@@ -250,6 +251,11 @@ class EfiApp:
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
         self._silence_monitor = SilenceMonitor(self._notification_manager, quiet_hours=settings.quiet_hours)
+        # Отложенные напоминания («напиши мне через 10 минут»). Персистентные:
+        # обещание со сроком обязано пережить перезапуск, иначе оно тихо
+        # исчезает ровно тогда, когда человек на него рассчитывает.
+        self._reminders = ReminderStore(self._database)
+        self._reminder_scheduler = ReminderScheduler(self._notification_manager, self._reminders)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
         self._researcher = BackgroundResearcher(
             templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
@@ -385,8 +391,14 @@ class EfiApp:
             RememberDiaryEntryTool(self._rag),
             UpdateBeliefTool(self._beliefs),
             UpdateSelfStateTool(self._working_memory),
-            RememberPromiseTool(self._working_memory),
-            CompletePromiseTool(self._working_memory),
+            RememberPromiseTool(
+                self._working_memory,
+                reminders=self._reminders,
+                # Проверяем право написать первой В МОМЕНТ ОБЕЩАНИЯ: пообещать
+                # и не смочь хуже, чем сразу честно предупредить.
+                can_schedule=self._lifecycle.allows_proactive_ping_to_chat,
+            ),
+            CompletePromiseTool(self._working_memory, reminders=self._reminders),
             RememberPersonTool(self._people),
             SendMessageTool(
                 self._telegram_client,
@@ -460,6 +472,7 @@ class EfiApp:
                 lifecycle=self._lifecycle,
                 social_memory=self._social_memory,
                 orchestrator=self._orchestrator,
+                promises=self._working_memory,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 
@@ -473,6 +486,7 @@ class EfiApp:
                 self._spawn_supervised(self._prompt_loader.watch(), name="prompt_loader_watch"),
                 self._spawn_supervised(self._run_consolidation_loop(), name="diary_consolidation"),
                 self._spawn_supervised(self._random_comment_engager.run(), name="random_comment_engager"),
+                self._spawn_supervised(self._reminder_scheduler.run(), name="reminders"),
             ]
         )
 

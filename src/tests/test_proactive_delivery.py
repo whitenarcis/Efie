@@ -108,7 +108,11 @@ class _SendingRouter:
 
 
 def _make_worker(
-    tmp_path: Path, *, router: _SendingRouter | None = None, allowed_chats: tuple[int, ...] = (_ALLOWED_GROUP_ID,)
+    tmp_path: Path,
+    *,
+    router: _SendingRouter | None = None,
+    allowed_chats: tuple[int, ...] = (_ALLOWED_GROUP_ID,),
+    promises: object | None = None,
 ) -> tuple[Worker, _RecordingSendTool, _FakeHistory]:
     database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
     lifecycle = ConversationLifecycle(database, owner_id=_OWNER_ID, proactive_chats=allowed_chats)
@@ -125,6 +129,7 @@ def _make_worker(
         system_prompt_builder=_FakePromptBuilder(),  # type: ignore[arg-type]
         busy_engine=_FakeBusyEngine(),  # type: ignore[arg-type]
         lifecycle=lifecycle,
+        promises=promises,  # type: ignore[arg-type]
     )
     return worker, send_tool, history
 
@@ -244,3 +249,66 @@ def test_lifecycle_allows_only_owner_and_configured_chats(tmp_path: Path) -> Non
     # Явный отправитель важнее чата — в обе стороны.
     assert lifecycle.allows_proactive_ping_to_chat(_STRANGER_CHAT_ID, _OWNER_ID) is True
     assert lifecycle.allows_proactive_ping_to_chat(_ALLOWED_GROUP_ID, 505) is False
+
+
+# -- закрытие обещания после доставки напоминания ----------------------------
+
+
+async def test_delivered_follow_up_closes_the_promise(tmp_path: Path) -> None:
+    """
+    Замыкание цикла: сработало напоминание -> сообщение ушло -> обещание
+    закрыто. Раньше обещание висело в состоянии навсегда, даже когда всё
+    остальное отрабатывало.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from efi.memory.working_memory import WorkingMemory
+
+    working_memory = WorkingMemory(tmp_path / "wm.json")
+    await working_memory.add_item(
+        "написать про собеседование", due_at=datetime.now(UTC) + timedelta(minutes=10), chat_id=_OWNER_ID
+    )
+
+    worker, send_tool, _history = _make_worker(tmp_path, promises=working_memory)
+    await worker._handle(
+        Notification(
+            type=NotificationType.FOLLOW_UP,
+            chat_id=_OWNER_ID,
+            message="пора написать",
+            payload={"promise_text": "написать про собеседование", "reminder_id": 1},
+        )
+    )
+
+    assert send_tool.sent, "напоминание обязано дойти до собеседника"
+    assert (await working_memory.load()).items[0].done is True
+
+
+async def test_undelivered_follow_up_keeps_the_promise_open(tmp_path: Path) -> None:
+    """
+    Модель промолчала — значит, обещание НЕ выполнено. Закрыть его здесь
+    значило бы записать невыполненное как сделанное, и человек не получил бы
+    ни сообщения, ни следа о том, что она задолжала.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from efi.memory.working_memory import WorkingMemory
+
+    working_memory = WorkingMemory(tmp_path / "wm.json")
+    await working_memory.add_item(
+        "написать про собеседование", due_at=datetime.now(UTC) + timedelta(minutes=10), chat_id=_OWNER_ID
+    )
+
+    worker, send_tool, _history = _make_worker(
+        tmp_path, router=_SendingRouter(calls_tool=False), promises=working_memory
+    )
+    await worker._handle(
+        Notification(
+            type=NotificationType.FOLLOW_UP,
+            chat_id=_OWNER_ID,
+            message="пора написать",
+            payload={"promise_text": "написать про собеседование"},
+        )
+    )
+
+    assert send_tool.sent == []
+    assert (await working_memory.load()).items[0].done is False

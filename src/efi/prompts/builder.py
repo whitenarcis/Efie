@@ -64,7 +64,7 @@ from efi.memory.dedup import KnowledgeStore, StoredFact, render_facts_block
 from efi.memory.people import PeopleStore, PersonProfile
 from efi.memory.rag import RAGMemory
 from efi.memory.router import MemoryDomain, MemoryRouter
-from efi.memory.working_memory import WorkingMemory, WorkingMemorySnapshot
+from efi.memory.working_memory import WorkingMemory, WorkingMemoryItem, WorkingMemorySnapshot
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
@@ -545,10 +545,32 @@ def _build_working_memory_block(snapshot: WorkingMemorySnapshot) -> str:
         )
     open_items = [item for item in snapshot.items if not item.done]
     if open_items:
-        parts.append("открытые задачи/обещания:\n" + "\n".join(f"  - {item.text}" for item in open_items))
+        parts.append("открытые задачи/обещания:\n" + "\n".join(f"  - {_render_promise(item)}" for item in open_items))
     if not parts:
         return ""
     return "[Текущее состояние]\n" + "\n".join(parts)
+
+
+def _render_promise(item: WorkingMemoryItem) -> str:
+    """
+    Обещание со сроком — вместе со сроком.
+
+    Просроченное помечается отдельно: напоминание могло сработать и не
+    дойти (модель промолчала, провайдер лёг), и тогда единственный шанс
+    выполнить обещание — чтобы Эфи увидела его в промпте и вспомнила сама
+    при следующем же обмене репликами. Без пометки строка выглядит как
+    обычный пункт списка, и повода спохватиться у неё нет.
+    """
+    if item.due_at is None:
+        return item.text
+    if item.is_overdue:
+        return f"{item.text} — СРОК УЖЕ ПРОШЁЛ ({_format_local(item.due_at)}), ты это ещё не сделала"
+    return f"{item.text} — к {_format_local(item.due_at)}"
+
+
+def _format_local(moment: datetime) -> str:
+    """Время в локальной зоне: срок «в 23:40» человеку понятен, «в 20:40 UTC» — нет."""
+    return moment.astimezone().strftime("%H:%M")
 
 
 #: Тег, которым efi.behavior.life_engine помечает записи о СОБСТВЕННОМ опыте
