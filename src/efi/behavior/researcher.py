@@ -35,6 +35,7 @@ from efi.memory.rag import RAGMemory
 from efi.notifications.schemas import Notification, NotificationType
 from efi.tools.base import ToolContext
 from efi.tools.web_tools.web_search import WebSearchTool
+from efi.utils.text import salvage_truncated
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,12 @@ _INCUBATED_THOUGHT_KEY = "incubated_thought"
 #: обычной дневниковой записи (см. RememberDiaryEntryTool, где дефолт 0.7,
 #: но там — прямое осознанное решение модели посреди разговора).
 _HYPOTHESIS_CONFIDENCE = 0.6
+
+#: Бюджет вывода на гипотезу. Промпт просит 1-3 предложения, и по английским
+#: меркам 256 токенов на это хватало с запасом — но Эфи пишет по-русски, а
+#: кириллица у токенизаторов бесплатных моделей стоит в 2-3 раза дороже, и
+#: запись регулярно обрывалась на полуслове. Запас взят по худшему курсу.
+_HYPOTHESIS_MAX_OUTPUT_TOKENS = 512
 
 _HYPOTHESIS_SYSTEM_PROMPT = (
     "Тебе показаны результаты веб-поиска по теме, которая тебе реально интересна. Сформулируй из них "
@@ -170,14 +177,25 @@ class BackgroundResearcher:
         return random.choice(interests)
 
     async def _formulate_hypothesis(self, topic: str, search_text: str) -> str | None:
-        params = LLMParams(model="", system_prompt=_HYPOTHESIS_SYSTEM_PROMPT, max_output_tokens=256)
+        params = LLMParams(
+            model="", system_prompt=_HYPOTHESIS_SYSTEM_PROMPT, max_output_tokens=_HYPOTHESIS_MAX_OUTPUT_TOKENS
+        )
         session = Session(messages=[Message(role=Role.USER, content=f"Тема: {topic}\n\n{search_text}")])
         try:
             response = await self._router.chat(self._hypothesis_role, params, session)
         except LLMError as exc:
             logger.warning("researcher: hypothesis formulation for %r failed: %s", topic, exc)
             return None
-        return response.text.strip() or None
+
+        hypothesis = salvage_truncated(response.text, truncated=response.was_truncated)
+        if response.was_truncated:
+            logger.warning(
+                "researcher: hypothesis on %r hit the output limit (%s tokens); %s",
+                topic,
+                _HYPOTHESIS_MAX_OUTPUT_TOKENS,
+                "trimmed to the last complete sentence" if hypothesis else "nothing salvageable, skipping",
+            )
+        return hypothesis or None
 
 
 def _make_research_context(topic: str) -> ToolContext:

@@ -46,6 +46,7 @@ from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.tools.base import ToolContext
 from efi.tools.registry import ToolRegistry
+from efi.utils.text import looks_unfinished
 
 logger = logging.getLogger(__name__)
 
@@ -575,6 +576,7 @@ async def build_diary_list(
                 "confidence": entry.metadata.confidence,
                 "score": entry.metadata.score,
                 "embedding_dim": len(entry.metadata.embedding),
+                "unfinished": looks_unfinished(entry.body),
             }
             for entry in page
         ],
@@ -599,6 +601,11 @@ async def build_diary_entry(context: DashboardContext, entry_id: str) -> dict[st
         "embedding_dim": len(entry.metadata.embedding),
         "is_ground_truth": entry.metadata.is_ground_truth,
         "is_marked_false": entry.metadata.is_marked_false,
+        # Записи, сохранённые до починки бюджетов вывода, так и остались
+        # оборванными на полуслове. Удалять их за спиной у владельца — не
+        # дело дашборда, но показать, какие именно пострадали, он обязан:
+        # иначе их не отличить от целых.
+        "unfinished": looks_unfinished(entry.body),
     }
 
 

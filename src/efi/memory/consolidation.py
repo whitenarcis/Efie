@@ -45,6 +45,7 @@ from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata, LLMParams, Message, 
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
 from efi.memory.rag import RAGMemory
+from efi.utils.text import salvage_truncated
 
 logger = logging.getLogger(__name__)
 
@@ -416,7 +417,25 @@ class DiaryConsolidator:
             return []
 
         pieces = [piece.strip() for piece in _ENTRY_SPLIT_RE.split(text)]
-        return [piece for piece in pieces if piece and piece.upper() != _NOVELIZATION_EMPTY_MARKER]
+        pieces = [piece for piece in pieces if piece and piece.upper() != _NOVELIZATION_EMPTY_MARKER]
+
+        # Обрыв по лимиту бьёт только по ПОСЛЕДНЕЙ записи: всё, что стоит
+        # перед разделителем, модель успела дописать целиком. Поэтому чинится
+        # ровно хвост, а не выбрасывается весь ответ — иначе один длинный
+        # эпизод стоил бы нам всех воспоминаний за проход.
+        if pieces and response.was_truncated:
+            tail = salvage_truncated(pieces[-1], truncated=True)
+            logger.warning(
+                "consolidation: novelization hit the output limit (%s tokens); last entry %s",
+                self._novelization_max_output_tokens,
+                "trimmed to the last complete sentence" if tail else "dropped, nothing salvageable",
+            )
+            if tail:
+                pieces[-1] = tail
+            else:
+                pieces.pop()
+
+        return pieces
 
     async def _summarize_via_llm(self, entries: list[DiaryEntry]) -> str | None:
         bodies = "\n\n".join(f"- {entry.body.strip()}" for entry in entries)
@@ -431,7 +450,14 @@ class DiaryConsolidator:
         except LLMError as exc:
             logger.warning("consolidation: summarization request failed: %s", exc)
             return None
-        return response.text.strip() or None
+
+        summary = salvage_truncated(response.text, truncated=response.was_truncated)
+        if response.was_truncated:
+            logger.warning(
+                "consolidation: summarization hit the output limit (1024 tokens); %s",
+                "trimmed to the last complete sentence" if summary else "nothing salvageable, keeping originals",
+            )
+        return summary or None
 
 
 def _render_conversation(session: Session, *, char_limit: int) -> str:

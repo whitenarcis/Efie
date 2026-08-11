@@ -521,6 +521,16 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   color: var(--muted);
 }
 
+.reader-note {
+  max-width: 64ch;
+  margin: 22px auto 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  font-size: var(--fs-small);
+  line-height: 1.6;
+  color: var(--muted);
+}
+
 /* --------------------------------------------------------------- беседа */
 
 .messages { display: flex; flex-direction: column; gap: 10px; }
