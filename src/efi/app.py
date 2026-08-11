@@ -152,7 +152,9 @@ class EfiApp:
             else None
         )
         self._rag = RAGMemory(self._diary, self._llm_router, self._tfidf, local_embeddings=self._local_embeddings)
-        self._working_memory = WorkingMemory(settings.paths.data_dir / "working_memory.json")
+        self._working_memory = WorkingMemory(
+            settings.paths.data_dir / "working_memory.json", timezone=settings.timezone
+        )
         self._facts = FactStore(self._database)
         # -- строгое хранилище знаний (границы доверия + домены C/P/H) --------
         # Собирается ЗДЕСЬ, сразу за RAG: дедупликации нужен тот же источник
@@ -483,7 +485,7 @@ class EfiApp:
                 lifecycle=self._lifecycle,
                 social_memory=self._social_memory,
                 orchestrator=self._orchestrator,
-                promises=self._working_memory,
+                working_memory=self._working_memory,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 

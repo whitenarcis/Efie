@@ -82,9 +82,24 @@ async def test_owner_conversation_never_ends(tmp_path: Path) -> None:
 # -- завершение диалога с посторонним -----------------------------------------
 
 
+async def _warm_up(lifecycle: ConversationLifecycle) -> None:
+    """
+    Разговор, из которого потом можно выйти.
+
+    Нужен потому, что первые GREETING_GRACE_TURNS реплик диалог закрыть не
+    могут: «попрощался» — это вывод о разговоре, а на первой фразе разговора
+    ещё нет.
+    """
+    for text in ("привет, а чем ты занимаешься?", "интересно, а давно этим увлекаешься?"):
+        assert (await lifecycle.evaluate(_STRANGER_ID, _CHAT_ID, text)).should_disengage is False
+
+
 async def test_farewell_ends_the_conversation(tmp_path: Path) -> None:
     lifecycle = _lifecycle(tmp_path)
+    await _warm_up(lifecycle)
+
     decision = await lifecycle.evaluate(_STRANGER_ID, _CHAT_ID, "ладно, пока")
+
     assert decision.should_disengage is True
     assert decision.reason == "farewell"
 
@@ -119,13 +134,17 @@ async def test_calm_messages_decay_annoyance(tmp_path: Path) -> None:
 
 async def test_closed_conversation_stays_closed_for_more_pressure(tmp_path: Path) -> None:
     lifecycle = _lifecycle(tmp_path)
+    await _warm_up(lifecycle)
     await lifecycle.evaluate(_STRANGER_ID, _CHAT_ID, "пока")
+
     decision = await lifecycle.evaluate(_STRANGER_ID, _CHAT_ID, "ЭЙ ОТВЕЧАЙ!!!")
+
     assert decision.should_disengage is True
 
 
 async def test_substantive_message_reopens_a_closed_conversation(tmp_path: Path) -> None:
     lifecycle = _lifecycle(tmp_path)
+    await _warm_up(lifecycle)
     await lifecycle.evaluate(_STRANGER_ID, _CHAT_ID, "пока")
     decision = await lifecycle.evaluate(
         _STRANGER_ID, _CHAT_ID, "слушай, я вернулся, хотел спросить про твой проект"

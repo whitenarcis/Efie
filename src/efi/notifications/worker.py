@@ -95,6 +95,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import datetime
 from typing import Protocol
 
 from efi.behavior.busy_engine import BusyEngine
@@ -165,15 +166,17 @@ class SystemPromptBuilder(Protocol):
     async def build(self, notification: Notification, history: Session) -> str: ...
 
 
-class PromiseTracker(Protocol):
+class WorkingMemoryPort(Protocol):
     """
-    Что Worker'у нужно от рабочей памяти, чтобы закрыть выполненное обещание.
-    Реализация — efi.memory.working_memory.WorkingMemory (метод у неё уже
-    есть; протокол объявлен здесь, чтобы Worker не зависел от всей
-    подсистемы памяти ради одного вызова).
+    Что Worker'у нужно от рабочей памяти: закрыть выполненное обещание и
+    списать энергию за проведённый разговор. Реализация —
+    efi.memory.working_memory.WorkingMemory; протокол объявлен здесь, чтобы
+    Worker не зависел от всей подсистемы памяти ради двух вызовов.
     """
 
     async def find_and_mark_done(self, text_query: str) -> WorkingMemoryItem | None: ...
+
+    async def spend_energy(self, *, turns: int = 1, now: datetime | None = None) -> object: ...
 
 
 class TelegramNotifier(Protocol):
@@ -220,7 +223,7 @@ class Worker:
         lifecycle: ConversationLifecycle | None = None,
         social_memory: SocialInteractionStore | None = None,
         orchestrator: ChatOrchestrator | None = None,
-        promises: PromiseTracker | None = None,
+        working_memory: WorkingMemoryPort | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -237,7 +240,7 @@ class Worker:
         self._lifecycle = lifecycle
         self._social_memory = social_memory
         self._orchestrator = orchestrator
-        self._promises = promises
+        self._working_memory = working_memory
 
     async def run(self) -> None:
         """
@@ -431,6 +434,30 @@ class Worker:
 
         await self._close_delivered_promise(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
+        await self._spend_energy(tool_context)
+
+    async def _spend_energy(self, tool_context: ToolContext) -> None:
+        """
+        Разговор стоит сил.
+
+        Раньше энергия менялась ровно одним способом — если модель сама
+        решала вызвать `update_self_state`, чего она не делала практически
+        никогда. Итог: `energy` месяцами стояла на дефолтных 0.7, а
+        BusyEngine, для которого она и существует, работал с константой.
+        Теперь усталость копится оттого, что Эфи РАЗГОВАРИВАЛА, а не оттого,
+        что кто-то про неё вспомнил.
+
+        Списывается только за ход, на котором что-то реально ушло
+        собеседнику: попытка, оборвавшаяся на таймауте провайдера, — это
+        усталость железа, а не её. Сбой записи не должен ронять уже
+        доставленный ответ, поэтому исключение здесь только логируется.
+        """
+        if self._working_memory is None or not tool_context.extra.get("sent_texts"):
+            return
+        try:
+            await self._working_memory.spend_energy()
+        except Exception:
+            logger.warning("worker[%d]: не удалось списать энергию за ход", self._worker_index, exc_info=True)
 
     def _retry_if_proactive(self, notification: Notification, tool_context: ToolContext, *, reason: str) -> None:
         """
@@ -482,7 +509,7 @@ class Worker:
         просроченный пункт попадает в промпт и на дашборд, и Эфи упомянет
         его при следующем же обмене репликами.
         """
-        if notification.type is not NotificationType.FOLLOW_UP or self._promises is None:
+        if notification.type is not NotificationType.FOLLOW_UP or self._working_memory is None:
             return
         promise_text = notification.payload.get("promise_text")
         if not isinstance(promise_text, str) or not promise_text.strip():
@@ -490,7 +517,7 @@ class Worker:
         if not tool_context.extra.get("sent_texts"):
             return
         try:
-            closed = await self._promises.find_and_mark_done(promise_text)
+            closed = await self._working_memory.find_and_mark_done(promise_text)
         except Exception:
             logger.warning(
                 "worker[%d]: не удалось закрыть обещание %r", self._worker_index, promise_text, exc_info=True
@@ -801,4 +828,4 @@ def _finalize_session(history: Session, notification: Notification) -> Session:
     return session
 
 
-__all__ = ["Worker", "HistoryRepository", "PromiseTracker", "SystemPromptBuilder", "TelegramNotifier"]
+__all__ = ["HistoryRepository", "SystemPromptBuilder", "TelegramNotifier", "Worker", "WorkingMemoryPort"]

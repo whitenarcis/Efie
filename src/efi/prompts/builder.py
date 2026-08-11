@@ -17,11 +17,13 @@ system-блок с working memory/RAG (как было до Шага 6) — эт
 {user_name}/{time_of_day} — они подставляются здесь (_render_personality_template),
 а не хранятся в самом файле как готовый текст: то, "кто сейчас пишет" и
 "какое сейчас время суток", известно только на момент конкретного запроса.
-{weather}/{energy} НЕ подставляются намеренно — для погоды нет источника
-данных (не подключён никакой weather API), а "энергия" не отслеживается как
-число нигде в системе; если такие плейсхолдеры встретятся в тексте, они
-останутся как есть (см. _SafeFormatDict) — это осознанный компромисс, а не
-баг, до тех пор, пока для них не появится реальный источник данных.
+{energy} (число процентов) и {energy_label} (то же словами) берутся из
+текущего самоощущения — efi/behavior/energy.py. Раньше {energy} намеренно НЕ
+подставлялся, потому что энергия нигде не отслеживалась как живая величина;
+теперь отслеживается. {weather} — по-прежнему нет: источника данных для него
+в системе не существует, и такой плейсхолдер останется в тексте как есть
+(см. _SafeFormatDict) — это осознанный компромисс, а не баг, до тех пор, пока
+не появится реальный источник.
 
 Блок "текущее состояние личности" (_build_state_vector_block) — отдельный
 седьмой блок, вставленный между working memory и RAG: mood/social_distance
@@ -64,7 +66,7 @@ from efi.memory.dedup import KnowledgeStore, StoredFact, render_facts_block
 from efi.memory.people import PeopleStore, PersonProfile
 from efi.memory.rag import RAGMemory
 from efi.memory.router import MemoryDomain, MemoryRouter
-from efi.memory.working_memory import WorkingMemory, WorkingMemoryItem, WorkingMemorySnapshot
+from efi.memory.working_memory import SelfState, WorkingMemory, WorkingMemoryItem, WorkingMemorySnapshot
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
@@ -269,8 +271,9 @@ class EfiSystemPromptBuilder:
         )
 
         now = local_now(self._settings.timezone)
+        self_state = self._working_memory.describe(memory_snapshot, now=now)
         rendered_personality = _render_personality_template(
-            personality, self._resolve_user_name(notification), now=now
+            personality, self._resolve_user_name(notification), now=now, state=self_state
         )
 
         blocks = [
@@ -285,7 +288,7 @@ class EfiSystemPromptBuilder:
             ),
             _build_proactive_brevity_block(notification),
             _build_time_block(now, is_user_message=notification.type is NotificationType.USER_MESSAGE),
-            _build_working_memory_block(memory_snapshot),
+            _build_working_memory_block(memory_snapshot, self_state),
             _build_state_vector_block(
                 relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
             ),
@@ -379,9 +382,22 @@ class EfiSystemPromptBuilder:
             return self._settings.personality_prompt
 
 
-def _render_personality_template(text: str, user_name: str, *, now: datetime | None = None) -> str:
-    """Подставляет {user_name}/{time_of_day}; см. докстринг модуля про {weather}/{energy}."""
-    context = _SafeFormatDict(user_name=user_name, time_of_day=_time_of_day_label(now))
+def _render_personality_template(
+    text: str, user_name: str, *, now: datetime | None = None, state: SelfState | None = None
+) -> str:
+    """
+    Подставляет {user_name}/{time_of_day}/{energy}/{energy_label}; см.
+    докстринг модуля про {weather}.
+
+    `{energy}` — именно число процентов, потому что в шаблоне оно стоит как
+    «примерно {energy}% энергии»; словесная форма живёт в `{energy_label}`.
+    """
+    context = _SafeFormatDict(
+        user_name=user_name,
+        time_of_day=_time_of_day_label(now),
+        energy=str(state.energy.percent) if state is not None else "",
+        energy_label=state.energy.label if state is not None else "",
+    )
     try:
         return text.format_map(context)
     except (ValueError, IndexError) as exc:
@@ -622,18 +638,29 @@ def _weekend_note(now: datetime) -> str:
     return "будний день"
 
 
-def _build_working_memory_block(snapshot: WorkingMemorySnapshot) -> str:
-    parts: list[str] = []
-    if snapshot.emotional_state or snapshot.physical_state:
+def _build_working_memory_block(snapshot: WorkingMemorySnapshot, state: SelfState) -> str:
+    """
+    Блок «[Текущее состояние]» — самоощущение и открытые долги.
+
+    Состояние здесь есть ВСЕГДА. Раньше блок появлялся, только если модель
+    сама однажды вызвала `update_self_state`, а она этого практически не
+    делала — и в промпте месяцами стояло «не определено», то есть прямая
+    подсказка, что никакого состояния у неё и нет. Теперь при молчании
+    модели оно выводится из энергии и часа суток (см. efi/behavior/energy.py),
+    а её собственные слова, пока свежие, эту оценку перебивают.
+    """
+    parts = [
+        f"эмоциональное состояние: {state.emotional}; физическое состояние: {state.physical}; "
+        f"энергия: {state.energy.percent}% ({state.energy.label})"
+    ]
+    if state.energy.is_sleepy:
         parts.append(
-            f"эмоциональное состояние: {snapshot.emotional_state or 'не определено'}; "
-            f"физическое состояние: {snapshot.physical_state or 'не определено'}"
+            "Тебя ощутимо клонит в сон. Это не запрет разговаривать — это то, как ты сейчас себя "
+            "чувствуешь: короче реплики, меньше энтузиазма, можешь честно сказать, что засыпаешь."
         )
     open_items = [item for item in snapshot.items if not item.done]
     if open_items:
         parts.append("открытые задачи/обещания:\n" + "\n".join(f"  - {_render_promise(item)}" for item in open_items))
-    if not parts:
-        return ""
     return "[Текущее состояние]\n" + "\n".join(parts)
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -26,9 +27,21 @@ import aiofiles
 import aiofiles.os
 from pydantic import BaseModel, Field, ValidationError
 
+from efi.behavior import energy as energy_model
+from efi.utils.clock import local_now
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_HORIZON = timedelta(days=3)
+
+#: Сколько живёт настроение, названное самой Эфи.
+#:
+#: Настроение — это состояние на сейчас, а не свойство характера. «Злая как
+#: чёрт», сказанное во вторник, к пятнице неправда, и подставлять его в промпт
+#: как текущее — значит заставлять её отыгрывать позавчерашний день. Восемь
+#: часов — примерно «до конца этого куска суток»: утреннее настроение доживает
+#: до вечера, но не до следующего утра.
+STATE_TTL = timedelta(hours=8)
 
 
 class WorkingMemoryItem(BaseModel):
@@ -62,11 +75,42 @@ class WorkingMemorySnapshot(BaseModel):
     physical_state: str = ""
     energy: float = Field(
         default=0.7, ge=0.0, le=1.0,
-        description="Текущий уровень бодрости (0..1) — вход для efi.behavior.busy_engine.BusyEngine "
-        "(низкая энергия удлиняет ignore_delay перед ответом).",
+        description="ЯКОРЬ энергии: последнее явно зафиксированное значение. Текущий уровень из него "
+        "вычисляется на момент запроса (efi.behavior.energy.project), а не читается напрямую — "
+        "энергия падает к ночи, тратится на разговор и восстанавливается со временем сама.",
     )
+    energy_updated_at: datetime | None = Field(
+        default=None,
+        description="Когда якорь энергии был поставлен. None — снимок из версии до появления модели "
+        "энергии: тогда якорь считается свежим, и старые файлы работают без миграции.",
+    )
+    #: Настроение — не постоянное свойство, а состояние на сейчас. Без отметки
+    #: времени фраза «злая как чёрт», сказанная во вторник, ехала бы в промпт
+    #: и в пятницу (см. STATE_TTL и WorkingMemory.describe).
+    state_updated_at: datetime | None = None
     items: list[WorkingMemoryItem] = Field(default_factory=list)
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(slots=True, frozen=True)
+class SelfState:
+    """
+    Как Эфи себя ощущает прямо сейчас — то, что уходит в промпт и на дашборд.
+
+    Пустых полей здесь нет по построению. «Состояние: не определено» —
+    единственный вариант, которого у живого существа быть не может, а до
+    появления этого типа именно он и стоял в промпте месяцами: строки
+    заполнялись только добровольным вызовом инструмента, которого модель не
+    делала.
+    """
+
+    emotional: str
+    physical: str
+    energy: energy_model.EnergyState
+    #: True — состояние выведено из энергии и часа, а не названо самой Эфи.
+    #: Дашборду это стоит показывать: «её слова» и «наша оценка» — разные
+    #: вещи, и путать их не надо.
+    is_derived: bool
 
 
 class WorkingMemory:
@@ -81,11 +125,49 @@ class WorkingMemory:
     `asyncio.create_task(...)`.
     """
 
-    def __init__(self, path: Path, *, horizon: timedelta = _DEFAULT_HORIZON) -> None:
+    def __init__(self, path: Path, *, horizon: timedelta = _DEFAULT_HORIZON, timezone: str = "") -> None:
         self._path = path
         self._horizon = horizon
+        #: Пояс нужен, потому что энергия зависит от ЧАСА СУТОК: по UTC на
+        #: московском телефоне «глубокая ночь» пришлась бы на девять вечера.
+        self._timezone = timezone
         self._lock = asyncio.Lock()
         self._cache: WorkingMemorySnapshot | None = None
+
+    def describe(self, snapshot: WorkingMemorySnapshot, *, now: datetime | None = None) -> SelfState:
+        """
+        Текущее самоощущение: энергия на этот момент и состояние словами.
+
+        Синхронная и без ввода-вывода — её зовут на критическом пути сборки
+        промпта, где снимок уже загружен.
+
+        Слова самой Эфи (`update_self_state`) имеют приоритет, пока не
+        протухли; иначе состояние выводится из энергии и часа. Молчание
+        модели больше не означает, что состояния нет.
+        """
+        moment = local_now(self._timezone, now=now)
+        energy = energy_model.project(
+            anchor=snapshot.energy, anchor_at=snapshot.energy_updated_at, now=moment
+        )
+        if self._explicit_state_is_fresh(snapshot, moment):
+            return SelfState(
+                emotional=snapshot.emotional_state or energy.label,
+                physical=snapshot.physical_state or energy.label,
+                energy=energy,
+                is_derived=False,
+            )
+        return SelfState(emotional=energy.label, physical=energy.label, energy=energy, is_derived=True)
+
+    @staticmethod
+    def _explicit_state_is_fresh(snapshot: WorkingMemorySnapshot, moment: datetime) -> bool:
+        if not snapshot.emotional_state and not snapshot.physical_state:
+            return False
+        if snapshot.state_updated_at is None:
+            # Снимок из версии без отметки времени. Считаем состояние
+            # протухшим, а не вечным: именно эти зависшие навсегда строки и
+            # были проблемой.
+            return False
+        return moment - snapshot.state_updated_at < STATE_TTL
 
     async def load(self) -> WorkingMemorySnapshot:
         """Критический путь: возвращает текущий снимок, читая с диска только при первом обращении."""
@@ -138,15 +220,49 @@ class WorkingMemory:
         emotional_state: str | None = None,
         physical_state: str | None = None,
         energy: float | None = None,
+        now: datetime | None = None,
     ) -> WorkingMemorySnapshot:
-        """Обновляет эмоциональное/физическое состояние и/или уровень энергии персонажа."""
+        """
+        Обновляет эмоциональное/физическое состояние и/или уровень энергии.
+
+        Слова Эфи о себе сильнее любой модели: сказанное здесь становится
+        новым якорем, от которого энергия дальше релаксирует как обычно.
+        Поэтому вместе со значениями обязательно записывается момент — без
+        него «я вымотана» осталось бы верным навсегда.
+        """
+        moment = now or datetime.now(UTC)
         snapshot = await self.load()
         if emotional_state is not None:
             snapshot.emotional_state = emotional_state
         if physical_state is not None:
             snapshot.physical_state = physical_state
+        if emotional_state is not None or physical_state is not None:
+            snapshot.state_updated_at = moment
         if energy is not None:
             snapshot.energy = max(0.0, min(energy, 1.0))
+            snapshot.energy_updated_at = moment
+        return await self.save(snapshot)
+
+    async def spend_energy(self, *, turns: int = 1, now: datetime | None = None) -> WorkingMemorySnapshot:
+        """
+        Списывает энергию за проведённый разговор и переставляет якорь на
+        «сейчас».
+
+        Вызывается после КАЖДОГО отвеченного хода (efi/notifications/worker.py).
+        Именно здесь энергия перестаёт быть константой: разговор её тратит,
+        а время между разговорами возвращает к норме своего часа.
+
+        Списывается от ТЕКУЩЕГО спроецированного значения, а не от старого
+        якоря: иначе долгий перерыв, за который Эфи отдохнула, при первой же
+        реплике откатился бы к позавчерашней усталости.
+        """
+        moment = now or datetime.now(UTC)
+        snapshot = await self.load()
+        projected = energy_model.project(
+            anchor=snapshot.energy, anchor_at=snapshot.energy_updated_at, now=moment
+        )
+        snapshot.energy = energy_model.spend(projected.level, turns=turns)
+        snapshot.energy_updated_at = moment
         return await self.save(snapshot)
 
     async def add_item(

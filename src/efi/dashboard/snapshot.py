@@ -145,10 +145,17 @@ async def build_overview(context: DashboardContext) -> dict[str, Any]:
     working_memory: dict[str, Any] = {}
     if context.working_memory is not None:
         snapshot = await context.working_memory.load()
+        # Спроецированное состояние, а не поля снимка: в снимке лежит ЯКОРЬ
+        # (последнее зафиксированное значение), и показывать его как текущее
+        # — то же самое, что показывать вчерашнюю погоду (см.
+        # efi/behavior/energy.py).
+        state = context.working_memory.describe(snapshot)
         working_memory = {
-            "emotional_state": snapshot.emotional_state,
-            "physical_state": snapshot.physical_state,
-            "energy": round(snapshot.energy, 3),
+            "emotional_state": state.emotional,
+            "physical_state": state.physical,
+            "energy": round(state.energy.level, 3),
+            "energy_label": state.energy.label,
+            "is_derived": state.is_derived,
             "open_items": sum(1 for item in snapshot.items if not item.done),
             "updated_at": snapshot.updated_at.isoformat(),
         }
@@ -355,10 +362,16 @@ async def build_self_state(context: DashboardContext) -> dict[str, Any]:
 
     if context.working_memory is not None:
         snapshot = await context.working_memory.load()
+        state = context.working_memory.describe(snapshot)
         payload["working_memory"] = {
-            "emotional_state": snapshot.emotional_state,
-            "physical_state": snapshot.physical_state,
-            "energy": round(snapshot.energy, 3),
+            "emotional_state": state.emotional,
+            "physical_state": state.physical,
+            "energy": round(state.energy.level, 3),
+            "energy_label": state.energy.label,
+            # Её собственные слова или наша оценка по энергии и часу — вещи
+            # разные, и путать их на дашборде нельзя.
+            "is_derived": state.is_derived,
+            "is_sleepy": state.energy.is_sleepy,
             "updated_at": snapshot.updated_at.isoformat(),
             "items": [
                 {

@@ -273,7 +273,8 @@ async def test_overdue_promise_is_marked_in_the_prompt(working_memory: WorkingMe
     await working_memory.add_item(
         "написать про собеседование", due_at=datetime.now(UTC) - timedelta(minutes=5), chat_id=_CHAT_ID
     )
-    block = _build_working_memory_block(await working_memory.load())
+    snapshot = await working_memory.load()
+    block = _build_working_memory_block(snapshot, working_memory.describe(snapshot))
 
     assert "СРОК УЖЕ ПРОШЁЛ" in block
 
@@ -284,7 +285,8 @@ async def test_pending_promise_shows_its_deadline(working_memory: WorkingMemory)
     await working_memory.add_item(
         "написать про собеседование", due_at=datetime.now(UTC) + timedelta(hours=1), chat_id=_CHAT_ID
     )
-    block = _build_working_memory_block(await working_memory.load())
+    snapshot = await working_memory.load()
+    block = _build_working_memory_block(snapshot, working_memory.describe(snapshot))
 
     assert "к " in block
     assert "СРОК УЖЕ ПРОШЁЛ" not in block

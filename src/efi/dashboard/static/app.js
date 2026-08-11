@@ -220,7 +220,7 @@
       cell(
         'Энергия',
         memory.energy === undefined || memory.energy === null ? '—' : pct(memory.energy),
-        `${esc(memory.emotional_state || 'состояние не записано')}${meter(memory.energy)}`,
+        `${esc(memory.energy_label || memory.emotional_state || '—')}${meter(memory.energy)}`,
         'small',
       ),
       cell(
@@ -274,9 +274,9 @@
     const busy = data.busy || {};
 
     const grid = [
-      cell('Эмоциональное состояние', esc(memory.emotional_state || 'не записано'), '', 'text'),
-      cell('Физическое состояние', esc(memory.physical_state || 'не записано'), '', 'text'),
-      cell('Энергия', pct(memory.energy), meter(memory.energy), 'small'),
+      cell('Эмоциональное состояние', esc(memory.emotional_state || '—'), memory.is_derived ? 'выведено из энергии и часа' : 'её собственные слова', 'text'),
+      cell('Физическое состояние', esc(memory.physical_state || '—'), memory.is_derived ? 'выведено из энергии и часа' : 'её собственные слова', 'text'),
+      cell('Энергия', pct(memory.energy), `${esc(memory.energy_label || '')}${memory.is_sleepy ? ' · клонит в сон' : ''}${meter(memory.energy)}`, 'small'),
       cell(
         'Занятость',
         busy.delay_seconds === undefined ? '—' : `${fixed(busy.delay_seconds, 1)} c`,
