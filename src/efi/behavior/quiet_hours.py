@@ -22,6 +22,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from efi.config.schema import QuietHoursSettings
+from efi.utils.clock import local_now
+
 
 def is_quiet_hours(now: datetime, *, start_hour: int, end_hour: int) -> bool:
     """
@@ -41,4 +44,20 @@ def is_quiet_hours(now: datetime, *, start_hour: int, end_hour: int) -> bool:
     return hour >= start_hour or hour < end_hour
 
 
-__all__ = ["is_quiet_hours"]
+def is_quiet_now(settings: QuietHoursSettings | None, timezone: str = "", *, now: datetime | None = None) -> bool:
+    """
+    «Сейчас тихие часы?» одним вызовом — с учётом настроенного пояса Эфи.
+
+    Раньше каждый планировщик собирал это условие сам из трёх частей
+    (`is not None`, `.enabled`, `is_quiet_hours(datetime.now(), ...)`), и все
+    три копии одинаково полагались на часовой пояс процесса. Если TZ не
+    настроен (proot, cron, VPS), процесс живёт по UTC — и ночная тишина
+    наступала не в те часы, причём молча. См. efi/utils/clock.py.
+    """
+    if settings is None or not settings.enabled:
+        return False
+    moment = local_now(timezone, now=now)
+    return is_quiet_hours(moment, start_hour=settings.start_hour, end_hour=settings.end_hour)
+
+
+__all__ = ["is_quiet_hours", "is_quiet_now"]

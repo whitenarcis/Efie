@@ -226,7 +226,7 @@
       cell(
         'Тихие часы',
         quiet.active_now ? 'идут' : 'нет',
-        quiet.enabled ? `${quiet.start_hour}:00 — ${quiet.end_hour}:00, локально ${esc(fmtTime(quiet.local_time))}` : 'выключены',
+        quiet.enabled ? `${quiet.start_hour}:00 — ${quiet.end_hour}:00, у неё ${esc(fmtTime(quiet.local_time))} ${esc(quiet.timezone || '')} (${esc(quiet.timezone_source || 'система')})` : 'выключены',
         'small',
       ),
       cell('Вызовы моделей', num(llm.calls), `ошибок ${num(llm.errors)} · среднее ${fixed(llm.avg_seconds)} c`),

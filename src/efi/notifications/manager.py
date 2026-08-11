@@ -18,6 +18,14 @@ put(): routing_key события хэшируется в номер ворке�
 что и у референса (события одного чата обрабатываются строго
 последовательно одним и тем же воркером), но без сканирования чужих
 уведомлений и без гонок за "захват" пина между несколькими воркерами.
+
+Здесь же живёт отложенный повтор (`retry_later`). Проактивное событие — это
+намерение Эфи что-то сказать, а не запрос, который можно молча потерять:
+если LLM не ответил (таймаут на бесплатном тире — обычное дело), намерение
+должно пережить неудачу и повториться. Таймеры повторов живут в самом
+менеджере, а не в воркере: воркер обрабатывает уведомления по одному и не
+может ждать минуту, не блокируя свою подочередь, а незарегистрированная
+`create_task` потерялась бы при остановке приложения.
 """
 
 from __future__ import annotations
@@ -31,6 +39,12 @@ from dataclasses import dataclass, field
 from efi.notifications.schemas import Notification
 
 logger = logging.getLogger(__name__)
+
+#: Сколько всего раз пытаться доставить одно проактивное уведомление, считая
+#: первую попытку. Три — это «пережить единичный таймаут провайдера и ещё
+#: один», но не «долбиться час»: если модель недоступна десять минут подряд,
+#: повод («напиши мне через 10 минут») уже протух сам по себе.
+MAX_DELIVERY_ATTEMPTS = 3
 
 
 @dataclass(order=True)
@@ -65,10 +79,16 @@ class NotificationManager:
         self._worker_count = worker_count
         self._queues: list[asyncio.PriorityQueue[_QueueItem]] = [asyncio.PriorityQueue() for _ in range(worker_count)]
         self._sequence_counter = itertools.count()
+        self._retry_timers: set[asyncio.Task[None]] = set()
 
     @property
     def worker_count(self) -> int:
         return self._worker_count
+
+    @property
+    def pending_retries(self) -> int:
+        """Сколько повторов сейчас ждёт своего часа — для дашборда и тестов."""
+        return len(self._retry_timers)
 
     def worker_index_for(self, routing_key: str) -> int:
         """
@@ -97,6 +117,62 @@ class NotificationManager:
             "notifications: queued %s id=%s (priority=%d, chat_id=%s) -> worker %d",
             notification.type.value, notification.id, notification.priority, notification.chat_id, index,
         )
+
+    def retry_later(self, notification: Notification, *, delay: float) -> bool:
+        """
+        Ставит уведомление в очередь заново через `delay` секунд, увеличив
+        счётчик попыток. Возвращает False, если попытки исчерпаны и повтора
+        не будет, — вызывающая сторона по этому решает, пора ли сдаваться
+        вслух (пометить обещание, написать в лог как о потере).
+
+        Синхронный по умыслу: вызывающий воркер не должен ждать ни секунды
+        из `delay` — он обязан немедленно взять следующее уведомление.
+        """
+        if notification.attempt + 1 >= MAX_DELIVERY_ATTEMPTS:
+            logger.warning(
+                "notifications: %s id=%s исчерпало %d попыток, повтора не будет",
+                notification.type.value, notification.id, MAX_DELIVERY_ATTEMPTS,
+            )
+            return False
+
+        # Копия, а не мутация: исходное уведомление ещё живёт в обработчике,
+        # который его уронил, и менять его под ним нехорошо.
+        retry = notification.model_copy(update={"attempt": notification.attempt + 1})
+
+        async def _sleep_and_put() -> None:
+            try:
+                await asyncio.sleep(delay)
+                await self.put(retry)
+                logger.info(
+                    "notifications: повторная попытка %d/%d для %s id=%s (chat_id=%s)",
+                    retry.attempt + 1, MAX_DELIVERY_ATTEMPTS, retry.type.value, retry.id, retry.chat_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("notifications: не удалось поставить повтор для id=%s", retry.id)
+
+        task = asyncio.create_task(_sleep_and_put(), name=f"notification_retry:{retry.id}")
+        self._retry_timers.add(task)
+        task.add_done_callback(self._retry_timers.discard)
+        logger.info(
+            "notifications: %s id=%s не доставлено, повтор через %.0fs (попытка %d/%d)",
+            notification.type.value, notification.id, delay, retry.attempt + 1, MAX_DELIVERY_ATTEMPTS,
+        )
+        return True
+
+    async def cancel_retries(self) -> None:
+        """
+        Снимает все ждущие повторы. Вызывается при остановке приложения:
+        без этого несработавшие таймеры остались бы висеть как незавершённые
+        задачи и мешали бы чистому выключению.
+        """
+        timers = list(self._retry_timers)
+        for task in timers:
+            task.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+        self._retry_timers.clear()
 
     async def get(self, worker_index: int) -> Notification:
         """
@@ -129,4 +205,4 @@ class NotificationManager:
             raise ValueError(f"worker_index {worker_index} вне диапазона [0, {self._worker_count})")
 
 
-__all__ = ["NotificationManager"]
+__all__ = ["MAX_DELIVERY_ATTEMPTS", "NotificationManager"]

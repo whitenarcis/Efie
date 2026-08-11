@@ -251,7 +251,9 @@ class EfiApp:
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
-        self._silence_monitor = SilenceMonitor(self._notification_manager, quiet_hours=settings.quiet_hours)
+        self._silence_monitor = SilenceMonitor(
+            self._notification_manager, quiet_hours=settings.quiet_hours, timezone=settings.timezone
+        )
         # Отложенные напоминания («напиши мне через 10 минут»). Персистентные:
         # обещание со сроком обязано пережить перезапуск, иначе оно тихо
         # исчезает ровно тогда, когда человек на него рассчитывает.
@@ -266,12 +268,14 @@ class EfiApp:
             self._active_chat_candidates,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
             quiet_hours=settings.quiet_hours,
+            timezone=settings.timezone,
         )
         self._organic_ping = OrganicPingGenerator(
             self._notification_manager,
             self._affinity,
             importance_threshold=settings.life_engine.ping_importance_threshold,
             quiet_hours=settings.quiet_hours,
+            timezone=settings.timezone,
         )
         self._life_engine = BackgroundLifeWorker(
             self._curiosity,
@@ -632,6 +636,10 @@ class EfiApp:
         # Активные генерации: недоговорённая серия бабблов не должна держать
         # остановку на своих паузах между сообщениями.
         await self._orchestrator.cancel_all()
+        # Отложенные повторы недоставленных проактивных уведомлений — тоже
+        # спят минутами, и ждать их на выключении незачем: повод протухнет
+        # раньше, чем таймер сработает.
+        await self._notification_manager.cancel_retries()
 
         for task in self._background_tasks:
             task.cancel()
