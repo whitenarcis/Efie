@@ -52,6 +52,7 @@ from efi.memory.dedup import KnowledgeStore
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
 from efi.memory.ingest import MemoryIngestor
+from efi.memory.knowledge_sink import EpisodeKnowledgeSink
 from efi.memory.local_embeddings import LocalEmbeddingEngine
 from efi.memory.parser import PerceptionParser
 from efi.memory.people import PeopleStore
@@ -171,15 +172,6 @@ class EfiApp:
             pending=self._pending_clarifications,
         )
         self._history = SqliteHistoryRepository(self._database)
-        self._consolidator = DiaryConsolidator(
-            self._diary,
-            self._llm_router,
-            self._rag,
-            novelization_char_limit=settings.memory.novelization_char_limit,
-            novelization_max_output_tokens=settings.memory.novelization_max_output_tokens,
-            character_name=settings.character_name,
-        )
-
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются
         # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
@@ -195,6 +187,22 @@ class EfiApp:
         # Социальная память внешнего опыта: журнал в SQLite + индексация в
         # векторную память через RAG, поэтому конструируется ПОСЛЕ _rag.
         self._social_memory = SocialInteractionStore(self._database, rag=self._rag)
+        # Консолидация памяти. Конструируется ПОСЛЕ PeopleStore: строгое
+        # хранилище знаний, которое она наполняет, разрешает упоминания по
+        # каталогу известных людей (см. efi/memory/catalog.py).
+        self._consolidator = DiaryConsolidator(
+            self._diary,
+            self._llm_router,
+            self._rag,
+            novelization_char_limit=settings.memory.novelization_char_limit,
+            novelization_max_output_tokens=settings.memory.novelization_max_output_tokens,
+            character_name=settings.character_name,
+            # Строгая память подключается ЗДЕСЬ, а не в пульсе: novelize_chat —
+            # единственная точка, общая для частого пульса и ночного прохода,
+            # и повесив разбор знаний на одну из них, мы получили бы память,
+            # зависящую от того, каким путём эпизод дошёл до осмысления.
+            knowledge=EpisodeKnowledgeSink(self._memory_ingestor, self._people),
+        )
         # Жизненный цикл диалога с посторонними (владелец vs остальные).
         self._lifecycle = ConversationLifecycle(
             self._database,
@@ -249,6 +257,7 @@ class EfiApp:
             self._affinity,
             self._people,
             knowledge=self._knowledge,
+            clarifications=self._pending_clarifications,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -487,6 +496,7 @@ class EfiApp:
                 social_memory=self._social_memory,
                 orchestrator=self._orchestrator,
                 working_memory=self._working_memory,
+                clarifications=self._pending_clarifications,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 

@@ -49,6 +49,13 @@ DEFAULT_MIN_SCORE = 0.35
 #: давности значит записать ещё более искажённые данные, чем при угадывании.
 DEFAULT_TTL = timedelta(minutes=30)
 
+#: Сколько помнится УЖЕ ПОЛУЧЕННЫЙ ответ на уточнение. Дольше самого вопроса
+#: и намного: вопрос живёт внутри реплики, а ответ на него — знание («Феникс
+#: в этом чате — это кот»), которое разумно применять к следующим эпизодам.
+#: Но не вечно: через сутки то же слово в том же чате вполне может означать
+#: другое, и застывшая привязка стала бы такой же ошибкой, как её отсутствие.
+DEFAULT_ANSWER_TTL = timedelta(hours=24)
+
 _MAX_LISTED_CANDIDATES = 3
 
 #: Заготовки уточнения. Все — короткие, разговорные и без служебного тона:
@@ -170,6 +177,14 @@ def render_clarification(mention: str, candidates: tuple[EntityCandidate, ...]) 
 
 
 @dataclass(slots=True)
+class _ConfirmedMention:
+    """Ответ человека на уточнение: кто это оказался и когда он это сказал."""
+
+    entity_id: str
+    answered_at: datetime
+
+
+@dataclass(slots=True, frozen=True)
 class PendingClarification:
     """Заданный и ещё не закрытый вопрос по одному упоминанию."""
 
@@ -193,9 +208,17 @@ class PendingClarifications:
     предотвращения которой модуль и написан.
     """
 
-    def __init__(self, *, ttl: timedelta = DEFAULT_TTL) -> None:
+    def __init__(self, *, ttl: timedelta = DEFAULT_TTL, answer_ttl: timedelta = DEFAULT_ANSWER_TTL) -> None:
         self._ttl = ttl
+        self._answer_ttl = answer_ttl
         self._pending: dict[int, PendingClarification] = {}
+        #: Ответы, которые человек уже дал: (chat_id, упоминание) -> кто это.
+        #: Без них система спрашивала бы одно и то же вечно — уточнение
+        #: закрывалось бы, следующий эпизод снова упирался бы в те же два
+        #: одинаковых имени, и человек получал бы тот же вопрос по кругу.
+        #: Хуже вопроса без ответа только вопрос, ответ на который не
+        #: запомнили.
+        self._answers: dict[tuple[int, str], _ConfirmedMention] = {}
 
     def remember(self, chat_id: int, resolution: Resolution) -> None:
         """Фиксирует, что по этому чату задан уточняющий вопрос."""
@@ -246,8 +269,31 @@ class PendingClarifications:
             return None
 
         del self._pending[chat_id]
+        self._answers[(chat_id, _normalize(pending.mention))] = _ConfirmedMention(
+            entity_id=matches[0].entity_id, answered_at=datetime.now(UTC)
+        )
         logger.info("ambiguity: уточнение по %r закрыто ответом -> %s", pending.mention, matches[0].entity_id)
         return matches[0]
+
+    def confirmed_entities(self, chat_id: int) -> dict[str, str]:
+        """
+        Что человек уже пояснил в этом чате: упоминание -> идентификатор.
+
+        Читает каталог сущностей (efi/memory/catalog.py), чтобы во второй раз
+        тот же вопрос не задавался. Протухшие ответы вычищаются здесь же: за
+        сутки «Феникс» в этом чате вполне может начать означать другое, и
+        вечная память об одном ответе была бы такой же ошибкой, как её полное
+        отсутствие.
+        """
+        now = datetime.now(UTC)
+        fresh: dict[str, str] = {}
+        for key, answer in list(self._answers.items()):
+            if now - answer.answered_at > self._answer_ttl:
+                del self._answers[key]
+                continue
+            if key[0] == chat_id:
+                fresh[key[1]] = answer.entity_id
+        return fresh
 
     def discard(self, chat_id: int) -> None:
         """Снимает уточнение без ответа — например, когда разговор ушёл на другую тему."""
@@ -287,6 +333,7 @@ def _normalize(text: str) -> str:
 
 
 __all__ = [
+    "DEFAULT_ANSWER_TTL",
     "DEFAULT_MARGIN",
     "DEFAULT_MIN_SCORE",
     "AmbiguityDetector",

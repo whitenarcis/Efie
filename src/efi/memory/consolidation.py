@@ -161,6 +161,21 @@ class ExperienceSource(Protocol):
     async def context_lines_for_chat(self, chat_id: int, *, since: datetime, limit: int = 30) -> list[str]: ...
 
 
+class KnowledgeSink(Protocol):
+    """
+    Строгое хранилище знаний с точки зрения консолидации — ровно один вызов.
+
+    Протокол, а не прямой импорт `MemoryIngestor`: консолидации незачем знать
+    ни про границу доверия, ни про домены, ни про разрешение сущностей. Она
+    умеет одно — сказать «вот прожитый эпизод», и это всё, что между этими
+    двумя подсистемами должно быть общего.
+
+    Конкретная реализация — efi.memory.knowledge_sink.EpisodeKnowledgeSink.
+    """
+
+    async def ingest_episode(self, episode_text: str, *, chat_id: int | None = None) -> object: ...
+
+
 class DiaryConsolidator:
     """Программная консолидация и пополнение дневника: dedup, сжатие старых записей, автоматическое извлечение новых."""
 
@@ -174,6 +189,7 @@ class DiaryConsolidator:
         novelization_char_limit: int = _DEFAULT_NOVELIZATION_CHAR_LIMIT,
         novelization_max_output_tokens: int = _DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS,
         character_name: str = "Эфи",
+        knowledge: KnowledgeSink | None = None,
     ) -> None:
         self._diary = diary
         #: Своим именем Эфи подписана в плоском тексте переписки — иначе её
@@ -184,6 +200,11 @@ class DiaryConsolidator:
         self._novelization_max_output_tokens = novelization_max_output_tokens
         self._rag = rag
         self._summarization_role = summarization_role
+        #: Необязателен: без него консолидация ведёт себя ровно как раньше и
+        #: пополняет только дневник. Это не «фича под флагом», а честная
+        #: граница — строгое хранилище требует и БД, и эмбеддингов, а тесты
+        #: дневника не должны тащить за собой ни то, ни другое.
+        self._knowledge = knowledge
 
     async def deduplicate(self, *, plagiarism_threshold: float) -> int:
         """
@@ -314,8 +335,18 @@ class DiaryConsolidator:
         короткие эпизоды выпадали бы из памяти навсегда просто потому, что
         пульс заглянул слишком рано.
 
+        Тот же текст эпизода уходит в строгое хранилище знаний, если оно
+        передано (`knowledge`): дневник и knowledge_facts — два разных среза
+        одного прожитого куска, и разъезжаться им нельзя. Здесь, а не в
+        пульсе памяти: `novelize_chat` — единственная точка, общая для
+        частого пульса и ночного прохода, и повесив разбор на одну из них,
+        мы получили бы память, которая зависит от того, каким путём эпизод
+        дошёл до осмысления.
+
         Возвращает число новых записей, реально сохранённых в дневник
         (дубли, отбракованные RAGMemory.remember(), в счёт не идут).
+        Результат разбора знаний в это число не входит: это отдельный срез
+        памяти со своим счётом, см. IngestResult.
         """
         session = await history.get_since(chat_id, since=since)
         experience_lines: list[str] = []
@@ -324,7 +355,9 @@ class DiaryConsolidator:
         if len(session.messages) + len(experience_lines) < min_messages:
             return 0
 
-        memories = await self._extract_memories(session, experience_lines)
+        episode_text = self._compose_episode(session, experience_lines)
+        memories = await self._extract_memories(episode_text)
+        await self._ingest_knowledge(episode_text, chat_id=chat_id)
         saved = 0
         for memory_text in memories:
             entry = await self._rag.remember(memory_text, confidence=0.5)
@@ -398,7 +431,16 @@ class DiaryConsolidator:
             )
             return datetime.now(UTC) - lookback
 
-    async def _extract_memories(self, session: Session, experience_lines: list[str] | None = None) -> list[str]:
+    def _compose_episode(self, session: Session, experience_lines: list[str] | None = None) -> str:
+        """
+        Прожитый кусок одним текстом: переписка плюс то, что Эфи делала
+        параллельно. Пустая строка — эпизода не было вовсе.
+
+        Собирается один раз и уходит СРАЗУ В ДВА разбора — дневниковый и
+        знаниевый. Собирать дважды значило бы допустить, что дневник и
+        knowledge_facts осмысляют слегка разный текст, а расхождение между
+        двумя срезами одной памяти потом не отследить ничем.
+        """
         blocks: list[str] = []
         conversation_text = render_transcript(
             session, self_name=self._character_name, char_limit=self._novelization_char_limit
@@ -411,9 +453,29 @@ class DiaryConsolidator:
             # треды, не ведя разговора как такового.
             header = _EXPERIENCE_BLOCK_HEADER if conversation_text else _EXPERIENCE_ONLY_HEADER
             blocks.append(header + "\n" + "\n".join(f"- {line}" for line in experience_lines))
-        if not blocks:
+        return "\n\n".join(blocks)
+
+    async def _ingest_knowledge(self, episode_text: str, *, chat_id: int | None) -> None:
+        """
+        Второй разбор того же эпизода — в строгое хранилище знаний.
+
+        Сбой здесь не должен отменять дневник: это два независимых среза
+        памяти, и потерять оба из-за проблем в одном — хуже, чем потерять
+        один. Поэтому исключение только логируется.
+        """
+        if self._knowledge is None or not episode_text:
+            return
+        try:
+            await self._knowledge.ingest_episode(episode_text, chat_id=chat_id)
+        except Exception:
+            logger.warning(
+                "consolidation: разбор знаний для chat_id=%s не удался, дневник это не отменяет",
+                chat_id, exc_info=True,
+            )
+
+    async def _extract_memories(self, conversation_text: str) -> list[str]:
+        if not conversation_text:
             return []
-        conversation_text = "\n\n".join(blocks)
 
         params = LLMParams(
             model="",

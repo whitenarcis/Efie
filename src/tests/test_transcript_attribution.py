@@ -181,7 +181,9 @@ async def test_the_novelization_prompt_gets_attributed_lines(tmp_path) -> None: 
     )
 
     await consolidator._extract_memories(
-        _session((Role.USER, "Рома: я весь вечер чинил парсер"), (Role.ASSISTANT, "а я вожусь с плёнкой"))
+        consolidator._compose_episode(
+            _session((Role.USER, "Рома: я весь вечер чинил парсер"), (Role.ASSISTANT, "а я вожусь с плёнкой"))
+        )
     )
 
     assert len(seen) == 1

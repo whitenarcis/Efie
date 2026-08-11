@@ -244,7 +244,7 @@ class FactValidator:
         if len(text) > MAX_ENTITY_CHARS:
             return "", f"слишком длинная сущность ({len(text)} символов)"
 
-        normalized = text.replace(" ", "_")
+        normalized = normalize_mention(raw)
         if normalized in RESERVED_ENTITIES:
             return "", f"служебная сущность {normalized!r} недоступна для записи"
 
@@ -385,6 +385,22 @@ def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(numeric, high))
 
 
+def normalize_mention(raw: str) -> str:
+    """
+    Имя сущности БЕЗ префикса домена — то, что стоит после двоеточия в
+    `entity_id` («person:рома» -> «рома»).
+
+    Вынесено сюда и экспортируется, чтобы каталог сущностей
+    (efi/memory/catalog.py) строил ключи ровно тем же способом, каким
+    валидатор нормализует сущности фактов. Разойдись эти две нормализации на
+    регистре или пробеле — каталог перестал бы находиться, разрешение
+    упоминаний тихо выключилось бы, и заметить это было бы нечем: фактам
+    просто досталась бы неразрешённая сущность.
+    """
+    text = _collapse(raw).strip(" .,:;!?").lower()
+    return text.replace(" ", "_")
+
+
 def _collapse(text: str) -> str:
     return _MULTISPACE_RE.sub(" ", unicodedata.normalize("NFKC", str(text or ""))).strip()
 
@@ -399,4 +415,5 @@ __all__ = [
     "ValidatedFact",
     "ValidationReport",
     "compute_hash",
+    "normalize_mention",
 ]

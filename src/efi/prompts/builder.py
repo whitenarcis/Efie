@@ -59,6 +59,7 @@ from efi.behavior.affinity import (
     AffinitySnapshot,
     AffinityTracker,
 )
+from efi.behavior.ambiguity import PendingClarification, PendingClarifications
 from efi.config.schema import LockdownMode, Settings
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
 from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
@@ -207,6 +208,7 @@ class EfiSystemPromptBuilder:
         affinity: AffinityTracker,
         people: PeopleStore | None = None,
         knowledge: KnowledgeStore | None = None,
+        clarifications: PendingClarifications | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -216,6 +218,11 @@ class EfiSystemPromptBuilder:
         self._affinity = affinity
         self._people = people
         self._knowledge = knowledge
+        #: Незакрытые уточнения по чатам (efi/behavior/ambiguity.py). Именно
+        #: через промпт, а не отдельным сообщением: вопрос «ты про Феникс-кота
+        #: или Феникс-проект?» должен прозвучать в её обычной реплике, а не
+        #: прилететь роботизированным уведомлением посреди разговора.
+        self._clarifications = clarifications
         #: Без состояния — один на билдер, см. efi/memory/router.py.
         self._memory_router = MemoryRouter()
 
@@ -287,6 +294,7 @@ class EfiSystemPromptBuilder:
                 self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
             ),
             _build_proactive_brevity_block(notification),
+            _build_clarification_block(self._peek_clarification(notification)),
             _build_time_block(now, is_user_message=notification.type is NotificationType.USER_MESSAGE),
             _build_working_memory_block(memory_snapshot, self_state),
             _build_state_vector_block(
@@ -298,6 +306,16 @@ class EfiSystemPromptBuilder:
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    def _peek_clarification(self, notification: Notification) -> PendingClarification | None:
+        """
+        Уточнение по ЭТОМУ чату, если оно ещё живо. Синхронно и без I/O —
+        реестр держится в памяти процесса (см. PendingClarifications: вопрос
+        живёт минуты и осмыслен только внутри текущего разговора).
+        """
+        if self._clarifications is None or notification.chat_id is None:
+            return None
+        return self._clarifications.peek(notification.chat_id)
 
     async def _resolve_knowledge(
         self, notification: Notification, domains: tuple[MemoryDomain, ...]
@@ -584,6 +602,27 @@ def _build_proactive_brevity_block(notification: Notification) -> str:
         "никаких острот про технику/энергосбережение/сон в обнимку с клавиатурой. "
         "Просто напиши то, с чем реально пришла — коротко и по-человечески, "
         "и оставь собеседнику место ответить. Если есть уместный стикер — он тут лучше слов."
+    )
+
+
+def _build_clarification_block(pending: PendingClarification | None) -> str:
+    """
+    Незакрытый уточняющий вопрос — то, что Эфи обязана спросить, прежде чем
+    записывать факт о неоднозначном упоминании.
+
+    Через промпт, а не отдельным сообщением: «ты про Феникс-кота или
+    Феникс-проект?» должно прозвучать её обычной репликой, вплетённой в
+    разговор, а не прилететь роботизированным уведомлением из ниоткуда.
+    Формулировка вопроса уже готова (efi/behavior/ambiguity.py), но она —
+    образец смысла, а не текст под копирку: у Эфи своя манера речи.
+    """
+    if pending is None:
+        return ""
+    options = ", ".join(candidate.describe() for candidate in pending.candidates)
+    return (
+        f"[Надо уточнить] В разговоре прозвучало «{pending.mention}», и ты не поняла, о ком речь: "
+        f"{options}. Пока не выяснишь — не делай вид, что поняла, и ничего про это не запоминай. "
+        f"Спроси по ходу разговора, своими словами и коротко. Смысл вопроса такой: «{pending.question}»"
     )
 
 

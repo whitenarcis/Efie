@@ -98,6 +98,7 @@ import logging
 from datetime import datetime
 from typing import Protocol
 
+from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.config.schema import TaskRole
@@ -224,6 +225,7 @@ class Worker:
         social_memory: SocialInteractionStore | None = None,
         orchestrator: ChatOrchestrator | None = None,
         working_memory: WorkingMemoryPort | None = None,
+        clarifications: PendingClarifications | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -241,6 +243,9 @@ class Worker:
         self._social_memory = social_memory
         self._orchestrator = orchestrator
         self._working_memory = working_memory
+        #: Тот же реестр, что читает сборщик промпта (efi/prompts/builder.py).
+        #: Воркер только закрывает вопрос ответом; задаёт его — промпт.
+        self._clarifications = clarifications
 
     async def run(self) -> None:
         """
@@ -334,6 +339,7 @@ class Worker:
             marked_as_read = True
 
         await self._apply_busy_delay(notification, decision.delay_seconds)
+        self._close_clarification_if_answered(notification)
 
         history = (
             await self._history.get_recent(notification.chat_id, limit=self._history_limit)
@@ -458,6 +464,29 @@ class Worker:
             await self._working_memory.spend_energy()
         except Exception:
             logger.warning("worker[%d]: не удалось списать энергию за ход", self._worker_index, exc_info=True)
+
+    def _close_clarification_if_answered(self, notification: Notification) -> None:
+        """
+        Закрывает уточняющий вопрос, если собеседник только что на него
+        ответил.
+
+        Здесь, ДО сборки промпта: иначе в промпт этого же хода уехал бы блок
+        «надо уточнить», и Эфи задала бы вопрос второй раз, уже получив ответ.
+
+        Ответ, который не удалось сопоставить ни с одним вариантом, вопрос НЕ
+        закрывает (см. PendingClarifications.resolve_with_answer) — неопознанный
+        ответ ничем не лучше исходной неоднозначности.
+        """
+        if self._clarifications is None or notification.chat_id is None:
+            return
+        if notification.type is not NotificationType.USER_MESSAGE:
+            return
+        resolved = self._clarifications.resolve_with_answer(notification.chat_id, notification.message)
+        if resolved is not None:
+            logger.info(
+                "worker[%d]: уточнение в chat_id=%s закрыто ответом -> %s",
+                self._worker_index, notification.chat_id, resolved.entity_id,
+            )
 
     def _retry_if_proactive(self, notification: Notification, tool_context: ToolContext, *, reason: str) -> None:
         """
