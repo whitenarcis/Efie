@@ -65,6 +65,7 @@ from efi.notifications.manager import NotificationManager
 from efi.notifications.worker import Worker
 from efi.prompts.builder import EfiSystemPromptBuilder
 from efi.prompts.loader import PromptLoader
+from efi.security.access_control import describe_access_policy
 from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.client import TelegramClientWrapper
 from efi.telegram.comments import (
@@ -451,6 +452,12 @@ class EfiApp:
         # дашборда не попадёт.
         self._log_buffer.install()
         logger.info("app: starting")
+
+        # Кто фактически может с ней говорить — одной строкой при старте.
+        # «Почему она не отвечает» это вопрос про сочетание lockdown_mode,
+        # allowed_chats и community_chats, и выяснять его по конфигу вручную
+        # неудобно ровно тогда, когда что-то не работает.
+        logger.info("app: отвечает — %s", describe_access_policy(self._settings.telegram))
 
         self._telegram_handlers.register(self._pyrogram_client)
         self._channel_post_watcher.register(self._pyrogram_client)

@@ -55,7 +55,7 @@ from efi.llm.router import LLMRouter
 from efi.media.stt_groq import GroqSTT
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
-from efi.security.access_control import ChatAccessInfo, is_chat_accessible
+from efi.security.access_control import AccessDeniedReason, ChatAccessInfo, is_chat_accessible
 from efi.telegram.buffer import InboundMessageBuffer
 from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.formatting import format_user_message
@@ -165,6 +165,10 @@ class TelegramEventHandlers:
             max_wait_seconds=humanizer_settings.debounce_max_wait_seconds,
             on_interrupt=orchestrator.interrupt if orchestrator is not None else None,
         )
+        #: Чаты, про которые уже сказано «не отвечаю и вот почему». Нужен,
+        #: чтобы объяснить причину один раз, а не на каждое сообщение
+        #: настойчивого собеседника — см. _log_access_denied.
+        self._denied_chats: set[int] = set()
 
     def register(self, client: Client) -> None:
         """Регистрирует все обработчики на клиенте. Вызывается один раз при сборке приложения (efi/app.py)."""
@@ -334,7 +338,7 @@ class TelegramEventHandlers:
         )
         allowed, reason = is_chat_accessible(access_info, self._telegram_settings)
         if not allowed:
-            logger.debug("telegram: message from chat_id=%s dropped (%s)", access_info.chat_id, reason)
+            self._log_access_denied(access_info, reason)
             return None
 
         if message.chat.type in _GROUP_CHAT_TYPES and not _is_addressed_to_bot(message, client):
@@ -344,6 +348,29 @@ class TelegramEventHandlers:
             return None
 
         return access_info
+
+    def _log_access_denied(self, access_info: ChatAccessInfo, reason: AccessDeniedReason | None) -> None:
+        """
+        ПЕРВЫЙ отказ по каждому чату — на уровне INFO и с подсказкой, что
+        поменять в конфигурации; повторные — на debug.
+
+        Пока весь отказ был debug-записью, «Эфи не отвечает» и «Эфи не
+        получает сообщений» выглядели снаружи одинаково: тишиной в логе при
+        стандартном уровне INFO. Причина при этом всегда известна коду
+        точно — её достаточно один раз произнести вслух. Один раз, а не на
+        каждое сообщение: собеседник, которому не отвечают, обычно пишет
+        ещё несколько раз подряд, и лента не должна этим забиваться.
+        """
+        if reason is None:  # pragma: no cover — отказ всегда приходит с причиной
+            return
+        if access_info.chat_id in self._denied_chats:
+            logger.debug("telegram: message from chat_id=%s dropped (%s)", access_info.chat_id, reason.value)
+            return
+        self._denied_chats.add(access_info.chat_id)
+        logger.info(
+            "telegram: не отвечаю в chat_id=%s (%s). %s",
+            access_info.chat_id, reason.value, reason.hint(),
+        )
 
     async def _dispatch_user_message(
         self,
