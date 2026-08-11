@@ -69,6 +69,16 @@ class ChatOrchestrator:
         task = self._active.get(chat_id)
         return task is not None and not task.done()
 
+    def active_chat_ids(self) -> list[int]:
+        """
+        Чаты, в которых прямо сейчас идёт генерация. Только для наблюдения
+        (efi/dashboard/): завершённые таски остаются в `_active` до
+        следующего запуска в том же чате, поэтому фильтровать по `done()`
+        обязательно — иначе дашборд показывал бы «пишет» в чате, где всё
+        давно отправлено.
+        """
+        return [chat_id for chat_id, task in self._active.items() if not task.done()]
+
     async def interrupt(self, chat_id: int) -> bool:
         """
         Снимает активную генерацию чата, если она есть. Возвращает True,

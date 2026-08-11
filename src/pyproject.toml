@@ -65,6 +65,12 @@ testpaths = ["tests"]
 include = ["efi*", "scripts*"]
 exclude = ["data*", "logs*", "tests*"]
 
+# Не-питоновские файлы, без которых установленный пакет неработоспособен:
+# страница дашборда и шаблоны личности. По умолчанию setuptools кладёт в
+# дистрибутив только .py, и дашборд отдавал бы 404 на собственную статику.
+[tool.setuptools.package-data]
+efi = ["dashboard/static/*", "prompts/templates/*"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

@@ -3,9 +3,9 @@ efi/app.py
 
 EfiApp — точка сборки всего приложения: связывает Settings, Database,
 LLMRouter, память (Diary/RAGMemory/WorkingMemory/FactStore), очередь событий
-(NotificationManager + N Worker'ов), Telegram-слой и проактивные сервисы
-(Scheduler/SpontaneousPingScheduler/SilenceMonitor) в один управляемый объект
-с корректным graceful shutdown.
+(NotificationManager + N Worker'ов), Telegram-слой, проактивные сервисы
+(Scheduler/SpontaneousPingScheduler/SilenceMonitor) и веб-дашборд
+(efi/dashboard/) в один управляемый объект с корректным graceful shutdown.
 
 EfiApp сам не работает с сигналами ОС (SIGINT/SIGTERM) — это дело точки
 входа (scripts/run.py), которая вызывает `request_stop()` из обработчика
@@ -25,16 +25,22 @@ from typing import Any
 from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
+from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
+from efi.behavior.reminders import ReminderScheduler, ReminderStore
 from efi.behavior.researcher import BackgroundResearcher
 from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
 from efi.behavior.silence_monitor import SilenceMonitor
 from efi.behavior.spontaneous_ping import SpontaneousPingScheduler
 from efi.config.schema import Settings, TaskRole
+from efi.dashboard.logbus import LogBuffer
+from efi.dashboard.metrics import LLMMetricsCollector
+from efi.dashboard.server import DashboardServer
+from efi.dashboard.snapshot import DashboardContext
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
@@ -42,14 +48,18 @@ from efi.humanizer.anti_repeat import AntiRepeatTracker
 from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
+from efi.memory.dedup import KnowledgeStore
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
+from efi.memory.ingest import MemoryIngestor
 from efi.memory.local_embeddings import LocalEmbeddingEngine
+from efi.memory.parser import PerceptionParser
 from efi.memory.people import PeopleStore
 from efi.memory.pulse import MemoryPulse
 from efi.memory.rag import RAGMemory
 from efi.memory.social_memory import SocialInteractionStore
 from efi.memory.tfidf_fallback import TfidfFallbackIndex
+from efi.memory.validator import FactValidator
 from efi.memory.working_memory import WorkingMemory
 from efi.notifications.manager import NotificationManager
 from efi.notifications.worker import Worker
@@ -113,10 +123,23 @@ class EfiApp:
         self._stop_event = asyncio.Event()
         self._background_tasks: list[asyncio.Task[None]] = []
         self._worker_tasks: list[asyncio.Task[None]] = []
+        self._started_at = datetime.now(UTC)
+
+        # -- наблюдаемость ---------------------------------------------------
+        # Строится ПЕРВОЙ: сборщик метрик нужен LLM-роутеру уже в конструкторе
+        # (он оборачивает провайдеров при создании), а буфер логов должен
+        # встать на корневой логгер до того, как подсистемы начнут писать.
+        dashboard_settings = settings.dashboard
+        self._log_buffer = LogBuffer(
+            capacity=dashboard_settings.log_buffer_size, level=dashboard_settings.log_level_no
+        )
+        self._llm_metrics = LLMMetricsCollector(history=dashboard_settings.metrics_history)
 
         # -- инфраструктура ------------------------------------------------
         self._database = Database(settings.paths.db_path, migrations=MIGRATIONS)
-        self._llm_router = settings.build_router()
+        self._llm_router = settings.build_router(
+            metrics_sink=self._llm_metrics.sink if dashboard_settings.enabled else None
+        )
 
         # -- память ----------------------------------------------------------
         diary_dir = settings.memory.resolve_diary_dir(settings.paths)
@@ -130,6 +153,20 @@ class EfiApp:
         self._rag = RAGMemory(self._diary, self._llm_router, self._tfidf, local_embeddings=self._local_embeddings)
         self._working_memory = WorkingMemory(settings.paths.data_dir / "working_memory.json")
         self._facts = FactStore(self._database)
+        # -- строгое хранилище знаний (границы доверия + домены C/P/H) --------
+        # Собирается ЗДЕСЬ, сразу за RAG: дедупликации нужен тот же источник
+        # эмбеддингов, что и дневнику (сравнивать факты вектором другого
+        # движка — значит сравнивать несравнимое, см. efi/memory/dedup.py).
+        self._knowledge = KnowledgeStore(self._database, embedder=self._rag)
+        self._fact_validator = FactValidator(owner_id=settings.telegram.owner_id)
+        self._perception = PerceptionParser(self._llm_router)
+        self._pending_clarifications = PendingClarifications()
+        self._memory_ingestor = MemoryIngestor(
+            self._perception,
+            self._fact_validator,
+            self._knowledge,
+            pending=self._pending_clarifications,
+        )
         self._history = SqliteHistoryRepository(self._database)
         self._consolidator = DiaryConsolidator(
             self._diary,
@@ -155,7 +192,13 @@ class EfiApp:
         # векторную память через RAG, поэтому конструируется ПОСЛЕ _rag.
         self._social_memory = SocialInteractionStore(self._database, rag=self._rag)
         # Жизненный цикл диалога с посторонними (владелец vs остальные).
-        self._lifecycle = ConversationLifecycle(self._database, owner_id=settings.telegram.owner_id)
+        self._lifecycle = ConversationLifecycle(
+            self._database,
+            owner_id=settings.telegram.owner_id,
+            # Куда вообще разрешено писать первой — тот же список, которым
+            # владелец задаёт «свои» чаты. Личка владельца добавляется внутри.
+            proactive_chats=settings.telegram.allowed_chats,
+        )
         # Пульс памяти — превращает прожитое в воспоминания по ходу дня, а не
         # раз в сутки ночью. Зависит и от консолидатора, и от журнала внешнего
         # опыта (тот подмешивается в разбор эпизода), поэтому конструируется
@@ -201,12 +244,18 @@ class EfiApp:
             self._beliefs,
             self._affinity,
             self._people,
+            knowledge=self._knowledge,
         )
 
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
         self._silence_monitor = SilenceMonitor(self._notification_manager, quiet_hours=settings.quiet_hours)
+        # Отложенные напоминания («напиши мне через 10 минут»). Персистентные:
+        # обещание со сроком обязано пережить перезапуск, иначе оно тихо
+        # исчезает ровно тогда, когда человек на него рассчитывает.
+        self._reminders = ReminderStore(self._database)
+        self._reminder_scheduler = ReminderScheduler(self._notification_manager, self._reminders)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
         self._researcher = BackgroundResearcher(
             templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
@@ -300,16 +349,56 @@ class EfiApp:
         self._tool_registry = ToolRegistry()
         self._tool_registry.register_all(self._build_tools())
 
+        # -- дашборд ------------------------------------------------------------
+        # Конструируется ПОСЛЕДНИМ: он смотрит на всё остальное. Списки задач
+        # передаются вызываемыми, а не значениями — они наполняются в start(),
+        # уже после сборки контекста.
+        self._dashboard: DashboardServer | None = None
+        if settings.dashboard.enabled:
+            self._dashboard = DashboardServer(
+                DashboardContext(
+                    settings=settings,
+                    logs=self._log_buffer,
+                    metrics=self._llm_metrics,
+                    started_at=self._started_at,
+                    database=self._database,
+                    diary=self._diary,
+                    working_memory=self._working_memory,
+                    history=self._history,
+                    beliefs=self._beliefs,
+                    affinity=self._affinity,
+                    people=self._people,
+                    lifecycle=self._lifecycle,
+                    busy_engine=self._busy_engine,
+                    life_engine=self._life_engine,
+                    notifications=self._notification_manager,
+                    orchestrator=self._orchestrator,
+                    telegram=self._telegram_client,
+                    tools=self._tool_registry,
+                    llm_router=self._llm_router,
+                    prompt_loader=self._prompt_loader,
+                    background_tasks=lambda: self._background_tasks,
+                    worker_tasks=lambda: self._worker_tasks,
+                ),
+                settings.dashboard,
+            )
+
     def _build_tools(self) -> list[Tool]:
         return [
             AskDiaryTool(self._rag, min_relatedness=self._settings.memory.min_relatedness),
-            RememberFactTool(self._facts),
-            RecallFactTool(self._facts),
+            RememberFactTool(self._knowledge, self._fact_validator),
+            RecallFactTool(self._knowledge, self._fact_validator),
             RememberDiaryEntryTool(self._rag),
             UpdateBeliefTool(self._beliefs),
             UpdateSelfStateTool(self._working_memory),
-            RememberPromiseTool(self._working_memory),
-            CompletePromiseTool(self._working_memory),
+            RememberPromiseTool(
+                self._working_memory,
+                reminders=self._reminders,
+                # Проверяем право написать первой В МОМЕНТ ОБЕЩАНИЯ: пообещать
+                # и не смочь хуже, чем сразу честно предупредить.
+                can_schedule=self._lifecycle.allows_proactive_ping_to_chat,
+            ),
+            CompletePromiseTool(self._working_memory, reminders=self._reminders),
             RememberPersonTool(self._people),
             SendMessageTool(
                 self._telegram_client,
@@ -357,6 +446,10 @@ class EfiApp:
 
     async def start(self) -> None:
         """Поднимает все подсистемы: Telegram-клиент, обработчики, воркеры, проактивные сервисы."""
+        # Буфер логов встаёт на корневой логгер ПЕРВЫМ делом: иначе ровно то,
+        # что происходит на старте (а падает чаще всего именно там), в ленту
+        # дашборда не попадёт.
+        self._log_buffer.install()
         logger.info("app: starting")
 
         self._telegram_handlers.register(self._pyrogram_client)
@@ -379,6 +472,7 @@ class EfiApp:
                 lifecycle=self._lifecycle,
                 social_memory=self._social_memory,
                 orchestrator=self._orchestrator,
+                promises=self._working_memory,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 
@@ -392,11 +486,23 @@ class EfiApp:
                 self._spawn_supervised(self._prompt_loader.watch(), name="prompt_loader_watch"),
                 self._spawn_supervised(self._run_consolidation_loop(), name="diary_consolidation"),
                 self._spawn_supervised(self._random_comment_engager.run(), name="random_comment_engager"),
+                self._spawn_supervised(self._reminder_scheduler.run(), name="reminders"),
             ]
         )
 
         if self._settings.memory_pulse.enabled:
             self._background_tasks.append(self._spawn_supervised(self._memory_pulse.run(), name="memory_pulse"))
+
+        if self._dashboard is not None:
+            # Дашборд поднимается ПОСЛЕДНИМ и не через _spawn_supervised: он
+            # не крутит свой цикл, а держит asyncio-сервер, и его падение при
+            # старте (занятый порт) не должно остаться незамеченным — но и
+            # ронять из-за него уже поднятую Эфи неправильно.
+            try:
+                await self._dashboard.start()
+            except OSError as exc:
+                logger.error("app: dashboard failed to start (%s), continuing without it", exc)
+                self._dashboard = None
 
         logger.info(
             "app: started (%d workers, %d background services)",
@@ -502,6 +608,13 @@ class EfiApp:
         """
         logger.info("app: stopping")
 
+        # Дашборд гасится первым: он читает состояние всех подсистем, и его
+        # запрос, пришедший посреди остановки, увидел бы полуразобранное
+        # приложение. Логи при этом продолжают писаться в буфер до самого
+        # конца — обработчик снимается уже после остановки всего остального.
+        if self._dashboard is not None:
+            await self._dashboard.stop()
+
         # Недописанные, ещё не отфлашенные из дебаунсера сообщения (человек
         # написал что-то за секунды до остановки) — сбрасываем в очередь,
         # а не молча теряем.
@@ -537,6 +650,7 @@ class EfiApp:
             await self._stt.aclose()
 
         logger.info("app: stopped")
+        self._log_buffer.uninstall()
 
 
 def _build_scheduled_jobs() -> list[ScheduledJob]:

@@ -289,16 +289,24 @@ async def test_user_turn_is_persisted_even_when_llm_fails() -> None:
 
 
 async def test_non_user_message_does_not_fabricate_a_user_turn() -> None:
-    """Триггер SPONTANEOUS_PING и т.п. — не то, что сказал собеседник, и не должен так выглядеть в истории."""
+    """
+    Триггер SPONTANEOUS_PING и т.п. — не то, что сказал собеседник, и не
+    должен так выглядеть в истории.
+
+    Здесь модель к тому же не вызывает send_telegram_message, то есть до
+    собеседника не долетело ничего — значит, в историю не должно попасть
+    вообще ничего: сохранённая реплика заставила бы Эфи в следующий раз
+    считать, что она это сказала. Доставленный инициативный ход сохраняется
+    как обычно — см. tests/test_proactive_delivery.py.
+    """
     events: list[str] = []
     worker, _telegram, _busy_engine, history = _make_worker(events)
     notification = Notification(type=NotificationType.SPONTANEOUS_PING, chat_id=42, message="напиши первой")
 
     await worker._handle(notification)
 
-    assert len(history.appended) == 1
-    _chat_id, message = history.appended[0]
-    assert message.role is Role.ASSISTANT
+    assert all(message.role is not Role.USER for _chat_id, message in history.appended)
+    assert history.appended == []
 
 
 class _ScriptedToolCallingLLMRouter:
@@ -671,6 +679,9 @@ class _FakeLifecycle:
         self.evaluated: list[tuple[int | None, int, str]] = []
 
     def allows_proactive_ping(self, user_id: int | None) -> bool:
+        return self._allow_proactive
+
+    def allows_proactive_ping_to_chat(self, chat_id: int | None, sender_id: int | None = None) -> bool:
         return self._allow_proactive
 
     async def evaluate(self, peer_user_id: int | None, chat_id: int, text: str) -> LifecycleDecision:

@@ -57,6 +57,8 @@ TOML-файл (``behavior.toml``) > значения по умолчанию, з
 
 from __future__ import annotations
 
+import ipaddress
+import logging
 import os
 from enum import StrEnum
 from functools import lru_cache
@@ -843,6 +845,123 @@ class QuietHoursSettings(BaseModel):
     end_hour: int = Field(default=8, ge=0, le=23, description="Час окончания тихих часов (локальное время сервера)")
 
 
+class DashboardSettings(BaseModel):
+    """
+    Веб-дашборд (efi/dashboard/): подробные логи, состояние подсистем,
+    дневник и вся накопленная память в браузере.
+
+    По умолчанию слушает ВСЕ интерфейсы (`0.0.0.0`): смысл дашборда в том,
+    чтобы смотреть на Эфи, которая крутится в Termux на телефоне, с ноутбука
+    в той же сети — а на самом телефоне открывать браузер поверх работающего
+    userbot'а неудобно и незачем. Ограничить его одной машиной по-прежнему
+    можно, поставив `host = "127.0.0.1"`.
+
+    Дашборд показывает переписку, дневник и профили людей, поэтому при выходе
+    за петлевой интерфейс он ТРЕБУЕТ токен, если сеть не выглядит домашней
+    (см. валидатор ниже): в локальной сети за роутером его можно не заводить,
+    а вот на машине с публичным адресом — обязательно.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=True, description="Поднимать ли дашборд вместе с приложением")
+    host: str = Field(
+        default="0.0.0.0",  # noqa: S104 — осознанно: см. докстринг класса и валидатор ниже
+        description=(
+            "Интерфейс, который слушает дашборд. 0.0.0.0 — доступен с других устройств локальной сети "
+            "(http://<ip-машины>:8765/), 127.0.0.1 — только с самой машины"
+        ),
+    )
+    port: int = Field(default=8765, ge=0, le=65535, description="Порт дашборда (0 — выбрать свободный, для тестов)")
+    token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Токен доступа. Не обязателен в домашней сети (localhost или частный адрес), обязателен, если "
+            "дашборд слушает публично маршрутизируемый адрес. Принимается заголовком X-Efi-Token, cookie "
+            "или ?token=... в ссылке"
+        ),
+    )
+    log_buffer_size: int = Field(
+        default=2000, ge=100, le=100_000, description="Сколько последних записей лога держать в памяти для ленты"
+    )
+    log_level: str = Field(
+        default="INFO",
+        description=(
+            "Минимальный уровень записей, попадающих в ленту дашборда. DEBUG показывает решения буфера, "
+            "оркестратора и роутера — полезно при отладке, но лента растёт быстро"
+        ),
+    )
+    metrics_history: int = Field(
+        default=200, ge=10, le=5000, description="Сколько последних LLM-вызовов держать в ленте метрик"
+    )
+
+    @model_validator(mode="after")
+    def _validate_exposure(self) -> DashboardSettings:
+        if not self.enabled:
+            return self
+        if self.log_level.upper() not in logging.getLevelNamesMapping():
+            raise ValueError(f"dashboard.log_level: неизвестный уровень логирования {self.log_level!r}")
+        if self.token is None and _is_public_host(self.host):
+            raise ValueError(
+                f"dashboard.host = {self.host!r} — это публично маршрутизируемый адрес, а dashboard.token "
+                "не задан. Дашборд отдаёт дневник, историю переписки и профили людей, поэтому наружу он "
+                'без токена не поднимается. Задайте EFI_DASHBOARD__TOKEN, либо оставьте host = "0.0.0.0" '
+                "(доступ только из локальной сети, если машина не смотрит в интернет напрямую)."
+            )
+        return self
+
+    @property
+    def log_level_no(self) -> int:
+        return logging.getLevelNamesMapping()[self.log_level.upper()]
+
+    @property
+    def is_local_only(self) -> bool:
+        """Доступен ли дашборд только с самой машины (тогда про токен можно вообще не думать)."""
+        return _is_loopback_host(self.host)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """Петлевой ли это адрес — то есть слышен ли дашборд только с самой машины."""
+    normalized = host.strip().strip("[]").lower()
+    if not normalized:
+        return False  # пустой host в asyncio означает «все интерфейсы»
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_public_host(host: str) -> bool:
+    """
+    Смотрит ли этот адрес в интернет.
+
+    Различение нужно, чтобы не мешать основному сценарию: Эфи живёт в Termux
+    на телефоне, а дашборд открывают с ноутбука в той же сети — требовать в
+    этом случае токен значит требовать его всегда, потому что без `0.0.0.0`
+    другое устройство не подключится вовсе.
+
+    `0.0.0.0` / пустая строка (все интерфейсы) публичным адресом НЕ считаются:
+    какие адреса за ними стоят, зависит от машины, и на домашнем телефоне за
+    NAT это ровно локальная сеть. А вот явно прописанный внешний адрес —
+    осознанное решение выставить дашборд в интернет, и вот там токен нужен.
+    """
+    normalized = host.strip().strip("[]").lower()
+    if not normalized or normalized in {"0.0.0.0", "::", "localhost"}:  # noqa: S104 — сравнение, а не bind
+        return False
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        # Доменное имя: куда оно резолвится, здесь не проверить, а
+        # предполагать лучшее для чужого адреса не стоит.
+        return True
+    # is_global — ровно нужный вопрос «маршрутизируется ли этот адрес в
+    # интернете»: он уже учитывает и петлю, и частные диапазоны, и
+    # link-local, и зарезервированные сети, а не только 10/172.16/192.168.
+    return bool(address.is_global)
+
+
 class Settings(BaseSettings):
     """
     Корневой объект конфигурации приложения.
@@ -885,6 +1004,7 @@ class Settings(BaseSettings):
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
     quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
     community: CommunitySettings = Field(default_factory=CommunitySettings)
+    dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
 
     @classmethod
     def settings_customise_sources(
@@ -1033,6 +1153,9 @@ __all__ = [
     "SttSettings",
     "LifeEngineSettings",
     "BusyEngineSettings",
+    "CommunitySettings",
+    "QuietHoursSettings",
+    "DashboardSettings",
     "Settings",
     "get_settings",
 ]

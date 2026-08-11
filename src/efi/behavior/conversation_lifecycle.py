@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -164,9 +165,13 @@ class ConversationLifecycle:
     efi.behavior.affinity.AffinityTracker.
     """
 
-    def __init__(self, database: Database, *, owner_id: int) -> None:
+    def __init__(self, database: Database, *, owner_id: int, proactive_chats: Iterable[int] = ()) -> None:
         self._database = database
         self._owner_id = owner_id
+        #: Чаты, куда владелец сам разрешил писать первой (telegram.allowed_chats).
+        #: Личка владельца входит сюда всегда: в Telegram id приватного чата
+        #: совпадает с user_id собеседника.
+        self._proactive_chats = {owner_id, *proactive_chats}
         self._cache: dict[tuple[int, int], ConversationState] = {}
         self._terse_streak: dict[tuple[int, int], int] = {}
 
@@ -176,11 +181,35 @@ class ConversationLifecycle:
 
     def allows_proactive_ping(self, user_id: int | None) -> bool:
         """
-        Инициативные пинги (SPONTANEOUS_PING и родственные) разрешены ТОЛЬКО
-        владельцу. Писать первой постороннему — навязчивость по определению:
-        он не просил о себе напоминать.
+        Разрешён ли инициативный пинг КОНКРЕТНОМУ человеку. Только владельцу:
+        писать первой постороннему — навязчивость по определению, он не
+        просил о себе напоминать.
         """
         return self.classify(user_id) is UserTier.PRIMARY
+
+    def allows_proactive_ping_to_chat(self, chat_id: int | None, sender_id: int | None = None) -> bool:
+        """
+        Разрешён ли инициативный пинг в ЭТОТ ЧАТ.
+
+        Отдельный метод, а не `allows_proactive_ping(sender_id)`, потому что у
+        инициативы отправителя нет по определению: спонтанный пинг, пинг по
+        затишью и follow-up рождаются не из чужой реплики, а из таймера, и
+        `sender_id` в их payload взять неоткуда. Раньше Worker всё равно
+        спрашивал именно про отправителя — получал None, None трактовался как
+        «посторонний», и КАЖДЫЙ инициативный пинг отбрасывался ещё до
+        обращения к LLM. Внешне это выглядело так, будто Эфи просто никогда
+        не пишет первой: в логах «queued for chat_id=...» есть, а дальше
+        тишина и ни одной ошибки.
+
+        Правило: явный отправитель решает всё (он либо владелец, либо нет);
+        если отправителя нет — решает чат. Разрешены личка владельца и то,
+        что он сам перечислил в `telegram.allowed_chats`. Каналы сообщества
+        сюда НЕ входят: участие в них — это ответ на чужой пост (см.
+        efi/telegram/comments.py), а не право заговорить первой.
+        """
+        if sender_id is not None:
+            return self.allows_proactive_ping(sender_id)
+        return chat_id is not None and chat_id in self._proactive_chats
 
     async def get_state(self, peer_user_id: int, chat_id: int) -> ConversationState:
         """Состояние диалога; при первом обращении поднимается из БД (переживает рестарт) либо создаётся чистым."""

@@ -38,6 +38,17 @@ class WorkingMemoryItem(BaseModel):
     created_at: datetime
     last_updated: datetime
     done: bool = False
+    #: Срок, к которому обещание должно быть выполнено, и чат, в котором оно
+    #: дано. Без них пункт был просто заметкой: «напиши мне через 10 минут»
+    #: оседало текстом, и ничто в системе не могло узнать, что у него вообще
+    #: есть срок и адресат (см. efi/behavior/reminders.py).
+    due_at: datetime | None = None
+    chat_id: int | None = None
+
+    @property
+    def is_overdue(self) -> bool:
+        """Срок прошёл, а пункт всё ещё открыт — то самое «висит и ничего не происходит»."""
+        return not self.done and self.due_at is not None and self.due_at < datetime.now(UTC)
 
 
 class WorkingMemorySnapshot(BaseModel):
@@ -138,11 +149,22 @@ class WorkingMemory:
             snapshot.energy = max(0.0, min(energy, 1.0))
         return await self.save(snapshot)
 
-    async def add_item(self, text: str) -> WorkingMemoryItem:
-        """Добавляет новый открытый пункт (обещание/напоминание/задачу)."""
+    async def add_item(
+        self, text: str, *, due_at: datetime | None = None, chat_id: int | None = None
+    ) -> WorkingMemoryItem:
+        """
+        Добавляет новый открытый пункт (обещание/напоминание/задачу).
+
+        `due_at`/`chat_id` необязательны: не у всякого обещания есть срок
+        («скину ссылку, как найду»). Но если срок назван, он обязан дойти
+        сюда — планировщик напоминаний берёт его именно отсюда, и пункт без
+        срока для него не существует.
+        """
         snapshot = await self.load()
         now = datetime.now(UTC)
-        item = WorkingMemoryItem(text=text, created_at=now, last_updated=now)
+        item = WorkingMemoryItem(
+            text=text, created_at=now, last_updated=now, due_at=due_at, chat_id=chat_id
+        )
         snapshot.items.append(item)
         await self.save(snapshot)
         return item

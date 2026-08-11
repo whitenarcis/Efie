@@ -23,6 +23,7 @@ import logging
 import math
 import re
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from efi.llm.schemas import DiaryEntry, DiaryQueryOptions, DiaryQueryResult
@@ -105,14 +106,34 @@ class TfidfFallbackIndex:
             for term in document.term_counts:
                 self._document_frequency[term] += 1
 
-    async def search(self, query_text: str, options: DiaryQueryOptions | None = None) -> list[DiaryQueryResult]:
-        """Критический путь: без сети, только локальная CPU-bound работа (в потоке)."""
+    async def search(
+        self,
+        query_text: str,
+        options: DiaryQueryOptions | None = None,
+        *,
+        filter_fn: Callable[[DiaryEntry], bool] | None = None,
+    ) -> list[DiaryQueryResult]:
+        """
+        Критический путь: без сети, только локальная CPU-bound работа (в потоке).
+
+        `filter_fn` — тот же контракт, что у `Diary.query`: фолбэк обязан
+        уважать доменную фильтрацию (efi/memory/router.py), иначе на отказе
+        эмбеддингов поиск начал бы возвращать записи чужих доменов, и
+        поведение памяти менялось бы в зависимости от того, работает ли
+        сегодня локальный движок.
+        """
         options = options or DiaryQueryOptions()
         async with self._lock:
             if not self._documents:
                 return []
             documents = dict(self._documents)
             document_frequency = Counter(self._document_frequency)
+        if filter_fn is not None:
+            documents = {
+                entry_id: document for entry_id, document in documents.items() if filter_fn(document.entry)
+            }
+            if not documents:
+                return []
         return await asyncio.to_thread(_score_query, query_text, documents, document_frequency, options.max_entry_count)
 
 

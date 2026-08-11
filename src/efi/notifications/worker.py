@@ -104,6 +104,7 @@ from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Response, Role, Session
 from efi.memory.social_memory import SocialInteraction, SocialInteractionKind, SocialInteractionStore
+from efi.memory.working_memory import WorkingMemoryItem
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.security.sanitize import sanitize_text
@@ -158,6 +159,17 @@ class SystemPromptBuilder(Protocol):
     async def build(self, notification: Notification, history: Session) -> str: ...
 
 
+class PromiseTracker(Protocol):
+    """
+    Что Worker'у нужно от рабочей памяти, чтобы закрыть выполненное обещание.
+    Реализация — efi.memory.working_memory.WorkingMemory (метод у неё уже
+    есть; протокол объявлен здесь, чтобы Worker не зависел от всей
+    подсистемы памяти ради одного вызова).
+    """
+
+    async def find_and_mark_done(self, text_query: str) -> WorkingMemoryItem | None: ...
+
+
 class TelegramNotifier(Protocol):
     """
     Всё, что Worker'у нужно от телеграм-слоя. Конкретная реализация —
@@ -202,6 +214,7 @@ class Worker:
         lifecycle: ConversationLifecycle | None = None,
         social_memory: SocialInteractionStore | None = None,
         orchestrator: ChatOrchestrator | None = None,
+        promises: PromiseTracker | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -218,6 +231,7 @@ class Worker:
         self._lifecycle = lifecycle
         self._social_memory = social_memory
         self._orchestrator = orchestrator
+        self._promises = promises
 
     async def run(self) -> None:
         """
@@ -389,10 +403,57 @@ class Worker:
                 await self._notify_failure(notification)
             raise  # даём run() залогировать полный трейсбек, как и раньше
 
-        if notification.chat_id is not None:
+        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not tool_context.extra.get("sent_texts"):
+            # Инициативный пинг, на котором модель ничего не отправила.
+            # Запасной текст здесь подставлять нельзя (в отличие от
+            # USER_MESSAGE): никто ничего не спрашивал, и «уф, у меня
+            # заглючило» из ниоткуда выглядит хуже молчания. Но и тихо
+            # ронять нельзя — иначе это опять неотличимо от «не работает».
+            # В историю тоже ничего не пишем: до собеседника не долетело
+            # ничего, а сохранённая реплика заставила бы Эфи в следующий раз
+            # считать, что она это сказала, и продолжать с несуществующего места.
+            logger.warning(
+                "worker[%d]: proactive %s for chat_id=%s finished without sending anything "
+                "(модель не вызвала send_telegram_message)",
+                self._worker_index, notification.type.value, notification.chat_id,
+            )
+        elif notification.chat_id is not None:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
 
+        await self._close_delivered_promise(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
+
+    async def _close_delivered_promise(self, notification: Notification, tool_context: ToolContext) -> None:
+        """
+        Закрывает обещание, ради которого сработало напоминание.
+
+        Именно ПОСЛЕ доставки, а не при постановке в очередь: обещание
+        считается выполненным тогда, когда собеседник получил сообщение, а не
+        когда сработал таймер. Если модель промолчала или упал провайдер,
+        пункт остаётся открытым — и видно, что она задолжала, а не что всё в
+        порядке.
+
+        Обратная сторона: повторно само оно не сработает (напоминание уже
+        помечено сработавшим, см. ReminderStore.mark_fired), но открытый
+        просроченный пункт попадает в промпт и на дашборд, и Эфи упомянет его
+        при следующем же обмене репликами.
+        """
+        if notification.type is not NotificationType.FOLLOW_UP or self._promises is None:
+            return
+        promise_text = notification.payload.get("promise_text")
+        if not isinstance(promise_text, str) or not promise_text.strip():
+            return
+        if not tool_context.extra.get("sent_texts"):
+            return
+        try:
+            closed = await self._promises.find_and_mark_done(promise_text)
+        except Exception:
+            logger.warning(
+                "worker[%d]: не удалось закрыть обещание %r", self._worker_index, promise_text, exc_info=True
+            )
+            return
+        if closed is not None:
+            logger.info("worker[%d]: обещание выполнено и закрыто: %r", self._worker_index, closed.text)
 
     async def _record_social_interaction(self, notification: Notification, tool_context: ToolContext) -> None:
         """
@@ -461,9 +522,16 @@ class Worker:
         sender_id = notification.payload.get("sender_id")
         sender_id = sender_id if isinstance(sender_id, int) else None
 
-        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not self._lifecycle.allows_proactive_ping(sender_id):
-            logger.debug(
-                "worker[%d]: skipping proactive %s for a non-primary user", self._worker_index, notification.type.value
+        if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not self._lifecycle.allows_proactive_ping_to_chat(
+            notification.chat_id, sender_id
+        ):
+            # INFO, а не DEBUG: это единственный след того, что инициативный
+            # пинг был отброшен. Пока он был отладочным, «Эфи не пишет первой»
+            # выглядело как отсутствие функции, а не как решение кода.
+            logger.info(
+                "worker[%d]: skipping proactive %s for chat_id=%s — "
+                "чат не в telegram.allowed_chats и это не личка владельца",
+                self._worker_index, notification.type.value, notification.chat_id,
             )
             return True
 
@@ -689,4 +757,4 @@ def _finalize_session(history: Session, notification: Notification) -> Session:
     return session
 
 
-__all__ = ["Worker", "HistoryRepository", "SystemPromptBuilder", "TelegramNotifier"]
+__all__ = ["Worker", "HistoryRepository", "PromiseTracker", "SystemPromptBuilder", "TelegramNotifier"]

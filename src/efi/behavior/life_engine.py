@@ -161,11 +161,21 @@ class BackgroundLifeWorker:
         await self._organic_ping.notify(thought)
 
     async def _research(self, seed: CuriositySeed) -> InformedThought | None:
-        search_text = await self._web_search.execute({"query": seed.topic}, _make_research_context(seed.topic))
-        if search_text.startswith("error:") or "ничего не нашлось" in search_text:
-            logger.info("life_engine: search for seed #%s (%r) yielded nothing useful", seed.id, seed.topic)
+        # search(), а не execute(): нужна причина неудачи, а не текст для
+        # модели — см. тот же разбор в efi/behavior/researcher.py.
+        outcome = await self._web_search.search(
+            seed.topic, journal_context=_make_research_context(seed.topic)
+        )
+        if outcome.failed:
+            logger.warning(
+                "life_engine: search for seed #%s (%r) failed: %s", seed.id, seed.topic, outcome.error
+            )
+            return None
+        if not outcome.results:
+            logger.info("life_engine: search for seed #%s (%r) returned no results", seed.id, seed.topic)
             return None
 
+        search_text = outcome.render()
         finding = await self._formulate_finding(seed.topic, search_text)
         if finding is None:
             return None
