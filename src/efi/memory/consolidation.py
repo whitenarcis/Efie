@@ -45,6 +45,8 @@ from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata, LLMParams, Message, 
 from efi.memory.diary import Diary
 from efi.memory.facts import FactStore
 from efi.memory.rag import RAGMemory
+from efi.memory.transcript import SELF_MARKER as _SELF_MARKER
+from efi.memory.transcript import render_transcript
 from efi.utils.text import salvage_truncated
 
 logger = logging.getLogger(__name__)
@@ -82,6 +84,13 @@ _NOVELIZATION_SYSTEM_PROMPT = (
     "ОБЯЗАТЕЛЬНО: строго от первого лица, как будто вспоминаешь ты сама. Всегда называй, С КЕМ "
     "это было — перед каждой репликой указано имя написавшего, используй эти имена ('с Ромой', "
     "'Рихтер опять...'), а не безличное 'собеседник'.\n"
+    "\n"
+    "КТО ЧТО СКАЗАЛ — проверь это отдельно, ПЕРЕД тем как писать. Реплики с пометкой "
+    f"«({_SELF_MARKER})» — твои собственные слова: то, что сказала ТЫ. Все остальные строки "
+    "написали другие люди, и их имя стоит в начале строки. Не приписывай себе чужие "
+    "мысли, работу и настроение и не отдавай собеседнику свои: перепутанное направление "
+    "превращает воспоминание в ложное — через месяц ты будешь уверена, что это ты чинила "
+    "тот баг, хотя чинил его он.\n"
     "\n"
     "Пример ПЛОХОГО воспоминания (протокольное, безличное, без деталей): 'Обсудили баг в коде, "
     "договорились исправить позже.'\n"
@@ -164,8 +173,12 @@ class DiaryConsolidator:
         summarization_role: TaskRole = TaskRole.BACKGROUND,
         novelization_char_limit: int = _DEFAULT_NOVELIZATION_CHAR_LIMIT,
         novelization_max_output_tokens: int = _DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS,
+        character_name: str = "Эфи",
     ) -> None:
         self._diary = diary
+        #: Своим именем Эфи подписана в плоском тексте переписки — иначе её
+        #: собственные реплики неотличимы от чужих (см. efi/memory/transcript.py).
+        self._character_name = character_name
         self._router = router
         self._novelization_char_limit = novelization_char_limit
         self._novelization_max_output_tokens = novelization_max_output_tokens
@@ -387,7 +400,9 @@ class DiaryConsolidator:
 
     async def _extract_memories(self, session: Session, experience_lines: list[str] | None = None) -> list[str]:
         blocks: list[str] = []
-        conversation_text = _render_conversation(session, char_limit=self._novelization_char_limit)
+        conversation_text = render_transcript(
+            session, self_name=self._character_name, char_limit=self._novelization_char_limit
+        )
         if conversation_text:
             blocks.append(conversation_text)
         if experience_lines:
@@ -460,23 +475,6 @@ class DiaryConsolidator:
         return summary or None
 
 
-def _render_conversation(session: Session, *, char_limit: int) -> str:
-    """
-    Плоский текст переписки для промпта новеллизации — только реплики с
-    содержимым (не голые tool-calls).
-
-    При переполнении лимита обрезается НАЧАЛО, а не конец. Раньше было
-    наоборот (`text[:char_limit]`), и на длинном окне это давало ровно ту
-    потерю, которой новеллизация должна мешать: сохранялось утро, а вечер —
-    свежая, ещё ни разу не осмысленная часть разговора — выпадал, и на
-    следующем проходе он уже был за отметкой last_novelized_at, то есть
-    терялся навсегда.
-    """
-    lines = [f"{message.role.value}: {message.content}" for message in session if message.content.strip()]
-    text = "\n".join(lines)
-    if len(text) <= char_limit:
-        return text
-    return "[...начало разговора опущено...]\n" + text[-char_limit:]
 
 
 def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:

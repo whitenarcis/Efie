@@ -177,6 +177,7 @@ class EfiApp:
             self._rag,
             novelization_char_limit=settings.memory.novelization_char_limit,
             novelization_max_output_tokens=settings.memory.novelization_max_output_tokens,
+            character_name=settings.character_name,
         )
 
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
