@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import datetime
 
 from efi.behavior.affinity import (
     HIGH_RESPECT_THRESHOLD,
@@ -68,6 +68,7 @@ from efi.memory.working_memory import WorkingMemory, WorkingMemoryItem, WorkingM
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
+from efi.utils.clock import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +127,44 @@ _TIME_OF_DAY_BOUNDARIES: tuple[tuple[int, int, str], ...] = (
     (17, 22, "вечер"),
     (22, 24, "ночь"),
     (0, 5, "глубокая ночь"),
+)
+
+#: Названия дней и месяцев прописаны здесь, а не берутся из strftime.
+#: `%A`/`%B` зависят от локали процесса, а в Termux локаль почти всегда "C" —
+#: и в русском системном промпте оказывалось "Monday, 11 August". Модель это
+#: поймёт, но именно из таких мелочей собирается ощущение, что с тобой
+#: разговаривает программа.
+_WEEKDAYS_RU: tuple[str, ...] = (
+    "понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье",
+)
+_MONTHS_RU: tuple[str, ...] = (
+    "января", "февраля", "марта", "апреля", "мая", "июня",
+    "июля", "августа", "сентября", "октября", "ноября", "декабря",
+)
+
+#: Что значит этот час по-человечески — сверх того, что показывают часы.
+#: Модель сама по числу "03:14" социальных выводов не делает: в её глазах это
+#: просто ещё одно поле контекста. Смысл приходится назвать словами.
+_TIME_OF_DAY_NOTES: dict[str, str] = {
+    "глубокая ночь": (
+        "Нормальные люди в это время спят. Если собеседник тебе сейчас пишет — он не спит, и это "
+        "само по себе повод: удивись, спроси, чего не спит, посоветуй лечь — как сделал бы живой "
+        "человек, которому не всё равно."
+    ),
+    "ночь": "Поздний вечер, время уже позднее — собеседник, скорее всего, скоро ляжет.",
+    "раннее утро": (
+        "Очень рано. Собеседник либо только проснулся и ещё вялый, либо вообще не ложился — "
+        "по разговору обычно понятно, что из двух."
+    ),
+    "вечер": "Рабочий день у большинства позади.",
+}
+
+#: Насколько настойчиво напоминать про час. Замечание про «иди спать» —
+#: живая человеческая реакция ровно один раз за ночь; сказанное в каждой
+#: реплике, оно превращается в занудство, от которого хочется закрыть чат.
+_TIME_TACT_NOTE = (
+    "Про время суток заговаривай только если это к месту, и не повторяй одну и ту же мысль про него "
+    "в каждом сообщении — сказала один раз и дальше просто общайся."
 )
 
 _GROUP_CHAT_TYPES = ("GROUP", "SUPERGROUP")
@@ -229,8 +268,9 @@ class EfiSystemPromptBuilder:
             knowledge_task,
         )
 
+        now = local_now(self._settings.timezone)
         rendered_personality = _render_personality_template(
-            personality, self._resolve_user_name(notification)
+            personality, self._resolve_user_name(notification), now=now
         )
 
         blocks = [
@@ -244,7 +284,7 @@ class EfiSystemPromptBuilder:
                 self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
             ),
             _build_proactive_brevity_block(notification),
-            _build_time_block(),
+            _build_time_block(now, is_user_message=notification.type is NotificationType.USER_MESSAGE),
             _build_working_memory_block(memory_snapshot),
             _build_state_vector_block(
                 relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
@@ -339,9 +379,9 @@ class EfiSystemPromptBuilder:
             return self._settings.personality_prompt
 
 
-def _render_personality_template(text: str, user_name: str) -> str:
+def _render_personality_template(text: str, user_name: str, *, now: datetime | None = None) -> str:
     """Подставляет {user_name}/{time_of_day}; см. докстринг модуля про {weather}/{energy}."""
-    context = _SafeFormatDict(user_name=user_name, time_of_day=_time_of_day_label())
+    context = _SafeFormatDict(user_name=user_name, time_of_day=_time_of_day_label(now))
     try:
         return text.format_map(context)
     except (ValueError, IndexError) as exc:
@@ -352,7 +392,7 @@ def _render_personality_template(text: str, user_name: str) -> str:
 
 
 def _time_of_day_label(now: datetime | None = None) -> str:
-    hour = (now or datetime.now(UTC).astimezone()).hour
+    hour = (now or local_now()).hour
     for start, end, label in _TIME_OF_DAY_BOUNDARIES:
         if start <= hour < end:
             return label
@@ -531,9 +571,55 @@ def _build_proactive_brevity_block(notification: Notification) -> str:
     )
 
 
-def _build_time_block() -> str:
-    now = datetime.now(UTC).astimezone()
-    return f"[Время] Сейчас {now.strftime('%A, %d %B %Y, %H:%M')} ({now.tzname() or 'UTC'})."
+def _build_time_block(now: datetime, *, is_user_message: bool) -> str:
+    """
+    Который сейчас час — и что это значит.
+
+    Раньше блок состоял из одной строки с датой и временем, и этого
+    оказалось мало: голое "03:14" модель воспринимает как ещё одно поле
+    контекста, а не как факт, из которого следуют выводы. Человек, увидев
+    три часа ночи в переписке, реагирует сам — Эфи приходится этому
+    научить прямым текстом.
+
+    `is_user_message` разделяет два очень разных случая с одинаковыми
+    часами: собеседник написал сам в четыре утра (значит, точно не спит —
+    об этом можно и сказать) или Эфи готовит проактивную реплику (тогда
+    про чужой сон она ничего не знает, а на деле её в это время вообще
+    придержат тихие часы).
+    """
+    label = _time_of_day_label(now)
+    stamp = (
+        f"{_WEEKDAYS_RU[now.weekday()]}, {now.day} {_MONTHS_RU[now.month - 1]} {now.year}, "
+        f"{now.strftime('%H:%M')}"
+    )
+    zone = now.tzname() or "локальное время"
+
+    parts = [f"[Время] Сейчас {stamp} ({zone}) — {label}, {_weekend_note(now)}."]
+    # Пояснения про час — только когда собеседник написал сам. На проактивном
+    # ходу рассуждать о том, спит ли он, не о чем: он ничего не написал, и
+    # знать этого Эфи не может. Само время суток уже названо выше, этого для
+    # выбора тона достаточно.
+    note = _TIME_OF_DAY_NOTES.get(label)
+    if note and is_user_message:
+        parts.append(note)
+        parts.append(_TIME_TACT_NOTE)
+    return " ".join(parts)
+
+
+def _weekend_note(now: datetime) -> str:
+    """
+    Будни или выходные — вторая половина ответа на «сколько сейчас времени».
+
+    «Три часа ночи» в ночь на понедельник и в ночь на субботу — это две
+    разные ситуации, и человек их различает не задумываясь.
+    """
+    # После полуночи «сегодня» уже наступило, и важен именно текущий день:
+    # в 03:00 понедельника человеку через несколько часов на работу.
+    if now.weekday() >= 5:
+        return "выходной"
+    if now.weekday() == 4 and now.hour >= 17:
+        return "впереди выходные"
+    return "будний день"
 
 
 def _build_working_memory_block(snapshot: WorkingMemorySnapshot) -> str:

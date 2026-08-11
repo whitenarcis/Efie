@@ -33,6 +33,7 @@ from efi.memory.rag import RAGMemory
 from efi.notifications.schemas import Notification, NotificationType
 from efi.tools.base import ToolContext
 from efi.tools.web_tools.web_search import WebSearchTool
+from efi.utils.text import salvage_truncated
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,13 @@ logger = logging.getLogger(__name__)
 AUTONOMOUS_THOUGHT_TAG = "#autonomous_thought"
 
 _FINDING_CONFIDENCE = 0.6
+
+#: Бюджеты вывода. Промпты просят 1-3 предложения и одну строчку — по
+#: английским меркам 256/128 токенов хватало, но кириллица у токенизаторов
+#: бесплатных моделей стоит в 2-3 раза дороже, и находка регулярно
+#: обрывалась на полуслове. Взято по худшему курсу.
+_FINDING_MAX_OUTPUT_TOKENS = 512
+_REACTION_MAX_OUTPUT_TOKENS = 256
 
 _FINDING_SYSTEM_PROMPT = (
     "Собеседник недавно упоминал или спрашивал про тему, которая тебе стала любопытна. Тебе показаны "
@@ -205,11 +213,17 @@ class BackgroundLifeWorker:
             f"Тема: {topic}\n\nЧто ты вычитала:\n{search_text}\n\nТвой вывод: {finding}",
             what="reaction",
             topic=topic,
-            max_output_tokens=128,
+            max_output_tokens=_REACTION_MAX_OUTPUT_TOKENS,
         )
 
     async def _ask(
-        self, system_prompt: str, user_content: str, *, what: str, topic: str, max_output_tokens: int = 256
+        self,
+        system_prompt: str,
+        user_content: str,
+        *,
+        what: str,
+        topic: str,
+        max_output_tokens: int = _FINDING_MAX_OUTPUT_TOKENS,
     ) -> str | None:
         """Один короткий запрос к фоновой роли; сбой — не исключение наружу, а None (цикл жизни не должен падать)."""
         params = LLMParams(model="", system_prompt=system_prompt, max_output_tokens=max_output_tokens)
@@ -219,7 +233,19 @@ class BackgroundLifeWorker:
         except LLMError as exc:
             logger.warning("life_engine: %s formulation for %r failed: %s", what, topic, exc)
             return None
-        return response.text.strip() or None
+
+        # Обрыв по лимиту — не ошибка запроса: ответ пришёл успешно, просто
+        # он неполный. Без этой проверки обрубок уходил прямо в дневник.
+        text = salvage_truncated(response.text, truncated=response.was_truncated)
+        if response.was_truncated:
+            logger.warning(
+                "life_engine: %s for %r hit the output limit (%s tokens); %s",
+                what,
+                topic,
+                max_output_tokens,
+                "trimmed to the last complete sentence" if text else "nothing salvageable, dropping",
+            )
+        return text or None
 
 
 def _render_diary_entry(thought: InformedThought) -> str:

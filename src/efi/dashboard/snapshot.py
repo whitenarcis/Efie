@@ -29,7 +29,7 @@ from efi.behavior.affinity import AffinityTracker
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.life_engine import BackgroundLifeWorker
-from efi.behavior.quiet_hours import is_quiet_hours
+from efi.behavior.quiet_hours import is_quiet_now
 from efi.config.schema import Settings, TaskRole
 from efi.dashboard import queries
 from efi.dashboard.logbus import LogBuffer
@@ -46,6 +46,8 @@ from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.tools.base import ToolContext
 from efi.tools.registry import ToolRegistry
+from efi.utils.clock import local_now
+from efi.utils.text import looks_unfinished
 
 logger = logging.getLogger(__name__)
 
@@ -309,14 +311,18 @@ def _task_state(task: asyncio.Task[Any] | None) -> dict[str, str]:
 
 def _quiet_hours_overview(context: DashboardContext) -> dict[str, Any]:
     quiet = context.settings.quiet_hours
-    now = datetime.now()
-    active = quiet.enabled and is_quiet_hours(now, start_hour=quiet.start_hour, end_hour=quiet.end_hour)
+    now = local_now(context.settings.timezone)
     return {
         "enabled": quiet.enabled,
         "start_hour": quiet.start_hour,
         "end_hour": quiet.end_hour,
-        "active_now": active,
+        "active_now": is_quiet_now(quiet, context.settings.timezone, now=now),
         "local_time": now.isoformat(timespec="seconds"),
+        # Именно тот пояс, по которому Эфи считает время, а не пояс браузера:
+        # расхождение между ними — самая частая причина «почему она молчит
+        # днём» и «почему не видит, что уже ночь».
+        "timezone": now.tzname() or "локальное время",
+        "timezone_source": context.settings.timezone or "система",
     }
 
 
@@ -575,6 +581,7 @@ async def build_diary_list(
                 "confidence": entry.metadata.confidence,
                 "score": entry.metadata.score,
                 "embedding_dim": len(entry.metadata.embedding),
+                "unfinished": looks_unfinished(entry.body),
             }
             for entry in page
         ],
@@ -599,6 +606,11 @@ async def build_diary_entry(context: DashboardContext, entry_id: str) -> dict[st
         "embedding_dim": len(entry.metadata.embedding),
         "is_ground_truth": entry.metadata.is_ground_truth,
         "is_marked_false": entry.metadata.is_marked_false,
+        # Записи, сохранённые до починки бюджетов вывода, так и остались
+        # оборванными на полуслове. Удалять их за спиной у владельца — не
+        # дело дашборда, но показать, какие именно пострадали, он обязан:
+        # иначе их не отличить от целых.
+        "unfinished": looks_unfinished(entry.body),
     }
 
 

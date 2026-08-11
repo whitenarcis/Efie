@@ -65,6 +65,7 @@ from efi.notifications.manager import NotificationManager
 from efi.notifications.worker import Worker
 from efi.prompts.builder import EfiSystemPromptBuilder
 from efi.prompts.loader import PromptLoader
+from efi.security.access_control import describe_access_policy
 from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.client import TelegramClientWrapper
 from efi.telegram.comments import (
@@ -250,7 +251,9 @@ class EfiApp:
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
         self._notification_manager = NotificationManager(worker_count=worker_count)
-        self._silence_monitor = SilenceMonitor(self._notification_manager, quiet_hours=settings.quiet_hours)
+        self._silence_monitor = SilenceMonitor(
+            self._notification_manager, quiet_hours=settings.quiet_hours, timezone=settings.timezone
+        )
         # Отложенные напоминания («напиши мне через 10 минут»). Персистентные:
         # обещание со сроком обязано пережить перезапуск, иначе оно тихо
         # исчезает ровно тогда, когда человек на него рассчитывает.
@@ -265,12 +268,14 @@ class EfiApp:
             self._active_chat_candidates,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
             quiet_hours=settings.quiet_hours,
+            timezone=settings.timezone,
         )
         self._organic_ping = OrganicPingGenerator(
             self._notification_manager,
             self._affinity,
             importance_threshold=settings.life_engine.ping_importance_threshold,
             quiet_hours=settings.quiet_hours,
+            timezone=settings.timezone,
         )
         self._life_engine = BackgroundLifeWorker(
             self._curiosity,
@@ -452,6 +457,12 @@ class EfiApp:
         self._log_buffer.install()
         logger.info("app: starting")
 
+        # Кто фактически может с ней говорить — одной строкой при старте.
+        # «Почему она не отвечает» это вопрос про сочетание lockdown_mode,
+        # allowed_chats и community_chats, и выяснять его по конфигу вручную
+        # неудобно ровно тогда, когда что-то не работает.
+        logger.info("app: отвечает — %s", describe_access_policy(self._settings.telegram))
+
         self._telegram_handlers.register(self._pyrogram_client)
         self._channel_post_watcher.register(self._pyrogram_client)
         self._typing_tracker.register(self._pyrogram_client)
@@ -625,6 +636,10 @@ class EfiApp:
         # Активные генерации: недоговорённая серия бабблов не должна держать
         # остановку на своих паузах между сообщениями.
         await self._orchestrator.cancel_all()
+        # Отложенные повторы недоставленных проактивных уведомлений — тоже
+        # спят минутами, и ждать их на выключении незачем: повод протухнет
+        # раньше, чем таймер сработает.
+        await self._notification_manager.cancel_retries()
 
         for task in self._background_tasks:
             task.cancel()

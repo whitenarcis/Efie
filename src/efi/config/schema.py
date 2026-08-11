@@ -992,6 +992,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    timezone: str = Field(
+        default="",
+        description=(
+            "Часовой пояс Эфи в формате IANA (например Europe/Moscow). По нему считаются тихие часы и блок "
+            "[Время] в системном промпте. Пусто — брать пояс системы; задавайте явно, если процесс может "
+            "стартовать без TZ (proot, cron, VPS), иначе Эфи будет считать четыре утра полуднем"
+        ),
+    )
+
     paths: PathsSettings = Field(default_factory=PathsSettings)
     telegram: TelegramSettings
     llm_roles: LLMRolesSettings

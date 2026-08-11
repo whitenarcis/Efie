@@ -160,6 +160,11 @@ class Choice(BaseModel):
     finish_reason: str | None = None
 
 
+#: Значения finish_reason, означающие «текст оборван лимитом», а не «модель
+#: закончила мысль». См. Response.was_truncated.
+_TRUNCATION_FINISH_REASONS = frozenset({"length", "max_tokens", "max_output_tokens", "token_limit"})
+
+
 class Response(BaseModel):
     """Полный ответ LLM-провайдера на chat-запрос (OpenAI-совместимая форма)."""
 
@@ -187,6 +192,23 @@ class Response(BaseModel):
         if not self.choices:
             raise ValueError("LLM response contains no choices")
         return self.choices[0].message
+
+    @property
+    def was_truncated(self) -> bool:
+        """
+        Ответ оборван лимитом токенов, а НЕ закончен моделью.
+
+        Различие принципиально там, где текст сохраняется как есть — в
+        дневнике: оборванный ответ выглядит как обычный, просто заканчивается
+        на полуслове, и отличить «она так и написала» от «здесь кончились
+        токены» по самому тексту невозможно. Провайдеры называют эту причину
+        по-разному ("length" у OpenAI-совместимых, "max_tokens" у части
+        прокси), поэтому сравнение идёт по набору, а не по одной строке.
+        """
+        return any(
+            (choice.finish_reason or "").strip().lower() in _TRUNCATION_FINISH_REASONS
+            for choice in self.choices
+        )
 
     @property
     def text(self) -> str:

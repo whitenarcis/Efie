@@ -226,7 +226,7 @@
       cell(
         'Тихие часы',
         quiet.active_now ? 'идут' : 'нет',
-        quiet.enabled ? `${quiet.start_hour}:00 — ${quiet.end_hour}:00, локально ${esc(fmtTime(quiet.local_time))}` : 'выключены',
+        quiet.enabled ? `${quiet.start_hour}:00 — ${quiet.end_hour}:00, у неё ${esc(fmtTime(quiet.local_time))} ${esc(quiet.timezone || '')} (${esc(quiet.timezone_source || 'система')})` : 'выключены',
         'small',
       ),
       cell('Вызовы моделей', num(llm.calls), `ошибок ${num(llm.errors)} · среднее ${fixed(llm.avg_seconds)} c`),
@@ -511,7 +511,7 @@
       row(
         esc(entry.preview || '(пустая запись)'),
         `${esc(fmtDateTime(entry.created_at))} · ${num(entry.length)} символов · использована ${num(entry.usage_count)} раз(а)`,
-        `${entry.confidence >= 1 ? '<span class="tag ok">факт</span>' : ''}${entry.confidence <= -1 ? '<span class="tag err">ложь</span>' : ''}${entry.embedding_dim ? '' : '<span class="tag warn">без эмбеддинга</span>'}`,
+        `${entry.confidence >= 1 ? '<span class="tag ok">факт</span>' : ''}${entry.confidence <= -1 ? '<span class="tag err">ложь</span>' : ''}${entry.embedding_dim ? '' : '<span class="tag warn">без эмбеддинга</span>'}${entry.unfinished ? '<span class="tag warn">обрыв</span>' : ''}`,
         `data-diary="${esc(entry.id)}"`,
       ),
     );
@@ -536,8 +536,9 @@
         <button class="ghost" id="diary-back" type="button">← К списку</button>
       </div>
       <article class="reader">
-        <p class="reader-title">${esc(entry.id)}</p>
+        <p class="reader-title">${esc(entry.id)}${entry.unfinished ? ' <span class="tag warn">обрыв</span>' : ''}</p>
         <div class="reader-body">${esc(entry.body)}</div>
+        ${entry.unfinished ? '<p class="reader-note">Запись обрывается на полуслове — её сохранили до починки бюджетов вывода. Новые записи так не сохраняются.</p>' : ''}
       </article>
       <div class="grid" style="margin-top:1px">
         ${cell('Использована', num(entry.usage_count), `последний раз ${esc(fmtAgo(entry.last_used))}`, 'small')}

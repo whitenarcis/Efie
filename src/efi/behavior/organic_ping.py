@@ -24,11 +24,10 @@ LLM внутри Worker'а видели повод, а не додумывали
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 
 from efi.behavior.affinity import AffinityTracker
 from efi.behavior.life_engine import InformedThought
-from efi.behavior.quiet_hours import is_quiet_hours
+from efi.behavior.quiet_hours import is_quiet_now
 from efi.config.schema import QuietHoursSettings
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
@@ -80,11 +79,13 @@ class OrganicPingGenerator:
         *,
         importance_threshold: float = _DEFAULT_IMPORTANCE_THRESHOLD,
         quiet_hours: QuietHoursSettings | None = None,
+        timezone: str = "",
     ) -> None:
         self._manager = manager
         self._affinity = affinity
         self._importance_threshold = importance_threshold
         self._quiet_hours = quiet_hours
+        self._timezone = timezone
         self._pending_by_chat: dict[int, int] = {}  # chat_id -> seed_id
 
     async def notify(self, thought: InformedThought) -> None:
@@ -101,13 +102,7 @@ class OrganicPingGenerator:
         """
         if thought.source_chat_id is None:
             return
-        if (
-            self._quiet_hours is not None
-            and self._quiet_hours.enabled
-            and is_quiet_hours(
-                datetime.now(), start_hour=self._quiet_hours.start_hour, end_hour=self._quiet_hours.end_hour
-            )
-        ):
+        if is_quiet_now(self._quiet_hours, self._timezone):
             logger.debug("organic_ping: skipping seed #%s — quiet hours", thought.seed_id)
             return
         if thought.weight < self._importance_threshold:

@@ -184,7 +184,13 @@ class PerceptionParser:
 
         raw = response.text
         candidates, error = parse_payload(raw)
-        if error:
+        if error and response.was_truncated:
+            # Оборванный JSON не «непонятный ответ модели», а исчерпанный
+            # бюджет вывода. Без этой ветки в логе оставалось загадочное
+            # "unbalanced JSON", по которому чинить нечего.
+            error = f"{error} (ответ оборван лимитом в {self._max_output_tokens} токенов)"
+            logger.warning("perception: model output hit the output limit; %s", error)
+        elif error:
             logger.warning("perception: could not parse model output (%s)", error)
         return PerceptionBatch(candidates=candidates, raw_response=raw, parse_error=error, source=source)
 

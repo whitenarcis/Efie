@@ -134,6 +134,12 @@ _NO_REPLY_REMINDER_TEXT = (
 #: чтобы статус не успевал погаснуть между пингами.
 _TYPING_PULSE_INTERVAL_SECONDS = 4.0
 
+#: Пауза перед повтором проактивного уведомления, по номеру попытки.
+#: Минута — это «провайдер моргнул»; три — «провайдеру плохо, но повод ещё
+#: не совсем протух». Дальше повторов нет (см. MAX_DELIVERY_ATTEMPTS):
+#: «напомнить через 10 минут» с опозданием на полчаса уже не напоминание.
+_RETRY_DELAYS_SECONDS = (60.0, 180.0)
+
 #: Уведомления, где Эфи пишет ПЕРВОЙ. Разрешены только владельцу —
 #: см. ConversationLifecycle.allows_proactive_ping и Worker._should_disengage.
 _PROACTIVE_NOTIFICATION_TYPES = frozenset(
@@ -389,6 +395,7 @@ class Worker:
             raise
         except LLMError:
             await self._notify_failure(notification)
+            self._retry_if_proactive(notification, tool_context, reason="сбой LLM")
             raise  # даём run() залогировать полный трейсбек, как и раньше
         except Exception:
             # Ловим ЛЮБОЙ сбой, а не только LLMError. Смысл уведомления не в
@@ -401,6 +408,7 @@ class Worker:
             # _ensure_reply_was_sent, и _notify_failure.
             if is_user_message:
                 await self._notify_failure(notification)
+            self._retry_if_proactive(notification, tool_context, reason="сбой обработки")
             raise  # даём run() залогировать полный трейсбек, как и раньше
 
         if notification.type in _PROACTIVE_NOTIFICATION_TYPES and not tool_context.extra.get("sent_texts"):
@@ -417,11 +425,45 @@ class Worker:
                 "(модель не вызвала send_telegram_message)",
                 self._worker_index, notification.type.value, notification.chat_id,
             )
+            self._retry_if_proactive(notification, tool_context, reason="модель ничего не отправила")
         elif notification.chat_id is not None:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
 
         await self._close_delivered_promise(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
+
+    def _retry_if_proactive(self, notification: Notification, tool_context: ToolContext, *, reason: str) -> None:
+        """
+        Переставляет неудавшееся проактивное уведомление в очередь на потом.
+
+        Зачем вообще. Проактивное событие — это не запрос, который можно
+        молча потерять: это намерение Эфи что-то сказать, часто по прямой
+        просьбе человека («напиши мне через 10 минут»). Таймаут провайдера на
+        бесплатном тире — рядовое событие, а не исключительная ситуация, и
+        терять из-за него обещание нельзя: напоминание уже помечено
+        сработавшим, второго шанса у него не будет.
+
+        Чего здесь НЕ делается:
+
+        - USER_MESSAGE не повторяется никогда. Собеседник уже получил
+          «уф, у меня заглючило» (_notify_failure) и, скорее всего, написал
+          снова; ответ на его прошлую реплику через минуту пришёл бы поверх
+          нового разговора.
+        - Не повторяется ход, на котором что-то УЖЕ ушло собеседнику: повтор
+          означал бы второе сообщение поверх доставленного, а сбой случился
+          уже после того, как своё Эфи сказала.
+        """
+        if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
+            return
+        if tool_context.extra.get("sent_texts"):
+            return
+
+        delay = _RETRY_DELAYS_SECONDS[min(notification.attempt, len(_RETRY_DELAYS_SECONDS) - 1)]
+        if not self._manager.retry_later(notification, delay=delay):
+            logger.warning(
+                "worker[%d]: %s для chat_id=%s потеряно окончательно (%s)",
+                self._worker_index, notification.type.value, notification.chat_id, reason,
+            )
 
     async def _close_delivered_promise(self, notification: Notification, tool_context: ToolContext) -> None:
         """
@@ -433,10 +475,12 @@ class Worker:
         пункт остаётся открытым — и видно, что она задолжала, а не что всё в
         порядке.
 
-        Обратная сторона: повторно само оно не сработает (напоминание уже
-        помечено сработавшим, см. ReminderStore.mark_fired), но открытый
-        просроченный пункт попадает в промпт и на дашборд, и Эфи упомянет его
-        при следующем же обмене репликами.
+        Само напоминание при этом уже помечено сработавшим (см.
+        ReminderStore.mark_fired) и вторым таймером не выстрелит — но
+        уведомление переставляется в очередь на повтор (см.
+        _retry_if_proactive), а если и повторы не помогли, открытый
+        просроченный пункт попадает в промпт и на дашборд, и Эфи упомянет
+        его при следующем же обмене репликами.
         """
         if notification.type is not NotificationType.FOLLOW_UP or self._promises is None:
             return

@@ -74,6 +74,14 @@ class Notification(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
+    #: Номер попытки доставки, считая с нуля. Проактивное событие — это
+    #: намерение Эфи что-то сказать; если LLM не ответил (таймаут на
+    #: бесплатном тире — обычное дело), намерение переставляется в очередь
+    #: заново, а не теряется. См. NotificationManager.retry_later.
+    #: `created_at` при этом НЕ обновляется: повод возник тогда, когда возник,
+    #: и по нему решается, не протух ли он.
+    attempt: int = Field(default=0, ge=0)
+
     @property
     def routing_key(self) -> str:
         """
