@@ -506,6 +506,13 @@ class EfiApp:
         # неудобно ровно тогда, когда что-то не работает.
         logger.info("app: отвечает — %s", describe_access_policy(self._settings.telegram))
 
+        # Какие роли LLM не настроены и в чью модель они из-за этого пойдут.
+        # Молча подставить MAIN вместо VISION нельзя: текстовая модель на
+        # фотографию ответит ошибкой или выдумкой, и узнать об этом владелец
+        # должен при запуске, а не когда ему пришлют картинку.
+        for note in self._settings.llm_roles.describe_fallbacks():
+            logger.warning("app: %s", note)
+
         self._telegram_handlers.register(self._pyrogram_client)
         self._channel_post_watcher.register(self._pyrogram_client)
         self._typing_tracker.register(self._pyrogram_client)
@@ -733,6 +740,11 @@ class EfiApp:
         await self._weather_tool.aclose()
         if self._stt is not None:
             await self._stt.aclose()
+        # БД — последней: до этого момента остановка ещё может писать
+        # (сохранение недоговорённых бабблов, закрытие обещаний). Закрыть
+        # обязательно: aiosqlite держит под соединение НЕ-daemon-поток, и
+        # незакрытое соединение не даёт процессу завершиться.
+        await self._database.close()
 
         logger.info("app: stopped")
         self._log_buffer.uninstall()
