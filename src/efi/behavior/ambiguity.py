@@ -30,6 +30,8 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from efi.utils.bounded import BoundedDict
+
 logger = logging.getLogger(__name__)
 
 #: Насколько близкими должны быть счета кандидатов, чтобы считать их
@@ -57,6 +59,12 @@ DEFAULT_TTL = timedelta(minutes=30)
 DEFAULT_ANSWER_TTL = timedelta(hours=24)
 
 _MAX_LISTED_CANDIDATES = 3
+
+#: Потолки на реестры: и вопросы, и полученные ответы живут по своему TTL,
+#: но истечение срока раньше замечалось только при обращении К ТОМУ ЖЕ чату —
+#: то есть запись по чату, куда больше не писали, не удалялась никогда.
+_MAX_TRACKED_CHATS = 256
+_MAX_TRACKED_ANSWERS = 512
 
 #: Заготовки уточнения. Все — короткие, разговорные и без служебного тона:
 #: это реплика в чате, а не диалоговое окно.
@@ -211,14 +219,21 @@ class PendingClarifications:
     def __init__(self, *, ttl: timedelta = DEFAULT_TTL, answer_ttl: timedelta = DEFAULT_ANSWER_TTL) -> None:
         self._ttl = ttl
         self._answer_ttl = answer_ttl
-        self._pending: dict[int, PendingClarification] = {}
+        #: Ограничен и по числу, и по возрасту: незакрытый вопрос по чату,
+        #: в который больше никто не написал, раньше жил до перезапуска —
+        #: `peek` чистит только тот чат, о котором спросили.
+        self._pending: BoundedDict[int, PendingClarification] = BoundedDict(
+            max_entries=_MAX_TRACKED_CHATS, ttl=ttl.total_seconds()
+        )
         #: Ответы, которые человек уже дал: (chat_id, упоминание) -> кто это.
         #: Без них система спрашивала бы одно и то же вечно — уточнение
         #: закрывалось бы, следующий эпизод снова упирался бы в те же два
         #: одинаковых имени, и человек получал бы тот же вопрос по кругу.
         #: Хуже вопроса без ответа только вопрос, ответ на который не
         #: запомнили.
-        self._answers: dict[tuple[int, str], _ConfirmedMention] = {}
+        self._answers: BoundedDict[tuple[int, str], _ConfirmedMention] = BoundedDict(
+            max_entries=_MAX_TRACKED_ANSWERS, ttl=answer_ttl.total_seconds()
+        )
 
     def remember(self, chat_id: int, resolution: Resolution) -> None:
         """Фиксирует, что по этому чату задан уточняющий вопрос."""

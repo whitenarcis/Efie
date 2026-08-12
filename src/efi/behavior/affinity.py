@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from efi.db.core import Database
+from efi.utils.bounded import BoundedDict
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +141,9 @@ class AffinityTracker:
 
     def __init__(self, database: Database) -> None:
         self._database = database
-        self._cache: dict[int, AffinitySnapshot] = {}
+        #: Кэш поверх БД, поэтому вытеснение безопасно: вытесненный чат
+        #: просто перечитается одним запросом при следующем обращении.
+        self._cache: BoundedDict[int, AffinitySnapshot] = BoundedDict(max_entries=256)
 
     async def get_snapshot(self, chat_id: int) -> AffinitySnapshot:
         """Критический путь (сборка системного промпта): кэш -> БД -> дефолт, в таком порядке."""

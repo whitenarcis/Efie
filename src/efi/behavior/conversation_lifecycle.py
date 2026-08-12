@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from efi.db.core import Database
+from efi.utils.bounded import BoundedDict
 
 logger = logging.getLogger(__name__)
 
@@ -253,8 +254,15 @@ class ConversationLifecycle:
         #: Личка владельца входит сюда всегда: в Telegram id приватного чата
         #: совпадает с user_id собеседника.
         self._proactive_chats = {owner_id, *proactive_chats}
-        self._cache: dict[tuple[int, int], ConversationState] = {}
-        self._terse_streak: dict[tuple[int, int], int] = {}
+        #: Записи на КАЖДУЮ пару (человек, чат). В группе на пять тысяч
+        #: участников, где каждый однажды написал, это пять тысяч записей,
+        #: которые раньше жили до перезапуска процесса. Кэш поверх БД —
+        #: вытеснение безопасно; серия сухих ответов живёт внутри одного
+        #: разговора и дольше суток не нужна.
+        self._cache: BoundedDict[tuple[int, int], ConversationState] = BoundedDict(max_entries=1024)
+        self._terse_streak: BoundedDict[tuple[int, int], int] = BoundedDict(
+            max_entries=1024, ttl=24 * 3600.0
+        )
 
     def classify(self, user_id: int | None) -> UserTier:
         """Владелец или посторонний. `None` (нет отправителя) трактуется как посторонний — безопасный дефолт."""

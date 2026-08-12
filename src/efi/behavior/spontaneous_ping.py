@@ -19,7 +19,6 @@ try_spontaneous_ping из текущей реализации: периодич�
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import random
 from collections.abc import Awaitable, Callable
@@ -30,6 +29,7 @@ from efi.behavior.quiet_hours import is_quiet_now
 from efi.config.schema import QuietHoursSettings
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
+from efi.utils.loops import run_periodically
 
 logger = logging.getLogger(__name__)
 
@@ -72,17 +72,12 @@ class SpontaneousPingScheduler:
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
-        logger.info(
-            "spontaneous_ping: started (interval=%.0fs, p=%.2f)",
-            self._check_interval_seconds, self._ping_probability,
+        logger.info("spontaneous_ping: probability=%.2f", self._ping_probability)
+        await run_periodically(
+            self._maybe_ping_candidates,
+            interval_seconds=self._check_interval_seconds,
+            name="spontaneous_ping",
         )
-        try:
-            while True:
-                await asyncio.sleep(self._check_interval_seconds)
-                await self._maybe_ping_candidates()
-        except asyncio.CancelledError:
-            logger.info("spontaneous_ping: stopped")
-            raise
 
     async def _maybe_ping_candidates(self) -> None:
         if is_quiet_now(self._quiet_hours, self._timezone):

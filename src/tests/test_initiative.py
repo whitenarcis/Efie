@@ -325,5 +325,87 @@ def test_the_prompt_bans_the_exact_phrases_it_used_to_produce() -> None:
         Notification(type=NotificationType.SPONTANEOUS_PING, chat_id=_CHAT_ID, message="повод")
     )
 
-    for phrase in ("«эй»", "ты там живой?", "как дела?", "не утонул в коде?"):
+    for phrase in ("«эй»", "ты там живой?", "не утонул в коде?"):
         assert phrase in block, f"{phrase} — ровно то, что она писала месяцами"
+
+
+def test_a_plain_how_are_you_is_not_forbidden() -> None:
+    """
+    Запрещено допытываться, здесь ли собеседник, — а не спрашивать, как у
+    него дела. «Как дела» живые люди пишут постоянно, и запрещать это значило
+    бы лечить симптом вместо причины (причина была в отсутствии повода).
+    """
+    from efi.notifications.schemas import Notification, NotificationType
+    from efi.prompts.builder import _build_proactive_brevity_block
+
+    block = _build_proactive_brevity_block(
+        Notification(type=NotificationType.SPONTANEOUS_PING, chat_id=_CHAT_ID, message="повод")
+    )
+
+    assert "«как дела» под запрет НЕ подпадает" in block
+
+
+# -- поводов стало больше ---------------------------------------------------------
+
+
+async def test_an_open_promise_is_the_strongest_reason(tmp_path: Path) -> None:
+    """Обещание человек помнит и ждёт — оно важнее и своих находок, и вежливого интереса."""
+    from efi.memory.working_memory import WorkingMemory
+
+    memory = WorkingMemory(tmp_path / "wm.json")
+    await memory.add_item("скинуть ссылку на тот сканер", chat_id=_CHAT_ID)
+
+    reason = await PingReasonBuilder(working_memory=memory).reason_for(_CHAT_ID)
+
+    assert reason is not None
+    assert "скинуть ссылку на тот сканер" in reason
+
+
+async def test_a_fresh_diary_entry_keeps_her_from_going_mute(tmp_path: Path) -> None:
+    """
+    Дневник наполняется с первого же разговора, а строгая память — только
+    когда прозвучал устойчивый факт. Без этого источника Эфи молчала бы
+    неделями после чистой установки.
+    """
+    from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata
+    from efi.memory.diary import Diary
+
+    diary = Diary(tmp_path / "diary")
+    await diary.save(
+        DiaryEntry(
+            id="fresh_1",
+            metadata=DiaryEntryMetadata(confidence=0.5),
+            body="Читала сегодня про плёночные сканеры и залипла на час.",
+        )
+    )
+
+    reason = await PingReasonBuilder(diary=diary).reason_for(_CHAT_ID)
+
+    assert reason is not None
+    assert "плёночные сканеры" in reason
+
+
+async def test_a_stale_diary_entry_is_not_a_reason(tmp_path: Path) -> None:
+    """«Я на прошлой неделе читала» — уже не разговор, а натянутый повод."""
+    from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata
+    from efi.memory.diary import Diary
+
+    diary = Diary(tmp_path / "diary")
+    await diary.save(
+        DiaryEntry(
+            id="old_1",
+            metadata=DiaryEntryMetadata(confidence=0.5, created_at=datetime.now(UTC) - timedelta(days=9)),
+            body="Что-то давнее и уже неактуальное.",
+        )
+    )
+
+    assert await PingReasonBuilder(diary=diary).reason_for(_CHAT_ID) is None
+
+
+async def test_a_promise_from_another_chat_is_not_a_reason(tmp_path: Path) -> None:
+    from efi.memory.working_memory import WorkingMemory
+
+    memory = WorkingMemory(tmp_path / "wm.json")
+    await memory.add_item("это обещание из другого чата", chat_id=-999)
+
+    assert await PingReasonBuilder(working_memory=memory).reason_for(_CHAT_ID) is None

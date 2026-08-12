@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
 from typing import Any
@@ -105,6 +105,14 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_WORKER_COUNT = 3
 _QUEUE_DRAIN_TIMEOUT_SECONDS = 30.0
+
+#: Сколько раз подряд перезапускать упавшую фоновую службу и с какой паузой.
+#: Потолок нужен, чтобы безнадёжно сломанная служба (нет файла, нет прав) не
+#: перезапускалась вечно; шести попыток с удвоением хватает, чтобы пережить
+#: любую временную неприятность и сдаться на постоянной.
+_MAX_SERVICE_RESTARTS = 6
+_SERVICE_RESTART_BASE_DELAY = 5.0
+_SERVICE_RESTART_MAX_DELAY = 300.0
 _CONSOLIDATION_TRIGGER_AT = dt_time(hour=3, minute=30)
 #: "С начала времён" — для get_active_chat_ids(since=...) в _active_chat_candidates,
 #: где нужны ВСЕ чаты с известной историей, а не только недавние.
@@ -292,6 +300,8 @@ class EfiApp:
         self._ping_reasons = PingReasonBuilder(
             knowledge=self._knowledge,
             people=self._people,
+            diary=self._diary,
+            working_memory=self._working_memory,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
         )
         self._silence_monitor.set_reasons(self._ping_reasons)
@@ -335,10 +345,9 @@ class EfiApp:
             settings.paths.session_name,
             api_id=settings.telegram.api_id,
             api_hash=settings.telegram.api_hash.get_secret_value(),
-            # Подавление ниже — та же неточность аннотаций Pyrogram, что и с
-            # reply_to_message_id: объявлено `phone_number: str`, а значение по
-            # умолчанию None (номер нужен только при первой интерактивной авторизации).
-            phone_number=phone_number,  # type: ignore[arg-type]
+            # Номер нужен только при первой интерактивной авторизации; в
+            # остальных запусках его нет, и Pyrogram это допускает.
+            phone_number=phone_number,
             workdir=str(settings.paths.session_path.parent),
         )
         self._telegram_client = TelegramClientWrapper(self._pyrogram_client, settings.humanizer)
@@ -525,20 +534,20 @@ class EfiApp:
 
         self._background_tasks.extend(
             [
-                self._spawn_supervised(self._scheduler.run(), name="scheduler"),
-                self._spawn_supervised(self._silence_monitor.run(), name="silence_monitor"),
-                self._spawn_supervised(self._spontaneous_ping.run(), name="spontaneous_ping"),
-                self._spawn_supervised(self._researcher.run(), name="background_researcher"),
-                self._spawn_supervised(self._life_engine.run(), name="life_engine"),
-                self._spawn_supervised(self._prompt_loader.watch(), name="prompt_loader_watch"),
-                self._spawn_supervised(self._run_consolidation_loop(), name="diary_consolidation"),
-                self._spawn_supervised(self._random_comment_engager.run(), name="random_comment_engager"),
-                self._spawn_supervised(self._reminder_scheduler.run(), name="reminders"),
+                self._spawn_supervised(lambda: self._scheduler.run(), name="scheduler"),
+                self._spawn_supervised(lambda: self._silence_monitor.run(), name="silence_monitor"),
+                self._spawn_supervised(lambda: self._spontaneous_ping.run(), name="spontaneous_ping"),
+                self._spawn_supervised(lambda: self._researcher.run(), name="background_researcher"),
+                self._spawn_supervised(lambda: self._life_engine.run(), name="life_engine"),
+                self._spawn_supervised(lambda: self._prompt_loader.watch(), name="prompt_loader_watch"),
+                self._spawn_supervised(lambda: self._run_consolidation_loop(), name="diary_consolidation"),
+                self._spawn_supervised(lambda: self._random_comment_engager.run(), name="random_comment_engager"),
+                self._spawn_supervised(lambda: self._reminder_scheduler.run(), name="reminders"),
             ]
         )
 
         if self._settings.memory_pulse.enabled:
-            self._background_tasks.append(self._spawn_supervised(self._memory_pulse.run(), name="memory_pulse"))
+            self._background_tasks.append(self._spawn_supervised(lambda: self._memory_pulse.run(), name="memory_pulse"))
 
         if self._dashboard is not None:
             # Дашборд поднимается ПОСЛЕДНИМ и не через _spawn_supervised: он
@@ -556,28 +565,53 @@ class EfiApp:
             len(self._worker_tasks), len(self._background_tasks),
         )
 
-    def _spawn_supervised(self, coro: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
+    def _spawn_supervised(self, factory: Callable[[], Coroutine[Any, Any, None]], *, name: str) -> asyncio.Task[None]:
         """
-        Создаёт фоновую задачу с логированием её падения В МОМЕНТ падения.
+        Фоновая служба, которая ПЕРЕЗАПУСКАЕТСЯ, если всё-таки упала.
 
         Голый asyncio.create_task() для долгоживущего сервиса — тихая дыра:
-        если корутина упадёт (сбой БД, баг в цикле), задача просто перестаёт
-        существовать, а исключение всплывает либо на shutdown при gather(),
-        либо вообще только сборщиком мусора как "Task exception was never
-        retrieved". С точки зрения наблюдателя фоновый сервис молча
-        переставал работать, и в логах на этот счёт не было ничего.
+        упавшая корутина просто перестаёт существовать, а исключение всплывает
+        либо на shutdown при gather(), либо вообще только сборщиком мусора как
+        "Task exception was never retrieved". Служба молча переставала
+        работать, и в логах на этот счёт не было ничего.
+
+        Логирования, которое здесь стояло раньше, оказалось мало. Оно делает
+        поломку видимой в логе — но Эфи от этого не начинает снова писать
+        первой. А смотрят в лог обычно уже после того, как заметили странность
+        поведения, то есть спустя дни.
+
+        Поэтому принимается ФАБРИКА корутины, а не корутина: перезапуск —
+        это новый вызов, а однажды исчерпанную корутину повторно запустить
+        нельзя. Между попытками — растущая пауза: если служба падает сразу
+        после старта (испорченный файл, недоступная БД), перезапуск в цикле
+        только забьёт лог и посадит батарею.
         """
 
-        def _log_failure(task: asyncio.Task[None]) -> None:
-            if task.cancelled():
-                return
-            exception = task.exception()
-            if exception is not None:
-                logger.error("app: background task %r died", name, exc_info=exception)
+        async def _supervise() -> None:
+            attempt = 0
+            while True:
+                try:
+                    await factory()
+                    logger.info("app: background task %r finished on its own", name)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    attempt += 1
+                    if attempt > _MAX_SERVICE_RESTARTS:
+                        logger.error(
+                            "app: background task %r упала %d раз подряд, больше не перезапускаю",
+                            name, attempt, exc_info=True,
+                        )
+                        return
+                    delay = min(_SERVICE_RESTART_BASE_DELAY * 2 ** (attempt - 1), _SERVICE_RESTART_MAX_DELAY)
+                    logger.error(
+                        "app: background task %r died, перезапуск через %.0fs (попытка %d/%d)",
+                        name, delay, attempt, _MAX_SERVICE_RESTARTS, exc_info=True,
+                    )
+                    await asyncio.sleep(delay)
 
-        task = asyncio.create_task(coro, name=name)
-        task.add_done_callback(_log_failure)
-        return task
+        return asyncio.create_task(_supervise(), name=name)
 
     async def _run_consolidation_loop(self) -> None:
         """

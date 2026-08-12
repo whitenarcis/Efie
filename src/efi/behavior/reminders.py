@@ -34,7 +34,6 @@ efi/behavior/reminders.py
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -43,6 +42,7 @@ from datetime import UTC, datetime, timedelta
 from efi.db.core import Database
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
+from efi.utils.loops import run_periodically
 
 logger = logging.getLogger(__name__)
 
@@ -240,14 +240,9 @@ class ReminderScheduler:
         self._check_interval_seconds = check_interval_seconds
 
     async def run(self) -> None:
-        logger.info("reminders: started (interval=%.0fs)", self._check_interval_seconds)
-        try:
-            while True:
-                await asyncio.sleep(self._check_interval_seconds)
-                await self.tick()
-        except asyncio.CancelledError:
-            logger.info("reminders: stopped")
-            raise
+        await run_periodically(
+            self.tick, interval_seconds=self._check_interval_seconds, name="reminders"
+        )
 
     async def tick(self) -> int:
         """

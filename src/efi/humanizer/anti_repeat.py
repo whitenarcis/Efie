@@ -14,9 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import difflib
-from collections import defaultdict, deque
+from collections import deque
 
 from efi.config.schema import HumanizerSettings
+from efi.utils.bounded import BoundedDict
+
+#: Сколько чатов держим под наблюдением. Заметно больше, чем у кого-либо
+#: бывает живых диалогов одновременно, — и при этом конечное число.
+_MAX_TRACKED_CHATS = 256
 
 
 class AntiRepeatTracker:
@@ -32,11 +37,20 @@ class AntiRepeatTracker:
 
     def __init__(self, settings: HumanizerSettings) -> None:
         self._settings = settings
-        self._history: dict[int, deque[str]] = defaultdict(lambda: deque(maxlen=settings.anti_repeat_max_history))
+        #: По чату — до `anti_repeat_max_history` последних реплик. Число
+        #: ЧАТОВ тоже ограничено: у userbot'а их за месяцы набегает сколько
+        #: угодно, а держим мы на каждый по три десятка строк. Вытесненный
+        #: чат теряет защиту от повтора — приемлемо: это чат, в котором Эфи
+        #: давно ничего не говорила, и повторяться там не с чем.
+        self._history: BoundedDict[int, deque[str]] = BoundedDict(max_entries=_MAX_TRACKED_CHATS)
 
     def record(self, chat_id: int, text: str) -> None:
         """Регистрирует отправленное сообщение в истории чата. Вызывается ПОСЛЕ фактической отправки."""
-        self._history[chat_id].append(text)
+        history = self._history.get(chat_id)
+        if history is None:
+            history = deque(maxlen=self._settings.anti_repeat_max_history)
+            self._history[chat_id] = history
+        history.append(text)
 
     async def is_repetitive(self, chat_id: int, candidate: str) -> bool:
         """Критический путь (перед отправкой): True, если кандидат слишком похож на недавнюю историю чата."""
