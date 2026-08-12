@@ -129,7 +129,7 @@ def _make_worker(
         system_prompt_builder=_FakePromptBuilder(),  # type: ignore[arg-type]
         busy_engine=_FakeBusyEngine(),  # type: ignore[arg-type]
         lifecycle=lifecycle,
-        promises=promises,  # type: ignore[arg-type]
+        working_memory=promises,  # type: ignore[arg-type]
     )
     return worker, send_tool, history
 

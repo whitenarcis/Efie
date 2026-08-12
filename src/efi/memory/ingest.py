@@ -83,8 +83,14 @@ class MemoryIngestor:
         self._parser = parser
         self._validator = validator
         self._store = store
-        self._detector = detector or AmbiguityDetector()
-        self._pending = pending or PendingClarifications()
+        self._detector = detector if detector is not None else AmbiguityDetector()
+        # Именно `is not None`, а не `or`. У PendingClarifications есть
+        # __len__, поэтому ПУСТОЙ реестр — а он всегда пуст при старте —
+        # ложен по значению, и `pending or PendingClarifications()` молча
+        # подменял переданный извне реестр своим. Внешне это выглядело как
+        # «уточняющие вопросы не работают»: конвейер исправно их формулировал
+        # и складывал в объект, которого не видел больше никто.
+        self._pending = pending if pending is not None else PendingClarifications()
 
     async def ingest_conversation(
         self,

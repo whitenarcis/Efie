@@ -146,6 +146,11 @@ async def test_finding_and_reaction_budgets_leave_room_for_cyrillic() -> None:
 # -- консолидация -------------------------------------------------------------
 
 
+def _episode(text: str) -> str:
+    """Текст эпизода в том виде, в каком его собирает novelize_chat."""
+    return f"собеседник: {text}"
+
+
 def _consolidator(tmp_path: Path, router: _FakeRouter) -> DiaryConsolidator:
     return DiaryConsolidator(Diary(tmp_path / "diary"), router, rag=None)  # type: ignore[arg-type]
 
@@ -160,7 +165,7 @@ async def test_only_the_last_novelized_entry_is_repaired(tmp_path: Path) -> None
     router = _FakeRouter((f"{complete}\n---\n{_TRUNCATED}", "length"))
 
     pieces = await _consolidator(tmp_path, router)._extract_memories(
-        Session(messages=[Message(role=Role.USER, content="про кирпич")])
+        _episode("про кирпич")
     )
 
     assert pieces == [complete, _TRIMMED]
@@ -171,7 +176,7 @@ async def test_hopeless_last_entry_is_dropped_and_the_rest_survives(tmp_path: Pa
     router = _FakeRouter((f"{complete}\n---\n{_HOPELESS}", "length"))
 
     pieces = await _consolidator(tmp_path, router)._extract_memories(
-        Session(messages=[Message(role=Role.USER, content="про кирпич")])
+        _episode("про кирпич")
     )
 
     assert pieces == [complete]
@@ -181,7 +186,7 @@ async def test_complete_novelization_is_untouched(tmp_path: Path) -> None:
     router = _FakeRouter(("Первая запись целиком.\n---\nВторая запись целиком.", "stop"))
 
     pieces = await _consolidator(tmp_path, router)._extract_memories(
-        Session(messages=[Message(role=Role.USER, content="про кирпич")])
+        _episode("про кирпич")
     )
 
     assert pieces == ["Первая запись целиком.", "Вторая запись целиком."]

@@ -384,7 +384,11 @@ class TelegramClientWrapper:
         """
         if not await self.ensure_peer_known(chat_id):
             raise UnknownChatError(chat_id)
-        await self._client.send_reaction(chat_id, message_id, emoji)
+        # Подавление ниже — неточность аннотаций Pyrogram: третий параметр
+        # объявлен `int` (id премиум-эмодзи), хотя обычная реакция передаётся
+        # строкой и именно так задокументирована. Проверять тут нечего:
+        # строка приходит уже нормализованной по штатному набору реакций.
+        await self._client.send_reaction(chat_id, message_id, emoji)  # type: ignore[arg-type]
 
 
 __all__ = ["TelegramClientWrapper"]

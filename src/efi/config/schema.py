@@ -345,28 +345,64 @@ class LLMRolesSettings(BaseModel):
         background.primary -> модель фоновой жизни (дневник/факты/исследования)
         vision.primary     -> мультимодальная модель
 
-    `background` необязателен: если он не задан, роль BACKGROUND использует
-    маршрут FAST. Так регламент ролей остаётся строгим на уровне кода (фоновые
-    потребители всегда просят именно BACKGROUND и физически не могут занять
-    канал живого диалога), но конфигурация не обязана заводить отдельный
-    эндпоинт, пока в этом нет нужды.
+    ОБЯЗАТЕЛЕН ТОЛЬКО `main`. Остальные роли, если не заданы, используют его
+    маршрут: FAST и VISION — напрямую, BACKGROUND — через FAST.
+
+    Так сделано ради первого запуска. Раньше схема требовала заполнить main,
+    fast и vision, а шаблон конфига объявлял ещё и main.fallback с
+    background — итого восемнадцать обязательных полей, из которых
+    пятнадцать про LLM. Человек, у которого есть один бесплатный ключ и
+    желание попробовать, упирался в стену раньше, чем видел хоть одно
+    сообщение. При этом ничто в архитектуре не требовало разных эндпоинтов:
+    регламент ролей — про то, КТО какой канал занимает, а не про то, сколько
+    у владельца ключей.
+
+    Регламент от этого не размывается: фоновые потребители по-прежнему
+    просят именно BACKGROUND и физически не могут занять канал живого
+    диалога. Просто по умолчанию все каналы ведут в одну модель — а разнести
+    их по разным можно тогда, когда в этом появится смысл.
     """
 
     model_config = ConfigDict(frozen=True)
 
     main: RoleRoute
-    fast: RoleRoute
-    vision: RoleRoute
+    fast: RoleRoute | None = None
+    vision: RoleRoute | None = None
     background: RoleRoute | None = None
 
     def as_routes(self) -> dict[TaskRole, RoleRoute]:
         """Приводит конфигурацию к виду, который принимает конструктор `LLMRouter`."""
+        fast = self.fast if self.fast is not None else self.main
         return {
             TaskRole.MAIN: self.main,
-            TaskRole.FAST: self.fast,
-            TaskRole.BACKGROUND: self.background if self.background is not None else self.fast,
-            TaskRole.VISION: self.vision,
+            TaskRole.FAST: fast,
+            TaskRole.BACKGROUND: self.background if self.background is not None else fast,
+            TaskRole.VISION: self.vision if self.vision is not None else self.main,
         }
+
+    def describe_fallbacks(self) -> list[str]:
+        """
+        Роли, которые пойдут в чужую модель, — человеческим языком для лога
+        при старте.
+
+        Молча подставить main вместо vision нельзя: текстовая модель на
+        фотографию ответит ошибкой или выдумкой, и владелец должен узнать об
+        этом при запуске, а не когда ему пришлют картинку.
+        """
+        notes: list[str] = []
+        if self.fast is None:
+            notes.append("FAST не задана — служебные вызовы пойдут в модель MAIN")
+        if self.background is None:
+            notes.append(
+                "BACKGROUND не задана — дневник и фоновая жизнь пойдут в модель "
+                + ("FAST" if self.fast is not None else "MAIN")
+            )
+        if self.vision is None:
+            notes.append(
+                "VISION не задана — фотографии пойдут в модель MAIN; если она не "
+                "мультимодальная, разбор изображений работать не будет"
+            )
+        return notes
 
     def build_router(self, **router_kwargs: Any) -> LLMRouter:
         """

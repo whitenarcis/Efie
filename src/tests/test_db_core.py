@@ -34,13 +34,45 @@ async def _settle() -> None:
         await asyncio.sleep(0.05)
 
 
-async def test_connection_is_closed_after_use(tmp_path: Path) -> None:
+async def test_the_connection_is_reused_not_reopened(tmp_path: Path) -> None:
+    """
+    Соединение теперь ОДНО на весь процесс. Раньше `connection()` открывал
+    новое под каждый вызов и закрывал следом — формально корректно, но
+    каждое подключение aiosqlite поднимает свой поток и заново прогоняет
+    PRAGMA: 2.7 мс на точечное чтение вместо 0.37 мс.
+    """
+    database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
+
+    async with database.connection() as first:
+        pass
+    async with database.connection() as second:
+        pass
+
+    assert first is second
+    await database.close()
+
+
+async def test_closing_releases_the_thread(tmp_path: Path) -> None:
+    """
+    aiosqlite держит под соединение НЕ-daemon-поток: незакрытое соединение не
+    даёт процессу завершиться вовсе.
+    """
     before = _worker_threads()
     database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
-    async with database.connection() as conn:
-        await conn.execute("SELECT 1")
+    await database.fetch_one("SELECT 1")
+
+    await database.close()
+
     await _settle()
     assert _worker_threads() <= before
+
+
+async def test_closing_twice_is_harmless(tmp_path: Path) -> None:
+    database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
+    await database.fetch_one("SELECT 1")
+
+    await database.close()
+    await database.close()
 
 
 async def test_failed_pragma_does_not_leak_a_connection(
@@ -100,5 +132,6 @@ async def test_concurrent_first_touch_of_a_fresh_database(tmp_path: Path) -> Non
     results = await asyncio.gather(*(database.fetch_all("SELECT COUNT(*) AS total FROM messages") for _ in range(6)))
     assert [dict(rows[0])["total"] for rows in results] == [0] * 6
 
+    await database.close()
     await _settle()
     assert _worker_threads() <= before

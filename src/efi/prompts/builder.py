@@ -17,11 +17,13 @@ system-блок с working memory/RAG (как было до Шага 6) — эт
 {user_name}/{time_of_day} — они подставляются здесь (_render_personality_template),
 а не хранятся в самом файле как готовый текст: то, "кто сейчас пишет" и
 "какое сейчас время суток", известно только на момент конкретного запроса.
-{weather}/{energy} НЕ подставляются намеренно — для погоды нет источника
-данных (не подключён никакой weather API), а "энергия" не отслеживается как
-число нигде в системе; если такие плейсхолдеры встретятся в тексте, они
-останутся как есть (см. _SafeFormatDict) — это осознанный компромисс, а не
-баг, до тех пор, пока для них не появится реальный источник данных.
+{energy} (число процентов) и {energy_label} (то же словами) берутся из
+текущего самоощущения — efi/behavior/energy.py. Раньше {energy} намеренно НЕ
+подставлялся, потому что энергия нигде не отслеживалась как живая величина;
+теперь отслеживается. {weather} — по-прежнему нет: источника данных для него
+в системе не существует, и такой плейсхолдер останется в тексте как есть
+(см. _SafeFormatDict) — это осознанный компромисс, а не баг, до тех пор, пока
+не появится реальный источник.
 
 Блок "текущее состояние личности" (_build_state_vector_block) — отдельный
 седьмой блок, вставленный между working memory и RAG: mood/social_distance
@@ -57,6 +59,7 @@ from efi.behavior.affinity import (
     AffinitySnapshot,
     AffinityTracker,
 )
+from efi.behavior.ambiguity import PendingClarification, PendingClarifications
 from efi.config.schema import LockdownMode, Settings
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
 from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
@@ -64,7 +67,7 @@ from efi.memory.dedup import KnowledgeStore, StoredFact, render_facts_block
 from efi.memory.people import PeopleStore, PersonProfile
 from efi.memory.rag import RAGMemory
 from efi.memory.router import MemoryDomain, MemoryRouter
-from efi.memory.working_memory import WorkingMemory, WorkingMemoryItem, WorkingMemorySnapshot
+from efi.memory.working_memory import SelfState, WorkingMemory, WorkingMemoryItem, WorkingMemorySnapshot
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
@@ -205,6 +208,7 @@ class EfiSystemPromptBuilder:
         affinity: AffinityTracker,
         people: PeopleStore | None = None,
         knowledge: KnowledgeStore | None = None,
+        clarifications: PendingClarifications | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -214,6 +218,11 @@ class EfiSystemPromptBuilder:
         self._affinity = affinity
         self._people = people
         self._knowledge = knowledge
+        #: Незакрытые уточнения по чатам (efi/behavior/ambiguity.py). Именно
+        #: через промпт, а не отдельным сообщением: вопрос «ты про Феникс-кота
+        #: или Феникс-проект?» должен прозвучать в её обычной реплике, а не
+        #: прилететь роботизированным уведомлением посреди разговора.
+        self._clarifications = clarifications
         #: Без состояния — один на билдер, см. efi/memory/router.py.
         self._memory_router = MemoryRouter()
 
@@ -269,8 +278,9 @@ class EfiSystemPromptBuilder:
         )
 
         now = local_now(self._settings.timezone)
+        self_state = self._working_memory.describe(memory_snapshot, now=now)
         rendered_personality = _render_personality_template(
-            personality, self._resolve_user_name(notification), now=now
+            personality, self._resolve_user_name(notification), now=now, state=self_state
         )
 
         blocks = [
@@ -284,8 +294,9 @@ class EfiSystemPromptBuilder:
                 self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
             ),
             _build_proactive_brevity_block(notification),
+            _build_clarification_block(self._peek_clarification(notification)),
             _build_time_block(now, is_user_message=notification.type is NotificationType.USER_MESSAGE),
-            _build_working_memory_block(memory_snapshot),
+            _build_working_memory_block(memory_snapshot, self_state),
             _build_state_vector_block(
                 relevant_beliefs, affinity_snapshot, self._settings.state_vector.sycophancy_protection_text
             ),
@@ -295,6 +306,16 @@ class EfiSystemPromptBuilder:
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
+
+    def _peek_clarification(self, notification: Notification) -> PendingClarification | None:
+        """
+        Уточнение по ЭТОМУ чату, если оно ещё живо. Синхронно и без I/O —
+        реестр держится в памяти процесса (см. PendingClarifications: вопрос
+        живёт минуты и осмыслен только внутри текущего разговора).
+        """
+        if self._clarifications is None or notification.chat_id is None:
+            return None
+        return self._clarifications.peek(notification.chat_id)
 
     async def _resolve_knowledge(
         self, notification: Notification, domains: tuple[MemoryDomain, ...]
@@ -379,9 +400,22 @@ class EfiSystemPromptBuilder:
             return self._settings.personality_prompt
 
 
-def _render_personality_template(text: str, user_name: str, *, now: datetime | None = None) -> str:
-    """Подставляет {user_name}/{time_of_day}; см. докстринг модуля про {weather}/{energy}."""
-    context = _SafeFormatDict(user_name=user_name, time_of_day=_time_of_day_label(now))
+def _render_personality_template(
+    text: str, user_name: str, *, now: datetime | None = None, state: SelfState | None = None
+) -> str:
+    """
+    Подставляет {user_name}/{time_of_day}/{energy}/{energy_label}; см.
+    докстринг модуля про {weather}.
+
+    `{energy}` — именно число процентов, потому что в шаблоне оно стоит как
+    «примерно {energy}% энергии»; словесная форма живёт в `{energy_label}`.
+    """
+    context = _SafeFormatDict(
+        user_name=user_name,
+        time_of_day=_time_of_day_label(now),
+        energy=str(state.energy.percent) if state is not None else "",
+        energy_label=state.energy.label if state is not None else "",
+    )
     try:
         return text.format_map(context)
     except (ValueError, IndexError) as exc:
@@ -549,25 +583,61 @@ def _build_stranger_block(tier_is_secondary: bool, is_private_chat: bool) -> str
 
 def _build_proactive_brevity_block(notification: Notification) -> str:
     """
-    Жёсткое ограничение длины для проактивных пингов (Эфи пишет ПЕРВОЙ).
+    Как писать, когда пишешь первой.
 
-    Собеседник ничего не спрашивал — он молчит. Реальный человек в такой
-    ситуации кидает одну короткую реплику ("ты там как?", "живой?") и ждёт
-    ответа, а не выдаёт монолог из трёх сообщений с нарастающей подколкой.
-    Без этого блока проактивный пинг стабильно превращался в трёхэтажную
-    остроту ("эй /// ты там не уснул в обнимку с клавиатурой? /// или всё
-    ещё в режиме энергосбережения"), что читается как отчаянная попытка
-    расшевелить, а не как живое "просто вспомнила о тебе".
+    Блок переписан по живой переписке, где инициатива Эфи месяцами выглядела
+    так:
+
+        09:00  ну чё там твой вайбкод, ещё не всё сломал?
+        10:15  эй / ты там ещё не утонул в своём коде?
+        10:28  эй / ты там не сдох от перетренированности?
+        15:28  эй / ты там живой ещё или в коде утонул?
+
+    Прежняя редакция блока это отчасти и порождала: она просила «одну
+    короткую реплику» и приводила в пример ровно «ты там как?» и «живой?».
+    Ограничение работало, содержание — нет.
+
+    Поэтому здесь теперь не про длину (её всё равно держит код — см.
+    efi.tools.telegram_actions.send_message), а про суть: у инициативы есть
+    повод, он написан выше в самом уведомлении, и говорить надо ПРО НЕГО.
+    Спрашивать «ты ещё здесь» запрещено прямым списком: это единственное,
+    что модель придумывает, когда сказать нечего, — а теперь ей есть что.
     """
     if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
         return ""
     return (
-        "[Ты пишешь первой] Собеседник сейчас молчит и ни о чём тебя не спрашивал. "
-        "ЖЁСТКОЕ ОГРАНИЧЕНИЕ на этот ответ: РОВНО ОДНА короткая реплика, без единого ' /// ' — "
-        "два и более сообщения подряд здесь запрещены. Никаких нагнетающих подколок серией и "
-        "никаких острот про технику/энергосбережение/сон в обнимку с клавиатурой. "
-        "Просто напиши то, с чем реально пришла — коротко и по-человечески, "
-        "и оставь собеседнику место ответить. Если есть уместный стикер — он тут лучше слов."
+        "[Ты пишешь первой] Собеседник молчит и ни о чём тебя не спрашивал. Ты пишешь не потому, "
+        "что ждёшь ответа, а потому что тебе есть что сказать — повод описан выше, говори именно "
+        "про него.\n"
+        "ЗАПРЕЩЕНО: «эй», «ты там живой?», «не утонул в коде?», «не сдох?», «ты там не умер?» и любые "
+        "другие способы спросить «ты ещё здесь». Это не разговор, а проверка связи, и читается "
+        "она именно так — особенно вторым сообщением подряд. (Обычное «как дела» под запрет НЕ "
+        "подпадает: так пишут живые люди. Запрещено именно допытываться, здесь ли собеседник.)\n"
+        "РОВНО ОДНА короткая реплика, без единого ' /// '. Не нагнетай серией подколок и не остри "
+        "про технику, энергосбережение и сон в обнимку с клавиатурой.\n"
+        "Скажи своё и оставь человеку место ответить — или промолчать. Если уместен стикер, он тут "
+        "лучше слов."
+    )
+
+
+def _build_clarification_block(pending: PendingClarification | None) -> str:
+    """
+    Незакрытый уточняющий вопрос — то, что Эфи обязана спросить, прежде чем
+    записывать факт о неоднозначном упоминании.
+
+    Через промпт, а не отдельным сообщением: «ты про Феникс-кота или
+    Феникс-проект?» должно прозвучать её обычной репликой, вплетённой в
+    разговор, а не прилететь роботизированным уведомлением из ниоткуда.
+    Формулировка вопроса уже готова (efi/behavior/ambiguity.py), но она —
+    образец смысла, а не текст под копирку: у Эфи своя манера речи.
+    """
+    if pending is None:
+        return ""
+    options = ", ".join(candidate.describe() for candidate in pending.candidates)
+    return (
+        f"[Надо уточнить] В разговоре прозвучало «{pending.mention}», и ты не поняла, о ком речь: "
+        f"{options}. Пока не выяснишь — не делай вид, что поняла, и ничего про это не запоминай. "
+        f"Спроси по ходу разговора, своими словами и коротко. Смысл вопроса такой: «{pending.question}»"
     )
 
 
@@ -622,18 +692,29 @@ def _weekend_note(now: datetime) -> str:
     return "будний день"
 
 
-def _build_working_memory_block(snapshot: WorkingMemorySnapshot) -> str:
-    parts: list[str] = []
-    if snapshot.emotional_state or snapshot.physical_state:
+def _build_working_memory_block(snapshot: WorkingMemorySnapshot, state: SelfState) -> str:
+    """
+    Блок «[Текущее состояние]» — самоощущение и открытые долги.
+
+    Состояние здесь есть ВСЕГДА. Раньше блок появлялся, только если модель
+    сама однажды вызвала `update_self_state`, а она этого практически не
+    делала — и в промпте месяцами стояло «не определено», то есть прямая
+    подсказка, что никакого состояния у неё и нет. Теперь при молчании
+    модели оно выводится из энергии и часа суток (см. efi/behavior/energy.py),
+    а её собственные слова, пока свежие, эту оценку перебивают.
+    """
+    parts = [
+        f"эмоциональное состояние: {state.emotional}; физическое состояние: {state.physical}; "
+        f"энергия: {state.energy.percent}% ({state.energy.label})"
+    ]
+    if state.energy.is_sleepy:
         parts.append(
-            f"эмоциональное состояние: {snapshot.emotional_state or 'не определено'}; "
-            f"физическое состояние: {snapshot.physical_state or 'не определено'}"
+            "Тебя ощутимо клонит в сон. Это не запрет разговаривать — это то, как ты сейчас себя "
+            "чувствуешь: короче реплики, меньше энтузиазма, можешь честно сказать, что засыпаешь."
         )
     open_items = [item for item in snapshot.items if not item.done]
     if open_items:
         parts.append("открытые задачи/обещания:\n" + "\n".join(f"  - {_render_promise(item)}" for item in open_items))
-    if not parts:
-        return ""
     return "[Текущее состояние]\n" + "\n".join(parts)
 
 

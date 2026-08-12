@@ -19,13 +19,13 @@ import httpx
 from efi.db.core import Database
 from efi.db.models import MIGRATIONS
 from efi.llm.schemas import DiaryEntry, Message, Role, Session
-from efi.memory.consolidation import _render_conversation
 from efi.memory.social_memory import (
     TAG_WEB_LOOKUP,
     SocialInteraction,
     SocialInteractionKind,
     SocialInteractionStore,
 )
+from efi.memory.transcript import render_transcript
 from efi.notifications.schemas import Notification, NotificationType
 from efi.tools.base import ToolContext
 from efi.tools.web_tools.web_search import WebSearchTool
@@ -191,13 +191,17 @@ def test_overflowing_conversation_keeps_the_end_not_the_beginning() -> None:
     session = Session(
         messages=[Message(role=Role.USER, content=f"реплика номер {index}") for index in range(200)]
     )
-    rendered = _render_conversation(session, char_limit=200)
+    rendered = render_transcript(session, self_name="Эфи", char_limit=200)
 
     assert "реплика номер 199" in rendered
     assert "реплика номер 0\n" not in rendered
-    assert rendered.startswith("[...начало разговора опущено...]")
+    assert "[...начало разговора опущено...]" in rendered
 
 
 def test_short_conversation_is_not_marked_as_truncated() -> None:
     session = Session(messages=[Message(role=Role.USER, content="короткий разговор")])
-    assert _render_conversation(session, char_limit=10_000) == "user: короткий разговор"
+
+    rendered = render_transcript(session, self_name="Эфи", char_limit=10_000)
+
+    assert "[...начало разговора опущено...]" not in rendered
+    assert rendered.endswith("собеседник: короткий разговор")

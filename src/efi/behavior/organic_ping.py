@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 
 from efi.behavior.affinity import AffinityTracker
+from efi.behavior.initiative import InitiativeGate
 from efi.behavior.life_engine import InformedThought
 from efi.behavior.quiet_hours import is_quiet_now
 from efi.config.schema import QuietHoursSettings
@@ -80,12 +81,16 @@ class OrganicPingGenerator:
         importance_threshold: float = _DEFAULT_IMPORTANCE_THRESHOLD,
         quiet_hours: QuietHoursSettings | None = None,
         timezone: str = "",
+        initiative: InitiativeGate | None = None,
     ) -> None:
         self._manager = manager
         self._affinity = affinity
         self._importance_threshold = importance_threshold
         self._quiet_hours = quiet_hours
         self._timezone = timezone
+        #: Право заговорить первой — общее на все инициативные службы, см.
+        #: efi/behavior/initiative.py.
+        self._initiative = initiative
         self._pending_by_chat: dict[int, int] = {}  # chat_id -> seed_id
 
     async def notify(self, thought: InformedThought) -> None:
@@ -109,6 +114,17 @@ class OrganicPingGenerator:
             logger.debug(
                 "organic_ping: seed #%s (%r) below importance threshold (%.2f < %.2f), staying in diary only",
                 thought.seed_id, thought.topic, thought.weight, self._importance_threshold,
+            )
+            return
+
+        if (
+            self._initiative is not None
+            and thought.source_chat_id is not None
+            and not await self._initiative.may_initiate(thought.source_chat_id)
+        ):
+            logger.info(
+                "organic_ping: в chat_id=%s висит неотвеченное сообщение — находка подождёт",
+                thought.source_chat_id,
             )
             return
 

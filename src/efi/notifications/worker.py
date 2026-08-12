@@ -95,10 +95,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from datetime import datetime
 from typing import Protocol
 
+from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
+from efi.behavior.initiative import InitiativeGate
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
@@ -150,6 +153,14 @@ _PROACTIVE_NOTIFICATION_TYPES = frozenset(
 #: #public_comment (см. Worker._record_social_interaction).
 _PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
 
+#: Уведомления, на которые распространяется правило «одно неотвеченное
+#: сообщение» (см. efi/behavior/initiative.py). FOLLOW_UP сюда НЕ входит:
+#: напоминание — это прямая просьба человека, а не её инициатива, и молчание
+#: в ответ на прошлый пинг эту просьбу не отменяет.
+_INITIATIVE_NOTIFICATION_TYPES = frozenset(
+    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING}
+)
+
 
 class HistoryRepository(Protocol):
     """Абстракция истории диалога. Конкретная реализация — efi.db.history_repository.SqliteHistoryRepository."""
@@ -165,15 +176,17 @@ class SystemPromptBuilder(Protocol):
     async def build(self, notification: Notification, history: Session) -> str: ...
 
 
-class PromiseTracker(Protocol):
+class WorkingMemoryPort(Protocol):
     """
-    Что Worker'у нужно от рабочей памяти, чтобы закрыть выполненное обещание.
-    Реализация — efi.memory.working_memory.WorkingMemory (метод у неё уже
-    есть; протокол объявлен здесь, чтобы Worker не зависел от всей
-    подсистемы памяти ради одного вызова).
+    Что Worker'у нужно от рабочей памяти: закрыть выполненное обещание и
+    списать энергию за проведённый разговор. Реализация —
+    efi.memory.working_memory.WorkingMemory; протокол объявлен здесь, чтобы
+    Worker не зависел от всей подсистемы памяти ради двух вызовов.
     """
 
     async def find_and_mark_done(self, text_query: str) -> WorkingMemoryItem | None: ...
+
+    async def spend_energy(self, *, turns: int = 1, now: datetime | None = None) -> object: ...
 
 
 class TelegramNotifier(Protocol):
@@ -220,7 +233,9 @@ class Worker:
         lifecycle: ConversationLifecycle | None = None,
         social_memory: SocialInteractionStore | None = None,
         orchestrator: ChatOrchestrator | None = None,
-        promises: PromiseTracker | None = None,
+        working_memory: WorkingMemoryPort | None = None,
+        clarifications: PendingClarifications | None = None,
+        initiative: InitiativeGate | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -237,7 +252,15 @@ class Worker:
         self._lifecycle = lifecycle
         self._social_memory = social_memory
         self._orchestrator = orchestrator
-        self._promises = promises
+        self._working_memory = working_memory
+        #: Тот же реестр, что читает сборщик промпта (efi/prompts/builder.py).
+        #: Воркер только закрывает вопрос ответом; задаёт его — промпт.
+        self._clarifications = clarifications
+        #: Право заговорить первой (efi/behavior/initiative.py). Воркер —
+        #: единственное место, которое ЗНАЕТ, что сообщение реально ушло, и
+        #: что собеседник реально ответил; сами инициативные службы этого не
+        #: видят.
+        self._initiative = initiative
 
     async def run(self) -> None:
         """
@@ -331,6 +354,8 @@ class Worker:
             marked_as_read = True
 
         await self._apply_busy_delay(notification, decision.delay_seconds)
+        self._close_clarification_if_answered(notification)
+        await self._clear_initiative_on_reply(notification)
 
         history = (
             await self._history.get_recent(notification.chat_id, limit=self._history_limit)
@@ -431,6 +456,83 @@ class Worker:
 
         await self._close_delivered_promise(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
+        await self._spend_energy(tool_context)
+        await self._record_initiative(notification, tool_context)
+
+    async def _spend_energy(self, tool_context: ToolContext) -> None:
+        """
+        Разговор стоит сил.
+
+        Раньше энергия менялась ровно одним способом — если модель сама
+        решала вызвать `update_self_state`, чего она не делала практически
+        никогда. Итог: `energy` месяцами стояла на дефолтных 0.7, а
+        BusyEngine, для которого она и существует, работал с константой.
+        Теперь усталость копится оттого, что Эфи РАЗГОВАРИВАЛА, а не оттого,
+        что кто-то про неё вспомнил.
+
+        Списывается только за ход, на котором что-то реально ушло
+        собеседнику: попытка, оборвавшаяся на таймауте провайдера, — это
+        усталость железа, а не её. Сбой записи не должен ронять уже
+        доставленный ответ, поэтому исключение здесь только логируется.
+        """
+        if self._working_memory is None or not tool_context.extra.get("sent_texts"):
+            return
+        try:
+            await self._working_memory.spend_energy()
+        except Exception:
+            logger.warning("worker[%d]: не удалось списать энергию за ход", self._worker_index, exc_info=True)
+
+    async def _record_initiative(self, notification: Notification, tool_context: ToolContext) -> None:
+        """
+        Отмечает, что Эфи написала первой и ответа пока нет.
+
+        Именно здесь, а не в инициативной службе: та знает только, что
+        поставила уведомление в очередь, а дошло ли оно до человека — нет.
+        Считать сообщение написанным, когда его никто не получил, значит
+        замолчать по чужому молчанию, которого не было.
+
+        Напоминания по прямой просьбе (`FOLLOW_UP`) под правило не подпадают:
+        человек заказал их сам, и его молчание в ответ на прошлый пинг заказ
+        не отменяет.
+        """
+        if self._initiative is None or notification.chat_id is None:
+            return
+        if notification.type not in _INITIATIVE_NOTIFICATION_TYPES:
+            return
+        if not tool_context.extra.get("sent_texts"):
+            return
+        await self._initiative.record_initiative(notification.chat_id)
+
+    async def _clear_initiative_on_reply(self, notification: Notification) -> None:
+        """Человек ответил — Эфи снова вправе заговорить первой, когда будет с чем."""
+        if self._initiative is None or notification.chat_id is None:
+            return
+        if notification.type is not NotificationType.USER_MESSAGE:
+            return
+        await self._initiative.record_reply(notification.chat_id)
+
+    def _close_clarification_if_answered(self, notification: Notification) -> None:
+        """
+        Закрывает уточняющий вопрос, если собеседник только что на него
+        ответил.
+
+        Здесь, ДО сборки промпта: иначе в промпт этого же хода уехал бы блок
+        «надо уточнить», и Эфи задала бы вопрос второй раз, уже получив ответ.
+
+        Ответ, который не удалось сопоставить ни с одним вариантом, вопрос НЕ
+        закрывает (см. PendingClarifications.resolve_with_answer) — неопознанный
+        ответ ничем не лучше исходной неоднозначности.
+        """
+        if self._clarifications is None or notification.chat_id is None:
+            return
+        if notification.type is not NotificationType.USER_MESSAGE:
+            return
+        resolved = self._clarifications.resolve_with_answer(notification.chat_id, notification.message)
+        if resolved is not None:
+            logger.info(
+                "worker[%d]: уточнение в chat_id=%s закрыто ответом -> %s",
+                self._worker_index, notification.chat_id, resolved.entity_id,
+            )
 
     def _retry_if_proactive(self, notification: Notification, tool_context: ToolContext, *, reason: str) -> None:
         """
@@ -482,7 +584,7 @@ class Worker:
         просроченный пункт попадает в промпт и на дашборд, и Эфи упомянет
         его при следующем же обмене репликами.
         """
-        if notification.type is not NotificationType.FOLLOW_UP or self._promises is None:
+        if notification.type is not NotificationType.FOLLOW_UP or self._working_memory is None:
             return
         promise_text = notification.payload.get("promise_text")
         if not isinstance(promise_text, str) or not promise_text.strip():
@@ -490,7 +592,7 @@ class Worker:
         if not tool_context.extra.get("sent_texts"):
             return
         try:
-            closed = await self._promises.find_and_mark_done(promise_text)
+            closed = await self._working_memory.find_and_mark_done(promise_text)
         except Exception:
             logger.warning(
                 "worker[%d]: не удалось закрыть обещание %r", self._worker_index, promise_text, exc_info=True
@@ -801,4 +903,4 @@ def _finalize_session(history: Session, notification: Notification) -> Session:
     return session
 
 
-__all__ = ["Worker", "HistoryRepository", "PromiseTracker", "SystemPromptBuilder", "TelegramNotifier"]
+__all__ = ["HistoryRepository", "SystemPromptBuilder", "TelegramNotifier", "Worker", "WorkingMemoryPort"]

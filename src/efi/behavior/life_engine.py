@@ -19,7 +19,6 @@ FAST, как и у BackgroundResearcher/DiaryConsolidator); сам цикл жи
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Protocol
@@ -33,6 +32,7 @@ from efi.memory.rag import RAGMemory
 from efi.notifications.schemas import Notification, NotificationType
 from efi.tools.base import ToolContext
 from efi.tools.web_tools.web_search import WebSearchTool
+from efi.utils.loops import run_periodically
 from efi.utils.text import salvage_truncated
 
 logger = logging.getLogger(__name__)
@@ -135,14 +135,9 @@ class BackgroundLifeWorker:
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
-        logger.info("life_engine: started (interval=%.0fs)", self._check_interval_seconds)
-        try:
-            while True:
-                await asyncio.sleep(self._check_interval_seconds)
-                await self._tick()
-        except asyncio.CancelledError:
-            logger.info("life_engine: stopped")
-            raise
+        await run_periodically(
+            self._tick, interval_seconds=self._check_interval_seconds, name="life_engine"
+        )
 
     async def _tick(self) -> None:
         seed = await self._curiosity.pick_top_pending()

@@ -32,6 +32,8 @@ from pyrogram.handlers import RawUpdateHandler
 from pyrogram.raw.types import UpdateChannelUserTyping, UpdateChatUserTyping, UpdateUserTyping
 from pyrogram.utils import get_channel_id
 
+from efi.utils.bounded import BoundedDict
+
 logger = logging.getLogger(__name__)
 
 #: Telegram-клиенты обычно обновляют статус "печатает" каждые ~5-6с, пока
@@ -45,7 +47,9 @@ class TypingTracker:
 
     def __init__(self, *, ttl_seconds: float = _DEFAULT_TYPING_TTL_SECONDS) -> None:
         self._ttl_seconds = ttl_seconds
-        self._last_seen_at: dict[int, float] = {}
+        #: Отметки живут секунды (см. TTL статуса «печатает»), поэтому
+        #: словарь ограничен и по возрасту: держать их дольше бессмысленно.
+        self._last_seen_at: BoundedDict[int, float] = BoundedDict(max_entries=256, ttl=600.0)
 
     def register(self, client: Client) -> None:
         """Подписывается на сырые апдейты клиента. Вызывается один раз при сборке приложения (efi/app.py)."""

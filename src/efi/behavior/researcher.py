@@ -18,7 +18,6 @@ efi.memory.consolidation). Это не нарушает требование "ze
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import random
@@ -35,6 +34,7 @@ from efi.memory.rag import RAGMemory
 from efi.notifications.schemas import Notification, NotificationType
 from efi.tools.base import ToolContext
 from efi.tools.web_tools.web_search import WebSearchTool
+from efi.utils.loops import run_periodically
 from efi.utils.text import salvage_truncated
 
 logger = logging.getLogger(__name__)
@@ -103,18 +103,13 @@ class BackgroundResearcher:
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
-        logger.info(
-            "researcher: started (interval=%.0fs, p=%.2f)",
-            self._check_interval_seconds, self._research_probability,
-        )
-        try:
-            while True:
-                await asyncio.sleep(self._check_interval_seconds)
-                if random.random() <= self._research_probability:
-                    await self._research_once()
-        except asyncio.CancelledError:
-            logger.info("researcher: stopped")
-            raise
+        logger.info("researcher: probability=%.2f", self._research_probability)
+        await run_periodically(self._maybe_research, interval_seconds=self._check_interval_seconds,
+                               name="researcher")
+
+    async def _maybe_research(self) -> None:
+        if random.random() <= self._research_probability:
+            await self._research_once()
 
     async def consume_incubated_thought(self) -> str | None:
         """

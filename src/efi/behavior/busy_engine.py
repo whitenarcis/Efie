@@ -139,7 +139,11 @@ class BusyEngine:
         is_active_conversation = _is_active_conversation(last_message_at, self._settings)
         delay = _calculate_ignore_delay(
             is_researching=self._life_engine.is_researching,
-            energy=memory_snapshot.energy,
+            # Спроецированная энергия, а не поле снимка: поле — это якорь,
+            # последнее зафиксированное значение, и брать его напрямую значило
+            # бы считать, что за ночь Эфи не отдохнула, а за долгий разговор не
+            # устала (см. efi/behavior/energy.py).
+            energy=self._working_memory.describe(memory_snapshot).energy.level,
             affinity=affinity_snapshot,
             is_active_conversation=is_active_conversation,
             settings=self._settings,

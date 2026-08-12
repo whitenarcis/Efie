@@ -42,14 +42,30 @@ Worker._handle.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Collection
 from typing import Any, Protocol
 
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.notifications.schemas import NotificationType
 from efi.telegram.client import UnknownChatError
 from efi.tools.base import Tool, ToolContext
 
 logger = logging.getLogger(__name__)
+
+#: Уведомления, где Эфи пишет первой. Здесь ответ обязан быть одной репликой:
+#: серия бабблов от того, кому ещё не ответили, читается как нетерпение.
+#: FOLLOW_UP входит: напоминание — тоже сообщение без реплики собеседника.
+_SINGLE_BUBBLE_TYPES = frozenset(
+    {
+        NotificationType.SPONTANEOUS_PING,
+        NotificationType.SILENCE_PING,
+        NotificationType.FOLLOW_UP,
+    }
+)
+
+#: Тот же разделитель, что размечает модель (см. efi/humanizer/message_splitting.py).
+_BUBBLE_DELIMITER_RE = re.compile(r"\s*///\s*")
 
 
 class MessageSender(Protocol):
@@ -123,6 +139,8 @@ class SendMessageTool(Tool):
             return "error: text must not be empty"
         if context.chat_id is None:
             return "error: no chat_id in the current context, nowhere to send the message"
+
+        text = _collapse_bubbles_if_proactive(text, context)
 
         if self._anti_repeat is not None and await self._anti_repeat.is_repetitive(context.chat_id, text):
             logger.info("send_message: blocked repetitive candidate for chat_id=%s", context.chat_id)
@@ -198,6 +216,34 @@ class SendMessageTool(Tool):
         """
         raw = context.notification.payload.get("telegram_message_ids") or []
         return [int(item) for item in raw]
+
+
+def _collapse_bubbles_if_proactive(text: str, context: ToolContext) -> str:
+    """
+    Инициативное сообщение — ровно одна реплика, а не серия.
+
+    Промпт этого требовал и раньше, но требование в промпте — пожелание, и в
+    переписке оно выглядело так:
+
+        эй
+        ты там ещё не утонул в своём коде?
+
+    Два баббла подряд от того, кто пишет первым и кому ещё не ответили, —
+    это не «живая манера», а нетерпение: первый только сообщает «сейчас
+    будет сообщение», второй его и несёт. Здесь разрывы просто склеиваются:
+    ничего не теряется, а получается одна фраза.
+
+    На ОТВЕТЫ правило не распространяется — там серия коротких реплик как раз
+    и есть живая речь (см. efi/humanizer/message_splitting.py).
+    """
+    if context.notification.type not in _SINGLE_BUBBLE_TYPES:
+        return text
+    collapsed = _BUBBLE_DELIMITER_RE.sub(" ", text).strip()
+    if collapsed != text:
+        logger.info(
+            "send_message: инициативный ход склеен в одну реплику для chat_id=%s", context.chat_id
+        )
+    return collapsed
 
 
 __all__ = ["MessageSender", "ActivityRecorder", "SendMessageTool"]

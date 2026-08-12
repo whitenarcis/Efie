@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS conversation_state (
     annoyance_score REAL NOT NULL DEFAULT 0.0,
     status          TEXT NOT NULL DEFAULT 'active',   -- active | closed
     closed_reason   TEXT NOT NULL DEFAULT '',
+    turns           INTEGER NOT NULL DEFAULT 0,       -- сколько реплик написал собеседник
     updated_at      TEXT NOT NULL,
     PRIMARY KEY (peer_user_id, chat_id)
 );
@@ -244,6 +245,23 @@ async def _has_column(conn: aiosqlite.Connection, table: str, column: str) -> bo
     return any(row[1] == column for row in rows)
 
 
+async def _migration_013_conversation_turns(conn: aiosqlite.Connection) -> None:
+    """
+    Счётчик реплик собеседника в `conversation_state`.
+
+    Нужен, чтобы отличить «разговор исчерпан» от «разговора ещё не было»:
+    без него любое совпадение с маркером прощания на ПЕРВОМ же сообщении
+    незнакомца закрывало диалог навсегда — человек не получал ни одного
+    ответа (см. GREETING_GRACE_TURNS в efi/behavior/conversation_lifecycle.py).
+
+    Тем, кто уже переписывался, ставится 0, а не «сколько-то»: настоящего
+    числа взять неоткуда, а 0 всего лишь даёт им те же две реплики форы,
+    что и новичкам. Ошибка в безопасную сторону.
+    """
+    if not await _has_column(conn, "conversation_state", "turns"):
+        await conn.execute("ALTER TABLE conversation_state ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -258,6 +276,7 @@ MIGRATIONS = [
     _migration_010_thread_state,
     _migration_011_knowledge,
     _migration_012_memory_domains,
+    _migration_013_conversation_turns,
 ]
 
 __all__ = ["MIGRATIONS"]

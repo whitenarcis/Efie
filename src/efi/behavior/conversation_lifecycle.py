@@ -42,6 +42,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from efi.db.core import Database
+from efi.utils.bounded import BoundedDict
 
 logger = logging.getLogger(__name__)
 
@@ -51,13 +52,44 @@ ANNOYANCE_THRESHOLD = 1.0
 #: Сколько сухих односложных реплик подряд читаются как «мне неинтересно».
 TERSE_STREAK_THRESHOLD = 3
 
+#: Сколько первых реплик человека диалог закрыть НЕ МОГУТ ни при каких
+#: маркерах.
+#:
+#: Правило не про снисходительность, а про смысл слов. «Разговор исчерпан»
+#: — суждение о разговоре, которого на первой реплике ещё нет: попрощаться
+#: можно только с тем, с кем говорил, а сухость первой фразы («ок») — это не
+#: «мне неинтересно», а обычная осторожность с незнакомым. Раньше этого
+#: различия не было, и любое совпадение с маркером на ПЕРВОМ же сообщении
+#: закрывало диалог навсегда — человек не получал ни одного ответа и не мог
+#: понять, почему.
+#:
+#: Единственное исключение — прямая грубость: на неё Эфи вправе не отвечать
+#: и незнакомцу (см. _pick_disengage_reason).
+GREETING_GRACE_TURNS = 2
+
 _TERSE_MAX_LENGTH = 12
 
+#: Прощания. Ищутся ПО ГРАНИЦАМ СЛОВ, а не подстрокой — см. _FAREWELL_RE.
+#:
+#: Поиск подстрокой здесь был не мелкой неточностью, а катастрофой: «пока» —
+#: одно из самых частых сочетаний букв в русском языке, и в него попадали
+#: «покажи», «показалось», «пока не понял», «пока что». «спок» ловил
+#: «успокойся», «бай» — «Байкал» и «байт». Первое же сообщение нового
+#: человека («привет! покажи, что умеешь») читалось как прощание, и Эфи
+#: молча закрывала диалог, не ответив ни разу.
 _FAREWELL_MARKERS = (
-    "пока", "бывай", "до связи", "спокойной ночи", "споки", "спок", "давай, пойду",
+    "пока", "бывай", "до связи", "спокойной ночи", "споки", "спокночи", "давай, пойду",
     "пойду я", "ладно, пошёл", "ладно, пошел", "всё, отбой", "все, отбой", "до завтра",
-    "увидимся", "чао", "бай", "gn", "bye",
+    "увидимся", "чао", "бай", "бай-бай", "гудбай", "bye", "goodbye", "cya",
 )
+
+#: «gn» из списка убрано: две латинские буквы без контекста дают ложные
+#: срабатывания на любом английском слове, а по-русски так почти не пишут.
+#: Отдельные маркеры, которые считаются прощанием ТОЛЬКО в конце сообщения:
+#: «пока» в середине фразы — это почти всегда «пока что», а не «до свидания»
+#: («пока не разобрался», «давай пока так»). В конце же реплики оно
+#: практически всегда прощание.
+_TRAILING_ONLY_FAREWELLS = frozenset({"пока", "бай", "чао", "bye", "cya"})
 
 _TERSE_REPLIES = (
     "ок", "окей", "ага", "угу", "ясно", "понятно", "пон", "ладно", "лан", "ну ок",
@@ -84,6 +116,42 @@ _HOSTILE_MARKERS = (
 _REPEATED_PUNCTUATION_RE = re.compile(r"[?!]{3,}")
 
 
+def _alternation(markers: Iterable[str]) -> str:
+    # Длинные раньше коротких: иначе «бай» перехватил бы «бай-бай».
+    return "|".join(re.escape(marker) for marker in sorted(markers, key=len, reverse=True))
+
+
+def _whole_word_re(markers: Iterable[str]) -> re.Pattern[str]:
+    """
+    Маркеры целыми словами. `\\b` в Python юникодный (класс `\\w` по
+    умолчанию включает кириллицу), поэтому отдельной возни с алфавитами не
+    нужно — нужна ровно та граница, которой раньше не было.
+    """
+    return re.compile(rf"\b(?:{_alternation(markers)})\b")
+
+
+def _word_prefix_re(markers: Iterable[str]) -> re.Pattern[str]:
+    """
+    Маркеры по НАЧАЛУ слова: грубость и требования пишутся в любой форме
+    («тупая»/«тупую», «ответь»/«ответьте», «бесполезн-ая/ый»), и обрезать их
+    по концу слова значило бы ловить только одну форму из десяти. Ложных
+    срабатываний, как у «пока», здесь нет: это не служебные слова, а
+    достаточно длинные и однозначные корни.
+    """
+    return re.compile(rf"\b(?:{_alternation(markers)})")
+
+
+_ALWAYS_FAREWELL_RE = _whole_word_re(set(_FAREWELL_MARKERS) - _TRAILING_ONLY_FAREWELLS)
+
+#: Те же «пока»/«бай»/«чао», но только если ими реплика ЗАКАНЧИВАЕТСЯ.
+#: После маркера допускается что угодно, кроме букв и цифр (`\W*`): «пока!)»,
+#: «пока 👋» и «пока...» — это по-прежнему прощание, а «пока что» — уже нет.
+_TRAILING_FAREWELL_RE = re.compile(rf"\b(?:{_alternation(_TRAILING_ONLY_FAREWELLS)})\W*$")
+
+_HOSTILE_RE = _word_prefix_re(_HOSTILE_MARKERS)
+_DEMANDING_RE = _word_prefix_re(_DEMANDING_MARKERS)
+
+
 class UserTier(StrEnum):
     """Статус собеседника — определяет и глубину доступа, и право на инициативу."""
 
@@ -105,6 +173,11 @@ class ConversationState:
     annoyance_score: float = 0.0
     status: ConversationStatus = ConversationStatus.ACTIVE
     closed_reason: str = ""
+    #: Сколько реплик этот человек уже написал. Нужно, чтобы отличить
+    #: «разговор исчерпан» от «разговора ещё не было»: попрощаться можно
+    #: только с тем, с кем разговаривал, а первое сообщение незнакомца — это
+    #: всегда начало, чем бы оно ни выглядело (см. GREETING_GRACE_TURNS).
+    turns: int = 0
 
 
 @dataclass(slots=True, frozen=True)
@@ -123,11 +196,20 @@ class LifecycleDecision:
 
 
 def is_farewell(text: str) -> bool:
-    """Чистая функция: похоже ли сообщение на прощание."""
+    """
+    Чистая функция: похоже ли сообщение на прощание.
+
+    Однозначные маркеры («до связи», «увидимся») засчитываются где угодно,
+    двусмысленные («пока», «бай», «чао») — только в самом конце реплики.
+    Разница не косметическая: «пока не разобрался, покажи ещё раз» и «ладно,
+    пока» отличаются ровно этим, а по подстроке они были неразличимы.
+    """
     lowered = text.strip().lower()
     if not lowered:
         return False
-    return any(marker in lowered for marker in _FAREWELL_MARKERS)
+    if _ALWAYS_FAREWELL_RE.search(lowered):
+        return True
+    return bool(_TRAILING_FAREWELL_RE.search(lowered))
 
 
 def is_terse(text: str) -> bool:
@@ -146,9 +228,9 @@ def score_annoyance(text: str) -> float:
         return 0.0
 
     score = 0.0
-    if any(marker in lowered for marker in _HOSTILE_MARKERS):
+    if _HOSTILE_RE.search(lowered):
         score += _ANNOYANCE_HOSTILE
-    if any(marker in lowered for marker in _DEMANDING_MARKERS):
+    if _DEMANDING_RE.search(lowered):
         score += _ANNOYANCE_DEMANDING
     if _REPEATED_PUNCTUATION_RE.search(lowered):
         score += _ANNOYANCE_SPAM
@@ -172,8 +254,15 @@ class ConversationLifecycle:
         #: Личка владельца входит сюда всегда: в Telegram id приватного чата
         #: совпадает с user_id собеседника.
         self._proactive_chats = {owner_id, *proactive_chats}
-        self._cache: dict[tuple[int, int], ConversationState] = {}
-        self._terse_streak: dict[tuple[int, int], int] = {}
+        #: Записи на КАЖДУЮ пару (человек, чат). В группе на пять тысяч
+        #: участников, где каждый однажды написал, это пять тысяч записей,
+        #: которые раньше жили до перезапуска процесса. Кэш поверх БД —
+        #: вытеснение безопасно; серия сухих ответов живёт внутри одного
+        #: разговора и дольше суток не нужна.
+        self._cache: BoundedDict[tuple[int, int], ConversationState] = BoundedDict(max_entries=1024)
+        self._terse_streak: BoundedDict[tuple[int, int], int] = BoundedDict(
+            max_entries=1024, ttl=24 * 3600.0
+        )
 
     def classify(self, user_id: int | None) -> UserTier:
         """Владелец или посторонний. `None` (нет отправителя) трактуется как посторонний — безопасный дефолт."""
@@ -219,7 +308,7 @@ class ConversationLifecycle:
             return cached
 
         row = await self._database.fetch_one(
-            "SELECT annoyance_score, status, closed_reason FROM conversation_state "
+            "SELECT annoyance_score, status, closed_reason, turns FROM conversation_state "
             "WHERE peer_user_id = ? AND chat_id = ?",
             (peer_user_id, chat_id),
         )
@@ -230,6 +319,7 @@ class ConversationLifecycle:
                 annoyance_score=row["annoyance_score"],
                 status=ConversationStatus(row["status"]),
                 closed_reason=row["closed_reason"],
+                turns=row["turns"],
             )
             if row is not None
             else ConversationState(peer_user_id=peer_user_id, chat_id=chat_id)
@@ -272,15 +362,17 @@ class ConversationLifecycle:
         else:
             self._terse_streak[key] = 0
 
+        turns = state.turns + 1
         reason = _pick_disengage_reason(
-            text, annoyance=annoyance, terse_streak=self._terse_streak.get(key, 0)
+            text, annoyance=annoyance, terse_streak=self._terse_streak.get(key, 0), turns=turns
         )
-        state = await self._persist(state, annoyance=annoyance, closed_reason=reason)
+        state = await self._persist(state, annoyance=annoyance, closed_reason=reason, turns=turns)
 
         if reason:
             logger.info(
-                "conversation_lifecycle: disengaging from user_id=%s in chat_id=%s (%s, annoyance=%.2f)",
-                peer_user_id, chat_id, reason, annoyance,
+                "conversation_lifecycle: disengaging from user_id=%s in chat_id=%s "
+                "(%s, annoyance=%.2f, реплик от него: %d)",
+                peer_user_id, chat_id, reason, annoyance, turns,
             )
         return LifecycleDecision(
             should_disengage=bool(reason), reason=reason, annoyance_score=annoyance, tier=tier
@@ -294,12 +386,16 @@ class ConversationLifecycle:
             # репликой, но история давления никуда не делась.
             annoyance_score=state.annoyance_score,
             status=ConversationStatus.ACTIVE,
+            # Счётчик реплик тоже сохраняется: человек не становится
+            # незнакомцем заново оттого, что разговор один раз закрывался,
+            # и второй раз давать ему фору «первых двух реплик» не за что.
+            turns=state.turns,
         )
         self._cache[(state.peer_user_id, state.chat_id)] = reopened
         return reopened
 
     async def _persist(
-        self, state: ConversationState, *, annoyance: float, closed_reason: str
+        self, state: ConversationState, *, annoyance: float, closed_reason: str, turns: int
     ) -> ConversationState:
         updated = ConversationState(
             peer_user_id=state.peer_user_id,
@@ -307,17 +403,19 @@ class ConversationLifecycle:
             annoyance_score=annoyance,
             status=ConversationStatus.CLOSED if closed_reason else ConversationStatus.ACTIVE,
             closed_reason=closed_reason,
+            turns=turns,
         )
         self._cache[(state.peer_user_id, state.chat_id)] = updated
         await self._database.execute(
             """
             INSERT INTO conversation_state
-                (peer_user_id, chat_id, annoyance_score, status, closed_reason, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (peer_user_id, chat_id, annoyance_score, status, closed_reason, turns, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (peer_user_id, chat_id) DO UPDATE SET
                 annoyance_score = excluded.annoyance_score,
                 status = excluded.status,
                 closed_reason = excluded.closed_reason,
+                turns = excluded.turns,
                 updated_at = excluded.updated_at
             """,
             (
@@ -326,18 +424,31 @@ class ConversationLifecycle:
                 updated.annoyance_score,
                 updated.status.value,
                 updated.closed_reason,
+                updated.turns,
                 datetime.now(UTC).isoformat(),
             ),
         )
         return updated
 
 
-def _pick_disengage_reason(text: str, *, annoyance: float, terse_streak: int) -> str:
-    """Пустая строка — продолжаем разговор. Непустая — молча выходим, причина уходит в лог."""
-    if is_farewell(text):
-        return "farewell"
+def _pick_disengage_reason(text: str, *, annoyance: float, terse_streak: int, turns: int) -> str:
+    """
+    Пустая строка — продолжаем разговор. Непустая — молча выходим, причина
+    уходит в лог.
+
+    `turns` — сколько реплик собеседник уже написал, считая текущую. Первые
+    GREETING_GRACE_TURNS закрыть диалог не могут: «попрощался» и «ему
+    неинтересно» — это выводы о разговоре, а разговора ещё не было.
+    Накопленная навязчивость под исключение не попадает: до порога за одну
+    реплику она не доходит, а если дошла — это уже не первое впечатление, а
+    целенаправленная грубость.
+    """
     if annoyance >= ANNOYANCE_THRESHOLD:
         return "annoyance threshold reached"
+    if turns <= GREETING_GRACE_TURNS:
+        return ""
+    if is_farewell(text):
+        return "farewell"
     if terse_streak >= TERSE_STREAK_THRESHOLD:
         return "interlocutor is disengaged (terse replies)"
     return ""
@@ -354,6 +465,7 @@ def _clamp(value: float) -> float:
 
 __all__ = [
     "ANNOYANCE_THRESHOLD",
+    "GREETING_GRACE_TURNS",
     "ConversationLifecycle",
     "ConversationState",
     "ConversationStatus",

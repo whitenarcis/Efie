@@ -110,14 +110,19 @@ class DashboardServer:
         открыть: Эфи крутится в Termux на телефоне, а смотрят на неё с
         ноутбука. Без этой строки в логе пользователю пришлось бы отдельно
         выяснять адрес телефона в сети.
+
+        БЕЗ токена в адресе, хотя с ним было бы удобнее кликать прямо из
+        терминала. Эта строка уходит в лог, а логи люди вставляют в issue,
+        когда просят помощи, — и вместе с логом уезжал бы ключ от собственной
+        переписки, дневника и профилей людей. Токен спрашивает сама страница:
+        форма для этого уже есть, а куки живут неделю.
         """
         if self._settings.is_local_only:
             return None
         address = _primary_lan_address()
         if address is None:
             return None
-        suffix = f"?token={self._settings.token.get_secret_value()}" if self._settings.token is not None else ""
-        return f"http://{address}:{self._http.port}/{suffix}"
+        return f"http://{address}:{self._http.port}/"
 
     async def start(self) -> None:
         await self._http.start()
@@ -126,6 +131,8 @@ class DashboardServer:
         lan_url = self.lan_url
         if lan_url is not None:
             logger.info("dashboard: с других устройств этой сети — %s", lan_url)
+            if self._settings.token is not None:
+                logger.info("dashboard: токен спросит сама страница (он в dashboard.token)")
         if self._settings.token is None and not self._settings.is_local_only:
             logger.warning(
                 "dashboard: токен не задан — дашборд открыт любому устройству вашей сети. "
