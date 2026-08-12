@@ -29,8 +29,10 @@ from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
+from efi.behavior.initiative import InitiativeGate
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
+from efi.behavior.ping_reason import PingReasonBuilder
 from efi.behavior.reminders import ReminderScheduler, ReminderStore
 from efi.behavior.researcher import BackgroundResearcher
 from efi.behavior.scheduler import ScheduledJob, Scheduler, seconds_until_next
@@ -262,10 +264,19 @@ class EfiApp:
 
         # -- humanizer / проактивность --------------------------------------
         self._anti_repeat = AntiRepeatTracker(settings.humanizer)
+        # Право заговорить первой — ОДНО на все инициативные службы. Три
+        # службы с тремя личными счётчиками дали бы ровно то, что было в
+        # переписке: три «эй» подряд вместо одного (см. initiative.py).
+        self._initiative = InitiativeGate(self._facts)
         self._notification_manager = NotificationManager(worker_count=worker_count)
         self._silence_monitor = SilenceMonitor(
-            self._notification_manager, quiet_hours=settings.quiet_hours, timezone=settings.timezone
+            self._notification_manager,
+            quiet_hours=settings.quiet_hours,
+            timezone=settings.timezone,
+            initiative=self._initiative,
         )
+        # reasons проставляется ниже: PingReasonBuilder зависит от
+        # BackgroundResearcher, который конструируется после монитора.
         # Отложенные напоминания («напиши мне через 10 минут»). Персистентные:
         # обещание со сроком обязано пережить перезапуск, иначе оно тихо
         # исчезает ровно тогда, когда человек на него рассчитывает.
@@ -275,12 +286,22 @@ class EfiApp:
         self._researcher = BackgroundResearcher(
             templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
         )
+        # С чем именно она приходит, когда пишет первой. Без повода служба
+        # молчит — раньше на его месте стояло «просто напомнить о себе», и из
+        # этого получалось единственно возможное «эй, ты там живой?».
+        self._ping_reasons = PingReasonBuilder(
+            knowledge=self._knowledge,
+            people=self._people,
+            incubated_thought_provider=self._researcher.consume_incubated_thought,
+        )
+        self._silence_monitor.set_reasons(self._ping_reasons)
         self._spontaneous_ping = SpontaneousPingScheduler(
             self._notification_manager,
             self._active_chat_candidates,
-            incubated_thought_provider=self._researcher.consume_incubated_thought,
+            reasons=self._ping_reasons,
             quiet_hours=settings.quiet_hours,
             timezone=settings.timezone,
+            initiative=self._initiative,
         )
         self._organic_ping = OrganicPingGenerator(
             self._notification_manager,
@@ -288,6 +309,7 @@ class EfiApp:
             importance_threshold=settings.life_engine.ping_importance_threshold,
             quiet_hours=settings.quiet_hours,
             timezone=settings.timezone,
+            initiative=self._initiative,
         )
         self._life_engine = BackgroundLifeWorker(
             self._curiosity,
@@ -497,6 +519,7 @@ class EfiApp:
                 orchestrator=self._orchestrator,
                 working_memory=self._working_memory,
                 clarifications=self._pending_clarifications,
+                initiative=self._initiative,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 

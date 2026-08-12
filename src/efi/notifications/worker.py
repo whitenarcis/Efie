@@ -101,6 +101,7 @@ from typing import Protocol
 from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
+from efi.behavior.initiative import InitiativeGate
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
@@ -151,6 +152,14 @@ _PROACTIVE_NOTIFICATION_TYPES = frozenset(
 #: Публичные выступления — их результат идёт в социальную память как
 #: #public_comment (см. Worker._record_social_interaction).
 _PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
+
+#: Уведомления, на которые распространяется правило «одно неотвеченное
+#: сообщение» (см. efi/behavior/initiative.py). FOLLOW_UP сюда НЕ входит:
+#: напоминание — это прямая просьба человека, а не её инициатива, и молчание
+#: в ответ на прошлый пинг эту просьбу не отменяет.
+_INITIATIVE_NOTIFICATION_TYPES = frozenset(
+    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING}
+)
 
 
 class HistoryRepository(Protocol):
@@ -226,6 +235,7 @@ class Worker:
         orchestrator: ChatOrchestrator | None = None,
         working_memory: WorkingMemoryPort | None = None,
         clarifications: PendingClarifications | None = None,
+        initiative: InitiativeGate | None = None,
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -246,6 +256,11 @@ class Worker:
         #: Тот же реестр, что читает сборщик промпта (efi/prompts/builder.py).
         #: Воркер только закрывает вопрос ответом; задаёт его — промпт.
         self._clarifications = clarifications
+        #: Право заговорить первой (efi/behavior/initiative.py). Воркер —
+        #: единственное место, которое ЗНАЕТ, что сообщение реально ушло, и
+        #: что собеседник реально ответил; сами инициативные службы этого не
+        #: видят.
+        self._initiative = initiative
 
     async def run(self) -> None:
         """
@@ -340,6 +355,7 @@ class Worker:
 
         await self._apply_busy_delay(notification, decision.delay_seconds)
         self._close_clarification_if_answered(notification)
+        await self._clear_initiative_on_reply(notification)
 
         history = (
             await self._history.get_recent(notification.chat_id, limit=self._history_limit)
@@ -441,6 +457,7 @@ class Worker:
         await self._close_delivered_promise(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
         await self._spend_energy(tool_context)
+        await self._record_initiative(notification, tool_context)
 
     async def _spend_energy(self, tool_context: ToolContext) -> None:
         """
@@ -464,6 +481,35 @@ class Worker:
             await self._working_memory.spend_energy()
         except Exception:
             logger.warning("worker[%d]: не удалось списать энергию за ход", self._worker_index, exc_info=True)
+
+    async def _record_initiative(self, notification: Notification, tool_context: ToolContext) -> None:
+        """
+        Отмечает, что Эфи написала первой и ответа пока нет.
+
+        Именно здесь, а не в инициативной службе: та знает только, что
+        поставила уведомление в очередь, а дошло ли оно до человека — нет.
+        Считать сообщение написанным, когда его никто не получил, значит
+        замолчать по чужому молчанию, которого не было.
+
+        Напоминания по прямой просьбе (`FOLLOW_UP`) под правило не подпадают:
+        человек заказал их сам, и его молчание в ответ на прошлый пинг заказ
+        не отменяет.
+        """
+        if self._initiative is None or notification.chat_id is None:
+            return
+        if notification.type not in _INITIATIVE_NOTIFICATION_TYPES:
+            return
+        if not tool_context.extra.get("sent_texts"):
+            return
+        await self._initiative.record_initiative(notification.chat_id)
+
+    async def _clear_initiative_on_reply(self, notification: Notification) -> None:
+        """Человек ответил — Эфи снова вправе заговорить первой, когда будет с чем."""
+        if self._initiative is None or notification.chat_id is None:
+            return
+        if notification.type is not NotificationType.USER_MESSAGE:
+            return
+        await self._initiative.record_reply(notification.chat_id)
 
     def _close_clarification_if_answered(self, notification: Notification) -> None:
         """

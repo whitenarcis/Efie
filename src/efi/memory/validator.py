@@ -50,6 +50,10 @@ RESERVED_ATTRIBUTES = frozenset(
         "incubated_thought",
         "last_pulse_at",
         "novelized_until",
+        # Отметка «написала первой и ответа нет» (efi/behavior/initiative.py).
+        # Уговорив модель «забыть» её, правило «одно неотвеченное сообщение»
+        # можно было бы обойти прямо из разговора.
+        "unanswered_initiative_at",
     }
 )
 

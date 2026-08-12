@@ -16,6 +16,7 @@ from pathlib import Path
 from efi.behavior.affinity import AffinityTracker
 from efi.behavior.life_engine import InformedThought
 from efi.behavior.organic_ping import OrganicPingGenerator
+from efi.behavior.ping_reason import PingReasonBuilder
 from efi.behavior.silence_monitor import SilenceMonitor
 from efi.behavior.spontaneous_ping import SpontaneousPingScheduler
 from efi.config.schema import QuietHoursSettings
@@ -49,12 +50,26 @@ async def test_spontaneous_ping_skips_candidates_during_quiet_hours() -> None:
 
 
 async def test_spontaneous_ping_fires_outside_quiet_hours() -> None:
+    """
+    Вне тихих часов пинг проходит — но только когда есть с чем прийти:
+    инициатива без повода больше не отправляется вовсе
+    (см. tests/test_initiative.py).
+    """
     manager = NotificationManager(worker_count=1)
 
     async def candidates() -> list[int]:
         return [1]
 
-    scheduler = SpontaneousPingScheduler(manager, candidates, ping_probability=1.0, quiet_hours=_quiet_hours_never())
+    async def thought() -> str | None:
+        return "плёночные сканеры до сих пор быстрее половины современных"
+
+    scheduler = SpontaneousPingScheduler(
+        manager,
+        candidates,
+        ping_probability=1.0,
+        quiet_hours=_quiet_hours_never(),
+        reasons=PingReasonBuilder(incubated_thought_provider=thought),
+    )
     await scheduler._maybe_ping_candidates()
     assert manager.qsize() == 1
 
