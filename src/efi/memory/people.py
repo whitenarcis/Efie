@@ -75,6 +75,11 @@ class PersonProfile:
     last_chat_id: int | None = None
     last_chat_title: str | None = None
     impression: str = ""
+    #: Когда этот человек последний раз что-то написал. Нужно, чтобы Эфи
+    #: могла честно ответить на «ты сегодня с кем-то переписывалась?» — без
+    #: даты список знакомых не отличается от списка «с кем говорила сегодня»
+    #: (см. _build_other_contacts_block в efi/prompts/builder.py).
+    last_seen_at: datetime | None = None
 
     @property
     def is_familiar(self) -> bool:
@@ -102,7 +107,7 @@ class PeopleStore:
         row = await self._database.fetch_one(
             """
             SELECT user_id, display_name, affinity, respect_level, message_count,
-                   last_chat_id, last_chat_title, impression
+                   last_chat_id, last_chat_title, impression, last_seen_at
             FROM people WHERE user_id = ?
             """,
             (user_id,),
@@ -118,6 +123,7 @@ class PeopleStore:
             last_chat_id=row["last_chat_id"],
             last_chat_title=row["last_chat_title"],
             impression=row["impression"],
+            last_seen_at=_parse_moment(row["last_seen_at"]),
         )
 
     async def record_message(
@@ -189,7 +195,7 @@ class PeopleStore:
         rows = await self._database.fetch_all(
             """
             SELECT user_id, display_name, affinity, respect_level, message_count,
-                   last_chat_id, last_chat_title, impression
+                   last_chat_id, last_chat_title, impression, last_seen_at
             FROM people ORDER BY last_seen_at DESC LIMIT ?
             """,
             (limit,),
@@ -204,6 +210,7 @@ class PeopleStore:
                 last_chat_id=row["last_chat_id"],
                 last_chat_title=row["last_chat_title"],
                 impression=row["impression"],
+                last_seen_at=_parse_moment(row["last_seen_at"]),
             )
             for row in rows
         ]
@@ -272,6 +279,20 @@ class PeopleStore:
 
 def _clamp(value: float) -> float:
     return max(0.0, min(value, 1.0))
+
+
+def _parse_moment(raw: object) -> datetime | None:
+    """
+    ISO-строка из БД в aware-datetime. Нечитаемое значение — это None, а не
+    исключение: профиль человека важнее, чем точная дата последней встречи.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _now() -> str:

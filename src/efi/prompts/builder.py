@@ -51,7 +51,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 from efi.behavior.affinity import (
     HIGH_RESPECT_THRESHOLD,
@@ -92,6 +93,17 @@ _STRESS_MARKERS = (
 )
 
 _PERSONALITY_TEMPLATE_NAME = "personality"
+
+#: Сколько недавних собеседников поднимается из БД и сколько попадает в промпт.
+#: Поднимаем с запасом, потому что часть отсеется по давности и по тому, что
+#: это сам спрашивающий; показываем немного — это ответ на вопрос «с кем ты
+#: общалась», а не выгрузка адресной книги.
+_OTHER_CONTACTS_LOOKUP = 12
+_OTHER_CONTACTS_SHOWN = 5
+
+#: За какой срок общение ещё считается «недавним». Сутки: на вопрос «ты
+#: сегодня с кем-то переписывалась?» ответ про позавчера — уже не ответ.
+_OTHER_CONTACTS_WINDOW = timedelta(days=1)
 
 _MOOD_DESCRIPTIONS: dict[str, str] = {
     "skeptical_focused": (
@@ -190,6 +202,25 @@ class _SafeFormatDict(dict[str, str]):
         return "{" + key + "}"
 
 
+@dataclass(slots=True, frozen=True)
+class RecentContact:
+    """Один недавний собеседник — то, что Эфи должна помнить про свой день."""
+
+    name: str
+    where: str
+    when: datetime | None
+    impression: str
+
+    def render(self) -> str:
+        parts = [self.name]
+        if self.where:
+            parts.append(f"в «{self.where}»")
+        if self.when is not None:
+            parts.append(_format_local(self.when))
+        line = ", ".join(parts)
+        return f"{line} — {self.impression}" if self.impression else line
+
+
 class EfiSystemPromptBuilder:
     """
     Собирает системный промпт из блоков, в порядке от самого стабильного
@@ -253,6 +284,7 @@ class EfiSystemPromptBuilder:
         )
         affinity_task = self._resolve_affinity_snapshot(notification)
         person_task = self._resolve_person_profile(notification)
+        contacts_task = self._resolve_other_contacts(notification, now=local_now(self._settings.timezone))
 
         # Вложенный gather, а не один на семь задач: у asyncio.gather
         # перегрузки с точными типами заканчиваются на шести аргументах, и
@@ -265,7 +297,7 @@ class EfiSystemPromptBuilder:
             relevant_beliefs,
             affinity_snapshot,
             person_profile,
-        ), known_facts = await asyncio.gather(
+        ), known_facts, other_contacts = await asyncio.gather(
             asyncio.gather(
                 personality_task,
                 rag_task,
@@ -275,6 +307,7 @@ class EfiSystemPromptBuilder:
                 person_task,
             ),
             knowledge_task,
+            contacts_task,
         )
 
         now = local_now(self._settings.timezone)
@@ -289,6 +322,7 @@ class EfiSystemPromptBuilder:
             _build_screen_state_block(notification),
             _BUBBLE_RHYTHM_BLOCK,
             _build_person_block(person_profile),
+            _build_other_contacts_block(other_contacts),
             _build_public_comment_block(notification),
             _build_stranger_block(
                 self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
@@ -351,6 +385,47 @@ class EfiSystemPromptBuilder:
             # чтения не должен срывать генерацию (тот же принцип, что у RAG).
             logger.warning("prompts: не удалось прочитать проверенные факты", exc_info=True)
             return []
+
+    async def _resolve_other_contacts(
+        self, notification: Notification, *, now: datetime
+    ) -> list[RecentContact]:
+        """
+        С кем Эфи недавно общалась ПОМИМО этого чата.
+
+        ТОЛЬКО ДЛЯ ВЛАДЕЛЬЦА. Это не перестраховка: список «с кем ещё
+        переписывается хозяин аккаунта» — приватные данные, и рассказывать о
+        нём постороннему нельзя ни при какой формулировке вопроса. Владелец
+        же спрашивает про собственный аккаунт, и врать ему не о чем.
+
+        Сам отправитель из списка исключается: он и так знает, что пишет ей
+        прямо сейчас, а в перечне «других» выглядел бы странно.
+        """
+        if self._people is None:
+            return []
+        sender_id = notification.payload.get("sender_id")
+        if sender_id != self._settings.telegram.owner_id:
+            return []
+
+        try:
+            profiles = await self._people.recent(limit=_OTHER_CONTACTS_LOOKUP)
+        except Exception:
+            logger.warning("prompts: не удалось прочитать список недавних собеседников", exc_info=True)
+            return []
+
+        cutoff = now - _OTHER_CONTACTS_WINDOW
+        contacts = [
+            RecentContact(
+                name=profile.display_name or "кто-то без имени",
+                where=profile.last_chat_title or "",
+                when=profile.last_seen_at,
+                impression=profile.impression,
+            )
+            for profile in profiles
+            if profile.user_id != self._settings.telegram.owner_id
+            and profile.last_seen_at is not None
+            and profile.last_seen_at >= cutoff
+        ]
+        return contacts[:_OTHER_CONTACTS_SHOWN]
 
     def _is_secondary_user(self, notification: Notification) -> bool:
         """Посторонний ли пишет — по тому же критерию, что и efi.behavior.conversation_lifecycle."""
@@ -535,6 +610,36 @@ def _build_person_block(profile: PersonProfile | None) -> str:
     if profile.last_chat_title:
         parts.append(f"В прошлый раз пересекались в «{sanitize_text(profile.last_chat_title)}».")
     return " ".join(parts)
+
+
+def _build_other_contacts_block(contacts: list[RecentContact]) -> str:
+    """
+    «С кем ты сегодня общалась» — то, чего Эфи про себя не знала.
+
+    Регрессия из жизни: она переписывалась с посторонним в ЛС, владелец
+    спросил, общалась ли она с кем-то, и получил «нет, только с тобой». Это
+    не было враньём в обычном смысле. В системном промпте есть история ЭТОГО
+    чата и найденные по смыслу воспоминания — и ничего о том, что происходило
+    в других чатах. На вопрос «ты с кем-то переписывалась?» у неё буквально не
+    было данных, и она отвечала единственным, что видела.
+
+    Семантический поиск по дневнику тут не спасал и не мог: записи о тех
+    разговорах есть, но они про их СОДЕРЖАНИЕ («обсудили сканеры»), а не про
+    факт «я с кем-то говорила», и на такой вопрос по вектору не находятся.
+
+    Блок собирается ТОЛЬКО для владельца — см. _resolve_other_contacts.
+    """
+    if not contacts:
+        return ""
+    lines = [contact.render() for contact in contacts]
+    return (
+        "[С кем ты ещё общалась]\n"
+        + "\n".join(f"  - {line}" for line in lines)
+        + "\nЭто правда, и скрывать её не надо: спросят — расскажи как есть. "
+        "Отвечать «я ни с кем не переписывалась», когда переписывалась, — прямое враньё, "
+        "а не тактичность. Подробности чужих разговоров пересказывать не обязана, но сам "
+        "факт общения отрицать нельзя."
+    )
 
 
 def _build_public_comment_block(notification: Notification) -> str:
