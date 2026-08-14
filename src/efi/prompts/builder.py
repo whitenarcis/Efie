@@ -72,6 +72,7 @@ from efi.memory.working_memory import SelfState, WorkingMemory, WorkingMemoryIte
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
+from efi.telegram.chat_scope import ChatKind, resolve_chat_kind
 from efi.utils.clock import local_now
 
 logger = logging.getLogger(__name__)
@@ -181,8 +182,6 @@ _TIME_TACT_NOTE = (
     "Про время суток заговаривай только если это к месту, и не повторяй одну и ту же мысль про него "
     "в каждом сообщении — сказала один раз и дальше просто общайся."
 )
-
-_GROUP_CHAT_TYPES = ("GROUP", "SUPERGROUP")
 
 #: Типы уведомлений, где Эфи пишет ПЕРВОЙ, без реплики собеседника —
 #: для них включается жёсткое ограничение длины (см. _build_proactive_brevity_block).
@@ -325,7 +324,10 @@ class EfiSystemPromptBuilder:
             _build_other_contacts_block(other_contacts),
             _build_public_comment_block(notification),
             _build_stranger_block(
-                self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
+                self._is_secondary_user(notification),
+                resolve_chat_kind(
+                    notification.payload.get("chat_type"), notification.chat_id
+                ).is_one_on_one,
             ),
             _build_proactive_brevity_block(notification),
             _build_clarification_block(self._peek_clarification(notification)),
@@ -510,25 +512,48 @@ def _time_of_day_label(now: datetime | None = None) -> str:
 
 def _build_chat_context_block(notification: Notification) -> str:
     """
-    Сообщает модели, в каком именно чате она сейчас отвечает — группа (с кем
-    угодно из участников) или личная переписка один на один. Без этого блока
-    модель не отличает "пишет только владелец" от "пишут разные люди в одном
-    чате" — а имя отправителя перед каждой репликой (formatting.py) без
-    этого контекста легко потерять из виду.
-    """
-    chat_type = notification.payload.get("chat_type")
-    chat_title = notification.payload.get("chat_title")
+    Сообщает модели, в каком именно чате она сейчас отвечает — группа, канал
+    или личная переписка один на один. Без этого блока модель не отличает
+    "пишет только владелец" от "пишут разные люди в одном чате" — а имя
+    отправителя перед каждой репликой (formatting.py) без этого контекста
+    легко потерять из виду.
 
-    if chat_type in _GROUP_CHAT_TYPES:
-        title_part = f' "{chat_title}"' if chat_title else ""
+    Род чата берётся не только из `payload["chat_type"]`, но и из самого
+    chat_id (см. efi/telegram/chat_scope.py). Разница принципиальная:
+    `chat_type` кладут телеграм-обработчики из входящего сообщения, а у
+    проактивных событий (пинг по таймеру) входящего сообщения нет — раньше
+    блок для них просто не собирался, и Эфи писала первой в группу теми же
+    словами, какими пишет человеку в личку, потому что из промпта было
+    не узнать, что это не личка.
+    """
+    if notification.chat_id is None and not notification.payload.get("chat_type"):
+        # Событие вообще без чата (ночная задача) — рассказывать про «этот
+        # чат» нечего, и выдумывать ему род тем более.
+        return ""
+
+    chat_title = notification.payload.get("chat_title")
+    kind = resolve_chat_kind(notification.payload.get("chat_type"), notification.chat_id)
+    title_part = f' "{chat_title}"' if chat_title else ""
+
+    if kind is ChatKind.GROUP:
         return (
             f"[О чате] Это групповой чат{title_part} — здесь пишут разные люди, "
             "не только твой создатель. Перед каждой репликой указано имя того, кто её написал — "
             "обращай на это внимание и не путай собеседников между собой."
         )
-    if chat_type == "PRIVATE":
-        return "[О чате] Это личная переписка один на один."
-    return ""
+    if kind is ChatKind.CHANNEL:
+        return (
+            f"[О чате] Это канал{title_part}, а не переписка: то, что ты здесь напишешь, "
+            "увидят все подписчики сразу. Никакого «привет, как дела» и ничего личного — "
+            "обращаться тут не к кому."
+        )
+    if kind is ChatKind.UNKNOWN:
+        return (
+            f"[О чате] Это общий чат{title_part} — группа или канал, а НЕ личная переписка. "
+            "Здесь тебя видит не один человек, а все участники; личных обращений «как ты там» "
+            "быть не должно."
+        )
+    return "[О чате] Это личная переписка один на один."
 
 
 def _build_screen_state_block(notification: Notification) -> str:

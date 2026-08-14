@@ -110,6 +110,13 @@ class TelegramEventHandlers:
     `handle_reply(chat_id: int)`), которым отмечается, что собеседник
     ответил в чате, где недавно был органический пинг.
 
+    `chat_recorder` — аналогичный необязательный дак-тайпинг (обычно
+    efi.db.chat_directory.ChatDirectory; асинхронный метод `remember(chat_id,
+    *, chat_type, title)`), которым запоминается, ЧТО за чат стоит за
+    chat_id. Входящее сообщение — единственное место, где это вообще видно;
+    проактивным событиям (пинг по таймеру) взять тип чата больше неоткуда,
+    и без справочника Эфи писала в группу так же, как в личку.
+
     `people_recorder` — аналогичный необязательный дак-тайпинг (обычно
     efi.memory.people.PeopleStore; асинхронный метод `record_message(user_id,
     text, *, display_name, chat_id, chat_title)`), которым ведётся учёт
@@ -141,6 +148,7 @@ class TelegramEventHandlers:
         curiosity_recorder: Any | None = None,
         organic_ping_recorder: Any | None = None,
         people_recorder: Any | None = None,
+        chat_recorder: Any | None = None,
         stt: GroqSTT | None = None,
         orchestrator: ChatOrchestrator | None = None,
     ) -> None:
@@ -153,6 +161,7 @@ class TelegramEventHandlers:
         self._curiosity_recorder = curiosity_recorder
         self._organic_ping_recorder = organic_ping_recorder
         self._people_recorder = people_recorder
+        self._chat_recorder = chat_recorder
         self._stt = stt
         self._buffer: InboundMessageBuffer[_PendingMessage] = InboundMessageBuffer(
             self._flush_debounced,
@@ -392,6 +401,16 @@ class TelegramEventHandlers:
         """
         if self._activity_recorder is not None:
             self._activity_recorder.record_activity(access_info.chat_id)
+
+        # Что за чат стоит за этим chat_id — запоминается ЗДЕСЬ, потому что
+        # здесь оно последний раз видно: у проактивных событий (пинг по
+        # таймеру) Pyrogram-объекта чата нет вовсе, см. efi/db/chat_directory.py.
+        if self._chat_recorder is not None and message.chat is not None:
+            await self._chat_recorder.remember(
+                access_info.chat_id,
+                chat_type=message.chat.type.name if message.chat.type else None,
+                title=message.chat.title,
+            )
 
         if self._affinity_recorder is not None:
             await self._affinity_recorder.record_message(access_info.chat_id, text)

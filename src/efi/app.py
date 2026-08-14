@@ -43,6 +43,7 @@ from efi.dashboard.logbus import LogBuffer
 from efi.dashboard.metrics import LLMMetricsCollector
 from efi.dashboard.server import DashboardServer
 from efi.dashboard.snapshot import DashboardContext
+from efi.db.chat_directory import ChatDirectory
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
@@ -182,6 +183,10 @@ class EfiApp:
             pending=self._pending_clarifications,
         )
         self._history = SqliteHistoryRepository(self._database)
+        # Справочник чатов: личка это, группа или канал. Заполняется из
+        # входящих сообщений, читается проактивным путём — единственным, у
+        # которого своего Pyrogram-объекта чата нет (см. efi/db/chat_directory.py).
+        self._chat_directory = ChatDirectory(self._database)
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются
         # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
@@ -389,6 +394,7 @@ class EfiApp:
             curiosity_recorder=self._curiosity,
             organic_ping_recorder=self._organic_ping,
             people_recorder=self._people,
+            chat_recorder=self._chat_directory,
             stt=self._stt,
             orchestrator=self._orchestrator,
         )
@@ -474,10 +480,19 @@ class EfiApp:
 
     async def _active_chat_candidates(self) -> list[int]:
         """
-        Список чатов-кандидатов для спонтанного пинга: allowed_chats из
-        конфига, пересечённые с чатами, где реально было хоть одно
+        Список чатов-кандидатов для спонтанного пинга: личные переписки из
+        allowed_chats, пересечённые с чатами, где реально было хоть одно
         сообщение (efi.db.history_repository.SqliteHistoryRepository.
         get_active_chat_ids).
+
+        Группы и каналы отсекаются, даже если владелец перечислил их в
+        allowed_chats: этот список отвечает на вопрос «где Эфи вправе
+        говорить», а не «кому уместно написать первой». Написать первой
+        можно человеку; в общем чате то же самое сообщение — объявление на
+        весь чат, и выглядело оно ровно так: спонтанный пинг ушёл в группу,
+        где у Эфи админка, обычным «как дела» (см. efi/telegram/chat_scope.py
+        и дублирующую проверку в efi.notifications.worker.Worker —
+        кандидатов эта служба отбирает не одна).
 
         Раньше отдавался «сырой» allowed_chats целиком. chat_id, который
         туда попал (например, руками в behavior.toml), но с которым этот
@@ -488,9 +503,21 @@ class EfiApp:
         попытке пинга, без единого шанса на успех. Пересечение с историей —
         дешёвая гарантия, что peer уже засветился хотя бы раз и кэш есть.
         """
-        allowed = set(self._settings.telegram.allowed_chats)
+        # Личка владельца — кандидат всегда, как и в гейте воркера
+        # (ConversationLifecycle._proactive_chats): в Telegram её chat_id
+        # равен owner_id, и требовать от владельца вписать самого себя в
+        # allowed_chats ради того, чтобы Эфи ему писала, незачем.
+        allowed = {self._settings.telegram.owner_id, *self._settings.telegram.allowed_chats}
         active = await self._history.get_active_chat_ids(since=_EPOCH)
-        return [chat_id for chat_id in active if chat_id in allowed]
+        candidates: list[int] = []
+        for chat_id in active:
+            if chat_id not in allowed:
+                continue
+            if not (await self._chat_directory.kind_of(chat_id)).is_one_on_one:
+                logger.debug("app: chat_id=%s пропущен для спонтанного пинга — это не личка", chat_id)
+                continue
+            candidates.append(chat_id)
+        return candidates
 
     async def start(self) -> None:
         """Поднимает все подсистемы: Telegram-клиент, обработчики, воркеры, проактивные сервисы."""
@@ -536,6 +563,7 @@ class EfiApp:
                 working_memory=self._working_memory,
                 clarifications=self._pending_clarifications,
                 initiative=self._initiative,
+                chat_directory=self._chat_directory,
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 

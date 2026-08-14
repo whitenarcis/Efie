@@ -135,6 +135,15 @@ CREATE TABLE IF NOT EXISTS conversation_state (
 );
 """
 
+_CHAT_DIRECTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_directory (
+    chat_id     INTEGER PRIMARY KEY,
+    chat_type   TEXT NOT NULL DEFAULT '',   -- имя pyrogram.enums.ChatType: PRIVATE/GROUP/SUPERGROUP/CHANNEL
+    title       TEXT NOT NULL DEFAULT '',   -- пусто для лички: у неё нет названия
+    updated_at  TEXT NOT NULL
+);
+"""
+
 _THREAD_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_state (
     chat_id        INTEGER NOT NULL,
@@ -262,6 +271,20 @@ async def _migration_013_conversation_turns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE conversation_state ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
 
 
+async def _migration_014_chat_directory(conn: aiosqlite.Connection) -> None:
+    """
+    Справочник чатов (см. efi/db/chat_directory.py): что за чат стоит за
+    chat_id — личка, группа или канал.
+
+    Заполняется по мере того, как в чатах приходят сообщения; для уже
+    накопленной истории таблица останется пустой, и род чата будет
+    выводиться из самого id (efi.telegram.chat_scope.classify_chat_id) —
+    задним числом восстановить тип неоткуда, а на главный вопрос («личка или
+    нет») id отвечает и без справочника.
+    """
+    await conn.executescript(_CHAT_DIRECTORY_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -277,6 +300,7 @@ MIGRATIONS = [
     _migration_011_knowledge,
     _migration_012_memory_domains,
     _migration_013_conversation_turns,
+    _migration_014_chat_directory,
 ]
 
 __all__ = ["MIGRATIONS"]

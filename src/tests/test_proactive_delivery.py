@@ -13,6 +13,13 @@
 
 Правило теперь формулируется через чат: личка владельца и то, что владелец
 сам перечислил в telegram.allowed_chats.
+
+Вторая половина файла — про обратный перекос того же правила. Разрешение
+«писать в этот чат» стало пониматься как «писать сюда первой», и спонтанный
+пинг ушёл в группу из allowed_chats — в общий чат, где у Эфи админка, ушло
+личное «слушай, а я тут подумала», адресованное неизвестно кому. Инициатива
+без просьбы теперь ограничена личкой; напоминание (FOLLOW_UP), о котором
+человек попросил сам, по-прежнему доходит туда, где он попросил.
 """
 
 from __future__ import annotations
@@ -148,13 +155,51 @@ async def test_spontaneous_ping_to_the_owner_is_delivered(tmp_path: Path) -> Non
     assert send_tool.sent == [(_OWNER_ID, "слушай, а я тут подумала")]
 
 
-async def test_ping_to_an_allowed_group_is_delivered(tmp_path: Path) -> None:
-    """Чат, который владелец сам вписал в allowed_chats, — тоже «свой»: инициатива там разрешена."""
+async def test_unprompted_ping_to_an_allowed_group_is_refused(tmp_path: Path) -> None:
+    """
+    Группа в allowed_chats — «свой» чат, но не собеседник. Спонтанный пинг
+    туда — не инициатива в разговоре, а объявление на весь чат: ровно это и
+    случилось в проде, где Эфи написала «как дела» в группу с админкой,
+    считая, что пишет человеку.
+    """
     worker, send_tool, _history = _make_worker(tmp_path)
 
     await worker._handle(
         Notification(
             type=NotificationType.SPONTANEOUS_PING, chat_id=_ALLOWED_GROUP_ID, message="напиши первой", payload={}
+        )
+    )
+
+    assert send_tool.sent == []
+
+
+async def test_silence_ping_to_an_allowed_group_is_refused(tmp_path: Path) -> None:
+    """Пинг по затишью — та же непрошеная инициатива, и в общем чате он так же неуместен."""
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.SILENCE_PING, chat_id=_ALLOWED_GROUP_ID, message="тут тихо", payload={}
+        )
+    )
+
+    assert send_tool.sent == []
+
+
+async def test_follow_up_to_an_allowed_group_is_still_delivered(tmp_path: Path) -> None:
+    """
+    Напоминание — не инициатива Эфи, а просьба человека («напомни через 10
+    минут»). Попросил в группе — значит, и напомнить надо там же, иначе
+    запрет на непрошеные пинги молча ломал бы обещания.
+    """
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.FOLLOW_UP,
+            chat_id=_ALLOWED_GROUP_ID,
+            message="пора напомнить",
+            payload={"promise_text": "напомнить про созвон"},
         )
     )
 
