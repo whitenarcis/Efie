@@ -244,11 +244,19 @@ class _ScriptedCoder:
     """Кодер, отвечающий по заранее заданному сценарию: первый ответ битый, второй — рабочий."""
 
     def __init__(
-        self, sources: list[str], *, fixes: list[str] | None = None, readme: str | None = _GOOD_README
+        self,
+        sources: list[str],
+        *,
+        fixes: list[str] | None = None,
+        readme: str | None = _GOOD_README,
+        unavailable_reason: str = "",
     ) -> None:
         self._sources = list(sources)
         self._fixes = list(fixes or [])
         self._readme = readme
+        #: Непоправимый отказ провайдера (нет такой модели, отвергнут ключ) —
+        #: см. QwenCoderClient.unavailable_reason.
+        self.unavailable_reason = unavailable_reason
         self.fix_calls = 0
         self.readme_calls = 0
 
@@ -348,6 +356,26 @@ async def test_unusable_readme_is_replaced_by_a_complete_one() -> None:
     assert coder.readme_calls == 2, "сначала просим дописать, и только потом собираем сами"
     assert missing_sections(readme) == []
     assert "src/main.py" in readme, "команда запуска — из реального файла, а не выдуманная"
+
+
+async def test_a_dead_coder_stops_the_build_with_the_real_reason() -> None:
+    """
+    Снятая с обслуживания модель или отвергнутый ключ не чинятся к следующему
+    файлу. Без остановки один неверный конфиг стоил бы десятка запросов на
+    каждый проект и заканчивался бы невнятным «кодер не написал ни одного
+    файла» — по такому сообщению причину не найти.
+    """
+    coder = _ScriptedCoder(
+        [None, None],  # type: ignore[list-item]
+        unavailable_reason="модель 'qwen-2.5-coder-32b' недоступна: coder: unexpected HTTP 404: model_decommissioned",
+    )
+
+    build = await _engine(coder).build(_spec())
+
+    assert build.is_publishable is False
+    assert "model_decommissioned" in build.failure_reason
+    assert build.broken_paths == ["src/parser.py"], "второй файл даже не запрашивался"
+    assert coder.readme_calls == 0, "README без кода писать не о чем"
 
 
 async def test_readme_survives_a_silent_coder() -> None:

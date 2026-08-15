@@ -33,7 +33,7 @@ import re
 from efi.config.schema import EndpointConfig
 from efi.dev.schemas import FileSpec, ProjectSpec
 from efi.llm.base import LLMProvider
-from efi.llm.errors import LLMError
+from efi.llm.errors import LLMAuthError, LLMError, LLMRateLimitError, LLMServerError
 from efi.llm.providers.openai_compatible import OpenAICompatibleProvider
 from efi.llm.schemas import LLMParams, Message, Role, Session
 
@@ -84,6 +84,11 @@ class QwenCoderClient:
 
     def __init__(self, endpoint: EndpointConfig, *, provider: LLMProvider | None = None) -> None:
         self._endpoint = endpoint
+        #: Последняя причина отказа — дословный ответ провайдера. Нужна, чтобы
+        #: «файл не написался» не оставалось единственным, что известно
+        #: наружу: имя снятой с обслуживания модели или отвергнутый ключ видны
+        #: только здесь (см. `unavailable_reason`).
+        self._last_error: LLMError | None = None
         #: Провайдер внедряем ради тестов; в бою — обычный OpenAI-совместимый
         #: клиент, тот же, что ходит в Groq для остальных ролей. Имя видно в
         #: логах и метриках (efi/dashboard/): запрос кодера должен быть
@@ -95,6 +100,33 @@ class QwenCoderClient:
     @property
     def model(self) -> str:
         return self._endpoint.model
+
+    @property
+    def unavailable_reason(self) -> str:
+        """
+        Почему кодера бессмысленно звать дальше — или пусто, если причин нет.
+
+        Отличать НЕПОПРАВИМЫЙ отказ от временного здесь важнее, чем кажется.
+        Модель, снятая с обслуживания (404 `model_decommissioned` у Groq —
+        рядовое событие на бесплатных тирах), и отвергнутый ключ (401) не
+        починятся ни к следующему файлу, ни к следующей правке: без этой
+        проверки один такой конфиг стоил бы десятка запросов на каждый проект
+        и заканчивался бы сообщением «кодер не написал ни одного файла», по
+        которому причину не найти. Таймаут и 429, наоборот, поправимы сами
+        собой — они сюда не попадают.
+        """
+        error = self._last_error
+        if error is None:
+            return ""
+        if isinstance(error, LLMAuthError):
+            return f"кодер отверг ключ: {error}"
+        # LLMTimeoutError наследует LLMServerError — оба транзиентные, как и 429.
+        if isinstance(error, LLMRateLimitError | LLMServerError):
+            return ""
+        status = error.status_code
+        if status is not None and 400 <= status < 500:
+            return f"модель {self._endpoint.model!r} недоступна: {error}"
+        return ""
 
     async def write_file(
         self, spec: ProjectSpec, file_spec: FileSpec, *, already_written: dict[str, str] | None = None
@@ -147,8 +179,11 @@ class QwenCoderClient:
         try:
             response = await self._provider.chat(params, session)
         except LLMError as exc:
+            self._last_error = exc
             logger.warning("qwen: %s не удалось (%s)", what, exc)
             return None
+
+        self._last_error = None
 
         if response.was_truncated:
             # У кода обрыв по лимиту неисправим в принципе: «последнее

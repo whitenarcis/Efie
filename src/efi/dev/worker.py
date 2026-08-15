@@ -251,6 +251,11 @@ def _build_note(build: BuildResult) -> str:
 
 
 def _broken_reason(build: BuildResult) -> str:
+    # Причина отказа кодера важнее списка непрошедших файлов: «нет такой
+    # модели» и «файл не парсится после трёх правок» чинятся совершенно
+    # по-разному, а выглядели бы одинаково.
+    if build.failure_reason:
+        return build.failure_reason
     if build.broken_paths:
         return f"файлы {', '.join(build.broken_paths)} так и не заработали — код не собирается"
     return "кодер не написал ни одного файла"

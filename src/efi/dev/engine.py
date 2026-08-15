@@ -82,6 +82,10 @@ class BuildResult:
     #: Файлы, которые не удалось довести до состояния «парсится». Проект с
     #: такими файлами не публикуется — см. `is_publishable`.
     broken_paths: list[str] = field(default_factory=list)
+    #: Почему сборка оборвалась целиком, если оборвалась: снятая с
+    #: обслуживания модель, отвергнутый ключ. Дословный ответ провайдера —
+    #: это то, по чему владелец найдёт причину за минуту, а не за вечер.
+    failure_reason: str = ""
 
     @property
     def is_publishable(self) -> bool:
@@ -174,6 +178,14 @@ class DevEngine:
             generated = await self._write_one(spec, file_spec, written)
             if generated is None:
                 broken.append(file_spec.path)
+                # Кодер, которого бессмысленно звать дальше (нет такой модели,
+                # отвергнут ключ), останавливает сборку сразу: иначе один
+                # неверный конфиг стоил бы десятка запросов на каждый проект и
+                # заканчивался бы невнятным «кодер не написал ни одного файла».
+                unavailable = self._coder.unavailable_reason
+                if unavailable:
+                    logger.error("dev_engine: сборка %s остановлена — %s", spec.slug, unavailable)
+                    return BuildResult(files=[], broken_paths=broken, failure_reason=unavailable)
                 continue
             written[generated.path] = generated.content
             files.append(generated)
