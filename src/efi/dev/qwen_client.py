@@ -116,6 +116,17 @@ class QwenCoderClient:
         )
         return await self._ask(_SYSTEM_PROMPT, user_content, what=f"write {file_spec.path}")
 
+    async def write_document(self, path: str, *, system_prompt: str, request: str) -> str | None:
+        """
+        Текстовый файл проекта, а не код: README и подобное.
+
+        Отдельный метод со своим системным промптом, потому что документацию
+        пишут иначе, чем модуль: «только код, без markdown» — ровно то, чего
+        от README не надо. Пишет его всё равно кодер: он единственный видел
+        реальные флаги и функции, а README про них и есть (см. efi/dev/readme.py).
+        """
+        return await self._ask(system_prompt, request, what=f"write {path}")
+
     async def fix_file(self, path: str, source: str, diagnostics: str) -> str | None:
         """Переписывает файл по замечаниям песочницы (efi/dev/sandbox.py)."""
         user_content = (

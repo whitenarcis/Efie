@@ -558,6 +558,79 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   color: var(--muted);
 }
 
+/* ------------------------------------------------------------ проекты */
+
+/*
+ * Проекты — карточками, а не строками списка: у каждого есть заголовок,
+ * ссылка, состав файлов и след правок, и в одну строку это не укладывается,
+ * а в таблицу на телефоне тем более.
+ */
+.projects {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 14px;
+}
+
+.project {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  padding: 20px 22px;
+  min-width: 0;
+}
+
+.project-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 14px;
+}
+
+.project-head h3 {
+  margin: 0;
+  font-size: var(--fs-body);
+  font-weight: 400;
+  letter-spacing: 0.02em;
+  overflow-wrap: anywhere;
+}
+
+.project-tags { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.project-problem {
+  margin: 10px 0 0;
+  font-size: var(--fs-small);
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.project-link { margin: 10px 0 0; font-size: var(--fs-small); overflow-wrap: anywhere; }
+.project-link a { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+
+.project-error {
+  margin: 10px 0 0;
+  font-size: var(--fs-small);
+  color: var(--err);
+  overflow-wrap: anywhere;
+}
+
+.project-files {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  font-size: var(--fs-small);
+  color: var(--muted);
+}
+
+.project-files li { margin-top: 3px; overflow-wrap: anywhere; }
+.project-files code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+.project-meta {
+  margin: 12px 0 0;
+  font-size: var(--fs-micro);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
 /* ------------------------------------------------------------- прочее */
 
 .spark { display: block; width: 100%; height: 46px; margin-top: 14px; }
@@ -637,6 +710,7 @@ button.ghost[aria-pressed="true"] { background: var(--ink); border-color: var(--
   .row { padding: 17px 22px; }
   .reader { padding: 54px 40px; }
   .bubble { max-width: 68%; }
+  .projects { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (min-width: 1240px) {

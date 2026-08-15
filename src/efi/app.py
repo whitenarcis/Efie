@@ -50,6 +50,7 @@ from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
 from efi.dev.engine import DevEngine
 from efi.dev.github_sync import GitHubSync
+from efi.dev.maintenance import ProjectMaintainer
 from efi.dev.qwen_client import QwenCoderClient
 from efi.dev.reporter import DevReporter
 from efi.dev.sandbox import CodeSandbox
@@ -469,6 +470,7 @@ class EfiApp:
                     tools=self._tool_registry,
                     llm_router=self._llm_router,
                     prompt_loader=self._prompt_loader,
+                    dev_store=self._dev_store,
                     background_tasks=lambda: self._background_tasks,
                     worker_tasks=lambda: self._worker_tasks,
                 ),
@@ -504,10 +506,12 @@ class EfiApp:
         workspace.mkdir(parents=True, exist_ok=True)
         token = dev_settings.github_token.get_secret_value() if dev_settings.github_token else ""
 
+        coder = QwenCoderClient(coder_endpoint)
+        sandbox = CodeSandbox(enable_linter=dev_settings.lint_generated_code)
         engine = DevEngine(
             self._llm_router,
-            QwenCoderClient(coder_endpoint),
-            CodeSandbox(enable_linter=dev_settings.lint_generated_code),
+            coder,
+            sandbox,
             # Замысел придумывает фоновая роль, а не MAIN: никто не ждёт
             # этого ответа в чате, и занимать им канал живого диалога нельзя
             # (регламент ролей — см. efi.config.schema.TaskRole).
@@ -530,6 +534,22 @@ class EfiApp:
             initiative=self._initiative,
             progress_probability=dev_settings.progress_probability,
         )
+        # Возвращение к своим проектам: перечитать, поправить, изредка
+        # спросить. Отдельный объект, а не метод воркера, потому что это
+        # другая работа: там «сделать новое», здесь «пересмотреть сделанное».
+        maintainer = ProjectMaintainer(
+            self._dev_store,
+            self._llm_router,
+            coder,
+            sandbox,
+            github,
+            reporter,
+            workspace,
+            review_interval=timedelta(days=dev_settings.review_interval_days),
+            patch_threshold=dev_settings.patch_importance_threshold,
+            discuss_threshold=dev_settings.discuss_importance_threshold,
+            review_probability=dev_settings.review_probability,
+        )
         logger.info(
             "app: разработка включена (кодер %s, %s)",
             coder_endpoint.model,
@@ -540,6 +560,7 @@ class EfiApp:
             engine,
             github,
             reporter,
+            maintainer=maintainer,
             interests=self._community_interests,
             # Своя затея рассказывается владельцу: чат для неё выбирается
             # здесь, а не воркером, — это единственное место, которое знает

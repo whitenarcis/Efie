@@ -312,6 +312,20 @@ async def _migration_015_dev_tasks(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_DEV_TASKS_SCHEMA)
 
 
+async def _migration_016_dev_reviews(conn: aiosqlite.Connection) -> None:
+    """
+    Когда Эфи последний раз возвращалась к своему проекту и сколько правок
+    внесла с тех пор (см. efi/dev/maintenance.py).
+
+    ALTER TABLE, а не пересоздание: у того, кто уже включил разработку, в
+    таблице лежат живые задачи со спеками и ссылками.
+    """
+    if not await _has_column(conn, "dev_tasks", "reviewed_at"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''")
+    if not await _has_column(conn, "dev_tasks", "revisions"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN revisions INTEGER NOT NULL DEFAULT 0")
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -329,6 +343,7 @@ MIGRATIONS = [
     _migration_013_conversation_turns,
     _migration_014_chat_directory,
     _migration_015_dev_tasks,
+    _migration_016_dev_reviews,
 ]
 
 __all__ = ["MIGRATIONS"]

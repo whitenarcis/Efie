@@ -37,6 +37,7 @@ from pydantic import ValidationError
 
 from efi.config.schema import TaskRole
 from efi.dev.qwen_client import QwenCoderClient
+from efi.dev.readme import README_PATH, ReadmeWriter
 from efi.dev.sandbox import CodeSandbox
 from efi.dev.schemas import MAX_PROJECT_FILES, FileSpec, GeneratedFile, ProjectSpec
 from efi.llm.errors import LLMError
@@ -114,12 +115,16 @@ class DevEngine:
         *,
         design_role: TaskRole = TaskRole.BACKGROUND,
         max_fix_iterations: int = 3,
+        readme: ReadmeWriter | None = None,
     ) -> None:
         self._router = router
         self._coder = coder
         self._sandbox = sandbox
         self._design_role = design_role
         self._max_fix_iterations = max_fix_iterations
+        #: README — обязательная часть сборки, а не постобработка: проект без
+        #: внятной документации не публикуется (см. efi/dev/readme.py).
+        self._readme = readme if readme is not None else ReadmeWriter(coder)
 
     async def design(self, idea: str = "", *, context: str = "") -> ProjectSpec | None:
         """
@@ -156,6 +161,10 @@ class DevEngine:
         """
         Пишет все файлы спеки. Порядок — как в спеке: первым идёт то, что
         модель считает основой, и последующие файлы видят его интерфейс.
+
+        README пишется ПОСЛЕДНИМ и всегда: он документирует то, что реально
+        получилось, а не то, что задумывалось, — и без него проект не
+        публикуется вовсе (см. efi/dev/readme.py).
         """
         written: dict[str, str] = {}
         files: list[GeneratedFile] = []
@@ -169,11 +178,13 @@ class DevEngine:
             written[generated.path] = generated.content
             files.append(generated)
 
-        readme = _render_readme(spec)
-        if readme and not any(item.path.lower() == "readme.md" for item in files):
-            files.append(GeneratedFile(path="README.md", content=readme))
-
-        return BuildResult(files=files, broken_paths=broken)
+        # Свой README из спеки, если кодер зачем-то сгенерировал его сам,
+        # выбрасываем: документация по замыслу вместо документации по коду —
+        # это ровно тот README, ради которого никто не открывает репозиторий.
+        code_files = [item for item in files if item.path.lower() != README_PATH.lower()]
+        if code_files:
+            code_files.append(await self._readme.write(spec, code_files))
+        return BuildResult(files=code_files, broken_paths=broken)
 
     async def _write_one(
         self, spec: ProjectSpec, file_spec: FileSpec, already_written: dict[str, str]
@@ -299,23 +310,6 @@ def _as_list(raw: object) -> list[object]:
     if raw is None or raw == "":
         return []
     return [raw]
-
-
-def _render_readme(spec: ProjectSpec) -> str:
-    """
-    README — из спеки, а не отдельным запросом к модели: всё нужное для него
-    уже придумано на первом уровне, и лишний запрос ради пересказа тех же
-    данных только тратил бы лимиты.
-    """
-    if spec.readme.strip():
-        body = spec.readme.strip()
-        return body if body.startswith("#") else f"# {spec.title}\n\n{body}\n"
-
-    stack = "\n".join(f"- {item}" for item in spec.stack) or "- python 3.11"
-    structure = "\n".join(f"- `{item.path}` — {item.purpose}" for item in spec.files)
-    return (
-        f"# {spec.title}\n\n{spec.problem}\n\n## Стек\n\n{stack}\n\n## Структура\n\n{structure}\n"
-    )
 
 
 __all__ = ["BuildResult", "DevEngine", "parse_spec"]

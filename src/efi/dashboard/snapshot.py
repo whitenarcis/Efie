@@ -36,6 +36,8 @@ from efi.dashboard.logbus import LogBuffer
 from efi.dashboard.metrics import LLMMetricsCollector
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
+from efi.dev.schemas import DevTask
+from efi.dev.store import DevTaskStore
 from efi.llm.router import LLMRouter
 from efi.memory.beliefs import BeliefStore
 from efi.memory.diary import Diary
@@ -113,6 +115,7 @@ class DashboardContext:
     tools: ToolRegistry | None = None
     llm_router: LLMRouter | None = None
     prompt_loader: PromptLoader | None = None
+    dev_store: DevTaskStore | None = None
 
     #: Возвращают живые списки задач приложения. Именно вызываемые, а не
     #: списки: `EfiApp` наполняет их уже после `start()`, и сохранённая
@@ -695,6 +698,59 @@ async def build_people(context: DashboardContext, *, limit: int = 100) -> dict[s
 # ---------------------------------------------------------------------------
 # Чаты и переписка
 # ---------------------------------------------------------------------------
+
+
+async def build_projects(context: DashboardContext, *, limit: int = 50) -> dict[str, Any]:
+    """
+    Ремесло Эфи: что она пишет, что уже выложила и что из этого не вышло.
+
+    Раздел отвечает на вопрос, который иначе проверяется только вручную через
+    GitHub: делает ли она что-то на самом деле. Поэтому здесь и ссылки, и
+    статусы, и — главное — число правок после релиза: разница между
+    «сгенерировала репозиторий» и «возвращается к своему коду» видна именно
+    по нему.
+    """
+    if context.dev_store is None:
+        return {"enabled": False, "projects": [], "stats": {}}
+
+    active, releases = await asyncio.gather(
+        context.dev_store.active(), context.dev_store.recent_releases(limit=limit)
+    )
+    failed = await context.dev_store.recent_failures(limit=limit)
+
+    projects = [_project_row(task) for task in [*active, *releases, *failed]]
+    return {
+        "enabled": context.settings.dev.enabled,
+        "projects": projects,
+        "stats": {
+            "in_work": len(active),
+            "released": len(releases),
+            "failed": len(failed),
+            "revisions": sum(task.revisions for task in releases),
+        },
+    }
+
+
+def _project_row(task: DevTask) -> dict[str, Any]:
+    spec = task.spec
+    return {
+        "id": task.id,
+        "title": spec.title if spec is not None else (task.idea[:80] or "замысел без названия"),
+        "slug": spec.slug if spec is not None else "",
+        "problem": spec.problem if spec is not None else task.idea,
+        "stack": list(spec.stack) if spec is not None else [],
+        "files": [{"path": item.path, "purpose": item.purpose} for item in spec.files] if spec else [],
+        "status": task.status.value,
+        "status_label": task.status_label,
+        "is_collab": task.is_collab,
+        "chat_id": task.chat_id,
+        "repo_url": task.repo_url,
+        "error": task.error,
+        "revisions": task.revisions,
+        "created_at": task.created_at.isoformat(),
+        "updated_at": task.updated_at.isoformat(),
+        "reviewed_at": task.reviewed_at.isoformat() if task.reviewed_at is not None else None,
+    }
 
 
 async def build_chats(context: DashboardContext, *, limit: int = 100) -> dict[str, Any]:

@@ -923,6 +923,30 @@ class DevSettings(BaseModel):
         default=True, description="Гонять ruff по сгенерированному коду (если он установлен в системе)"
     )
 
+    review_probability: float = Field(
+        default=0.3, ge=0.0, le=1.0,
+        description=(
+            "Вероятность перечитать один из своих старых проектов, когда новой работы нет "
+            "(0 — выключает возвращение к проектам совсем)"
+        ),
+    )
+    review_interval_days: float = Field(
+        default=7.0, gt=0.0,
+        description="Через сколько дней после последнего просмотра проект снова попадает в выборку",
+    )
+    patch_importance_threshold: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="С какой важности находка при перечитывании становится настоящей правкой с коммитом",
+    )
+    discuss_importance_threshold: float = Field(
+        default=0.8, ge=0.0, le=1.0,
+        description=(
+            "С какой важности она пишет владельцу вопрос по проекту. Высоко намеренно: модель находит, "
+            "что улучшить, всегда, и без порога это превратилось бы в еженедельные вопросы про "
+            "переименование переменных"
+        ),
+    )
+
     github_token: SecretStr | None = Field(
         default=None,
         description="Personal access token с правом repo. Не задан — проекты остаются локальными",

@@ -154,11 +154,63 @@ class DevTaskStore:
         )
         return [_row_to_task(row) for row in rows]
 
+    async def due_for_review(self, *, not_reviewed_for: timedelta) -> list[DevTask]:
+        """
+        Выложенные проекты, к которым Эфи давно не возвращалась.
+
+        «Давно» считается от последнего просмотра, а если его не было — от
+        публикации: свежий проект незачем ревизовать на следующий день после
+        релиза, он ровно такой, каким его дописали.
+        """
+        cutoff = (datetime.now(UTC) - not_reviewed_for).isoformat()
+        rows = await self._database.fetch_all(
+            """
+            SELECT * FROM dev_tasks
+             WHERE status = ? AND repo_url != ''
+               AND (CASE WHEN reviewed_at = '' THEN updated_at ELSE reviewed_at END) < ?
+             ORDER BY (CASE WHEN reviewed_at = '' THEN updated_at ELSE reviewed_at END) ASC
+            """,
+            (DevTaskStatus.DONE.value, cutoff),
+        )
+        return [_row_to_task(row) for row in rows]
+
+    async def mark_reviewed(self, task: DevTask, *, revised: bool = False) -> DevTask:
+        """
+        Отмечает, что проект просмотрен. `revised` — была ли внесена правка;
+        счётчик правок нужен и дашборду, и самой Эфи («я к этой штуке уже
+        трижды возвращалась»).
+
+        Отметка ставится ВСЕГДА, включая исход «всё нормально, трогать
+        нечего»: без неё один и тот же проект пересматривался бы каждый тик,
+        а остальные не дождались бы очереди никогда.
+        """
+        now = datetime.now(UTC)
+        updated = task.model_copy(
+            update={
+                "reviewed_at": now,
+                "revisions": task.revisions + (1 if revised else 0),
+                "updated_at": now if revised else task.updated_at,
+            }
+        )
+        await self._database.execute(
+            "UPDATE dev_tasks SET reviewed_at = ?, revisions = ?, updated_at = ? WHERE id = ?",
+            (now.isoformat(), updated.revisions, updated.updated_at.isoformat(), task.id),
+        )
+        return updated
+
     async def recent_releases(self, *, limit: int = 5) -> list[DevTask]:
         """Последние доведённые до репозитория проекты — материал для показа и для «внешнего флекса»."""
         rows = await self._database.fetch_all(
             "SELECT * FROM dev_tasks WHERE status = ? AND repo_url != '' ORDER BY updated_at DESC LIMIT ?",
             (DevTaskStatus.DONE.value, limit),
+        )
+        return [_row_to_task(row) for row in rows]
+
+    async def recent_failures(self, *, limit: int = 5) -> list[DevTask]:
+        """Недавно провалившиеся задачи — только для дашборда: в промпт неудачи не идут, ей о них напоминать незачем."""
+        rows = await self._database.fetch_all(
+            "SELECT * FROM dev_tasks WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
+            (DevTaskStatus.FAILED.value, limit),
         )
         return [_row_to_task(row) for row in rows]
 
@@ -235,7 +287,15 @@ def _row_to_task(row: aiosqlite.Row) -> DevTask:
         error=str(row["error"] or ""),
         created_at=datetime.fromisoformat(str(row["created_at"])),
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
+        reviewed_at=_parse_optional(row["reviewed_at"]),
+        revisions=int(row["revisions"] or 0),
     )
+
+
+def _parse_optional(raw: object) -> datetime | None:
+    """Пустая строка в колонке значит «не было ни разу» — это не дата и не ноль эпохи."""
+    text = str(raw or "")
+    return datetime.fromisoformat(text) if text else None
 
 
 __all__ = ["DevTaskStore"]

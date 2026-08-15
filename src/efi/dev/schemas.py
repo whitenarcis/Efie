@@ -226,6 +226,22 @@ class DevTask(BaseModel):
     error: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    #: Когда Эфи последний раз перечитывала свой проект (efi/dev/maintenance.py).
+    #: None — ни разу: значит, он ровно такой, каким его дописали.
+    reviewed_at: datetime | None = None
+    #: Сколько правок она внесла после релиза. Это и есть разница между
+    #: «сгенерировала и забыла» и «у неё есть проект, к которому она
+    #: возвращается».
+    revisions: int = 0
+
+    @property
+    def status_label(self) -> str:
+        """
+        Статус её словами, а не значением перечисления. Одно определение на
+        промпт, инструменты и дашборд: «coding» в интерфейсе для человека
+        выглядит ровно так же неуместно, как в реплике Эфи.
+        """
+        return _STATUS_WORDS[self.status]
 
     def render_for_prompt(self) -> str:
         """Строчка о задаче для системного промпта — чтобы Эфи знала, чем сама сейчас занята."""
@@ -233,7 +249,7 @@ class DevTask(BaseModel):
             subject = self.spec.render_for_prompt()
         else:
             subject = f"замысел: {self.idea.strip()}"
-        return f"{subject} — {_STATUS_WORDS[self.status]}"
+        return f"{subject} — {self.status_label}"
 
 
 #: Как статус звучит для самой Эфи. Не «status=coding», а то, что она могла

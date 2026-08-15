@@ -119,6 +119,13 @@ def build_routes(context: DashboardContext) -> dict[str, Handler]:
             )
         )
 
+    async def projects(request: Request) -> Response:
+        return Response.json(
+            await snapshot.build_projects(
+                context, limit=request.int_param("limit", 50, minimum=1, maximum=queries.MAX_ROWS)
+            )
+        )
+
     async def chats(request: Request) -> Response:
         return Response.json(
             await snapshot.build_chats(
@@ -160,6 +167,7 @@ def build_routes(context: DashboardContext) -> dict[str, Handler]:
         "/api/diary/entry": diary_entry,
         "/api/memory": memory,
         "/api/people": people,
+        "/api/projects": projects,
         "/api/chats": chats,
         "/api/chats/messages": chat_messages,
     }

@@ -22,8 +22,9 @@ from pydantic import SecretStr
 from efi.config.schema import EndpointConfig, TaskRole
 from efi.dev.engine import DevEngine, parse_spec
 from efi.dev.qwen_client import QwenCoderClient, strip_code_fences
+from efi.dev.readme import missing_sections, problems, render_fallback
 from efi.dev.sandbox import CodeSandbox, write_project_files
-from efi.dev.schemas import FileSpec, ProjectSpec
+from efi.dev.schemas import FileSpec, GeneratedFile, ProjectSpec
 from efi.llm.errors import LLMServerError
 from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session
 
@@ -165,16 +166,91 @@ def test_generated_files_cannot_escape_the_project(tmp_path: Any) -> None:
     assert written[0].read_text(encoding="utf-8") == "x = 1"
 
 
+# -- README как обязательный критерий -----------------------------------------
+
+
+def test_readme_stub_is_not_accepted() -> None:
+    """Два заголовка и строчка описания — это не документация, а её видимость."""
+    assert missing_sections("# Проект\n\nкрутая штука") == [
+        "Назначение",
+        "Установка",
+        "Использование",
+        "Структура",
+    ]
+
+
+def test_readme_sections_are_recognized_by_synonyms() -> None:
+    """
+    Требовать дословных заголовков нельзя: модель пишет то «Установка», то
+    «Как поставить», то «Installation» — и годный текст забраковывался бы
+    из-за синонима.
+    """
+    text = (
+        "# Утилита\n\nчто-то полезное\n\n"
+        "## Зачем нужна\n\nрешает конкретную проблему конкретного человека, который устал делать это руками\n\n"
+        "## Как поставить\n\nPython 3.11, зависимостей нет, склонировать и запустить\n\n"
+        "## Быстрый старт\n\n`python main.py --help` покажет все доступные флаги и примеры вызова\n\n"
+        "## Модули\n\n- `main.py` — точка входа и разбор аргументов командной строки\n"
+    )
+
+    assert missing_sections(text) == []
+
+
+def test_short_readme_is_reported_as_short_not_as_missing_everything() -> None:
+    """
+    Заглушка, где формально упомянуты все четыре темы, всё равно не годится —
+    но претензия к ней именно «слишком короткий». Соврать здесь значит
+    отправить модели неправду про отсутствующие разделы.
+    """
+    text = "# Утилита\n\n## Назначение\nвсё\n## Установка\nvsё\n## Использование\nвсё\n## Структура\nвсё\n"
+
+    issues = problems(text)
+
+    assert missing_sections(text) == []
+    assert any("короткий" in issue for issue in issues)
+
+
+def test_fallback_readme_is_complete_and_built_from_real_paths() -> None:
+    files = [
+        GeneratedFile(path="src/parser.py", content="def parse() -> None:\n    ..."),
+        GeneratedFile(path="src/main.py", content="def main() -> None:\n    ..."),
+    ]
+
+    text = render_fallback(_spec(), files)
+
+    assert missing_sections(text) == []
+    assert "python src/main.py" in text, "команда запуска — из точки входа проекта"
+    assert "git clone" in text
+    assert "`src/parser.py`" in text
+
+
 # -- цикл «написать -> проверить -> починить» ---------------------------------
+
+
+#: README, проходящий проверку обязательных разделов, — им отвечает кодер в
+#: тестах, где предмет проверки не документация, а код.
+_GOOD_README = (
+    "# Log Digest\n\nУтилита для разбора логов.\n\n"
+    "## Назначение\n\nРазбирает логи nginx и показывает топ ошибок за период — тем, кто держит "
+    "сервер и не хочет читать гигабайты руками.\n\n"
+    "## Установка\n\nТребуется Python 3.11+, внешних зависимостей нет.\n\n"
+    "```bash\ngit clone https://github.com/efi/log-digest.git\ncd log-digest\n```\n\n"
+    "## Использование\n\n```bash\npython src/main.py access.log --top 10\n```\n\n"
+    "## Структура\n\n- `src/parser.py` — разбор строк\n- `src/main.py` — точка входа\n"
+)
 
 
 class _ScriptedCoder:
     """Кодер, отвечающий по заранее заданному сценарию: первый ответ битый, второй — рабочий."""
 
-    def __init__(self, sources: list[str], *, fixes: list[str] | None = None) -> None:
+    def __init__(
+        self, sources: list[str], *, fixes: list[str] | None = None, readme: str | None = _GOOD_README
+    ) -> None:
         self._sources = list(sources)
         self._fixes = list(fixes or [])
+        self._readme = readme
         self.fix_calls = 0
+        self.readme_calls = 0
 
     async def write_file(self, spec: ProjectSpec, file_spec: FileSpec, **_: Any) -> str | None:
         return self._sources.pop(0) if self._sources else None
@@ -182,6 +258,10 @@ class _ScriptedCoder:
     async def fix_file(self, path: str, source: str, diagnostics: str) -> str | None:
         self.fix_calls += 1
         return self._fixes.pop(0) if self._fixes else None
+
+    async def write_document(self, path: str, *, system_prompt: str, request: str) -> str | None:
+        self.readme_calls += 1
+        return self._readme
 
 
 class _StaticRouter:
@@ -239,13 +319,43 @@ async def test_file_that_never_parses_blocks_publication() -> None:
     assert build.broken_paths == ["src/parser.py"]
 
 
-async def test_readme_is_added_when_the_coder_did_not_write_one() -> None:
+async def test_every_project_gets_a_readme_written_from_the_real_code() -> None:
+    """
+    README — обязательное условие публикации: репозиторий, по которому
+    непонятно ни что это, ни как запустить, бесполезен для того, кто по
+    ссылке пришёл.
+    """
     coder = _ScriptedCoder(["x = 1\n", "y = 2\n"])
 
     build = await _engine(coder).build(_spec())
 
-    assert "README.md" in build.as_file_map()
-    assert build.as_file_map()["README.md"].startswith("# Log Digest")
+    readme = build.as_file_map()["README.md"]
+    assert coder.readme_calls == 1
+    assert missing_sections(readme) == []
+
+
+async def test_unusable_readme_is_replaced_by_a_complete_one() -> None:
+    """
+    Модель регулярно отвечает заглушкой в две строки. «Обязательный раздел»
+    должен быть свойством кода, а не пожеланием в промпте: годного README нет
+    — собираем сами из спеки, но полный.
+    """
+    coder = _ScriptedCoder(["x = 1\n", "y = 2\n"], readme="# Log Digest\n\nкрутая штука\n")
+
+    build = await _engine(coder).build(_spec())
+
+    readme = build.as_file_map()["README.md"]
+    assert coder.readme_calls == 2, "сначала просим дописать, и только потом собираем сами"
+    assert missing_sections(readme) == []
+    assert "src/main.py" in readme, "команда запуска — из реального файла, а не выдуманная"
+
+
+async def test_readme_survives_a_silent_coder() -> None:
+    coder = _ScriptedCoder(["x = 1\n", "y = 2\n"], readme=None)
+
+    build = await _engine(coder).build(_spec())
+
+    assert missing_sections(build.as_file_map()["README.md"]) == []
 
 
 async def test_design_rejects_junk_and_gives_up_honestly() -> None:

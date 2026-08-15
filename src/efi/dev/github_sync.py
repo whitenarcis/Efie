@@ -170,6 +170,45 @@ class GitHubSync:
         logger.info("github_sync: %s запушен в %s", spec.slug, repo.html_url)
         return PublishResult(local_path=project_dir, commits=commits, repo=repo, pushed=True)
 
+    async def commit_revision(
+        self, spec: ProjectSpec, files: list[GeneratedFile], *, message: str
+    ) -> bool:
+        """
+        Правка в уже существующем проекте: перезаписать файлы, закоммитить
+        одним коммитом и запушить в тот же репозиторий.
+
+        Возвращает False, если коммитить было нечего (модель «исправила»
+        файл в то же самое содержимое — обычное дело). Пустой коммит здесь
+        хуже отсутствия правки: история проекта должна показывать работу, а
+        не активность.
+
+        Каталог проекта должен существовать — это клон, оставшийся от
+        публикации. Если его нет (почистили диск, переехали), правка
+        пропускается: перевыкладывать проект заново под видом «внёс правку»
+        нельзя, это переписывание истории.
+        """
+        project_dir = (self._workspace / spec.slug).resolve()
+        if not (project_dir / ".git").is_dir():
+            raise GitHubSyncError(f"локального клона {spec.slug} нет — править нечего")
+
+        _write_files(project_dir, files)
+        paths = [item.path for item in files]
+        await self._git(project_dir, "add", "--", *paths)
+        if not (await self._git(project_dir, "status", "--porcelain", "--", *paths)).strip():
+            logger.info("github_sync: правка в %s ничего не изменила, коммита не будет", spec.slug)
+            return False
+
+        await self._git(
+            project_dir,
+            "-c", f"user.name={_COMMIT_AUTHOR_NAME}",
+            "-c", f"user.email={_COMMIT_AUTHOR_EMAIL}",
+            "commit", "-m", message,
+        )
+        if self.can_publish:
+            await self._git(project_dir, "push", "origin", _DEFAULT_BRANCH)
+        logger.info("github_sync: %s — %s", spec.slug, message)
+        return True
+
     async def create_repository(self, spec: ProjectSpec) -> RepoRef:
         """
         Создаёт репозиторий через REST API.

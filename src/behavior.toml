@@ -225,6 +225,12 @@ topic_match_min_score = 0.34
 # self_initiated_probability = 0.25  # шанс затеять СВОЙ проект, когда очередь пуста
 # max_fix_iterations = 3             # сколько раз возвращать файл кодеру с замечаниями
 # progress_probability = 0.5         # шанс рассказать в чате об этапе (не чаще раза в час)
+#
+# Возвращение к своим проектам: перечитать, поправить, изредка спросить.
+# review_probability = 0.3           # шанс заглянуть в старый проект, когда новой работы нет (0 — выключить)
+# review_interval_days = 7.0         # не чаще раза в неделю на один проект
+# patch_importance_threshold = 0.5   # с какой важности находка становится коммитом
+# discuss_importance_threshold = 0.8 # с какой важности она пишет вам вопрос по проекту (высоко намеренно)
 # github_token = "ghp_..."           # PAT с правом repo; лучше через EFI_DEV__GITHUB_TOKEN
 # github_ssh_key_path = "~/.ssh/efi_ed25519"   # ключ ИМЕННО для неё, а не ваш личный
 # repo_private = false

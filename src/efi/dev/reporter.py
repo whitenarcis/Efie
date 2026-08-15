@@ -130,6 +130,25 @@ class DevReporter:
             return
         await self._put(task, _render_release_reason(task, url=url, build=build), priority=_RELEASE_PRIORITY)
 
+    async def report_question(self, task: DevTask, question: str) -> None:
+        """
+        Вопрос по своему проекту — то, что она решила не решать в одиночку
+        (см. efi/dev/maintenance.py).
+
+        Вероятность и кулдаун прогресса здесь НЕ применяются: до этого места
+        доходит только то, что уже прошло порог важности, и «не в настроении
+        рассказывать» к вопросу по существу отношения не имеет. Тихие часы
+        соблюдаются — вопрос про формат конфига может подождать до утра, — а
+        вот право заговорить первой не спрашивается: это не пинг из воздуха,
+        а продолжение работы, которую человек видел.
+        """
+        if task.chat_id is None or not question.strip():
+            return
+        if is_quiet_now(self._quiet_hours, self._timezone):
+            logger.debug("dev_reporter: вопрос по #%s подождёт до утра", task.id)
+            return
+        await self._put(task, _render_question_reason(task, question), priority=_RELEASE_PRIORITY)
+
     async def report_failure(self, task: DevTask, reason: str) -> None:
         """Не получилось. Только для совместных задач — см. докстринг модуля."""
         if task.chat_id is None or not task.is_collab:
@@ -205,6 +224,27 @@ def _render_release_reason(task: DevTask, *, url: str, build: BuildResult | None
         "Скажи об этом собеседнику сама, одной-двумя короткими репликами, и ОБЯЗАТЕЛЬНО дай ссылку — "
         "без неё сообщение бессмысленно. Тон: «сделала штуку, глянь», а не презентация релиза. "
         "Не перечисляй файлы, не расписывай возможности по пунктам и не благодари за внимание."
+    )
+
+
+def _render_question_reason(task: DevTask, question: str) -> str:
+    """
+    Повод для вопроса по своему проекту.
+
+    Формулировка настаивает на том, что вопрос уже есть и его надо просто
+    задать: без этого модель, получив «обсуди с человеком», начинает с
+    пересказа проекта и трёх абзацев контекста, а сам вопрос теряется в
+    конце.
+    """
+    subject = task.spec.render_for_prompt() if task.spec is not None else task.idea.strip()
+    where = f" ({task.repo_url})" if task.repo_url else ""
+    return (
+        f"Ты перечитывала свой проект{where}: {subject}\n"
+        f"И упёрлась в развилку, которую не хочешь решать одна: {question}\n"
+        "Спроси собеседника прямо и коротко — как спрашивают у человека, с которым вместе что-то "
+        "делают. Сначала в двух словах суть развилки, потом сам вопрос.\n"
+        "Не пересказывай проект целиком, не перечисляй варианты по пунктам с плюсами и минусами и не "
+        "извиняйся за беспокойство. Своё мнение у тебя есть — скажи и его, а не только «как лучше?»."
     )
 
 

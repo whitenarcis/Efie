@@ -37,6 +37,7 @@ from typing import Protocol
 
 from efi.dev.engine import BuildResult, DevEngine
 from efi.dev.github_sync import GitHubSync, GitHubSyncError
+from efi.dev.maintenance import ProjectMaintainer
 from efi.dev.reporter import DevReporter
 from efi.dev.schemas import DevTask, DevTaskStatus, ProjectSpec
 from efi.dev.store import DevTaskStore
@@ -78,6 +79,7 @@ class DevWorker:
         github: GitHubSync,
         reporter: DevReporter,
         *,
+        maintainer: ProjectMaintainer | None = None,
         interests: InterestSource | None = None,
         owner_chat_id: int | None = None,
         check_interval_seconds: float = 3600.0,
@@ -87,6 +89,10 @@ class DevWorker:
         self._engine = engine
         self._github = github
         self._reporter = reporter
+        #: Возвращение к уже выложенным проектам (efi/dev/maintenance.py).
+        #: Необязательно: без него Эфи просто пишет новое и не перечитывает
+        #: старое — то есть ведёт себя как генератор репозиториев.
+        self._maintainer = maintainer
         self._interests = interests
         self._owner_chat_id = owner_chat_id
         self._check_interval_seconds = check_interval_seconds
@@ -120,11 +126,25 @@ class DevWorker:
         if task is None:
             task = await self._maybe_start_own_project()
         if task is None:
+            # Работы нет — самое время перечитать что-нибудь своё. Именно в
+            # этом порядке: новый проект и чужая просьба важнее ревизии
+            # старого, а ревизия — не «занятие на безрыбье», а то, чем автор
+            # и занимается между проектами.
+            await self._maybe_review_old_work()
             return
 
         self._is_coding = True
         try:
             await self._process(task)
+        finally:
+            self._is_coding = False
+
+    async def _maybe_review_old_work(self) -> None:
+        if self._maintainer is None:
+            return
+        self._is_coding = True
+        try:
+            await self._maintainer.maybe_review()
         finally:
             self._is_coding = False
 
