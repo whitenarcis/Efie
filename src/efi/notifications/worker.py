@@ -153,8 +153,21 @@ _RETRY_DELAYS_SECONDS = (60.0, 180.0)
 
 #: Уведомления, где Эфи пишет ПЕРВОЙ. Разрешены только владельцу —
 #: см. ConversationLifecycle.allows_proactive_ping и Worker._should_disengage.
+#:
+#: DEV_UPDATE (ход работы над проектом, efi/dev/reporter.py) входит сюда на
+#: тех же правах, что FOLLOW_UP: повод у неё конкретный и не выдуманный, но
+#: сообщение всё равно приходит в чат, где никто ничего не спрашивал, — а
+#: значит, действует общее правило «первой пишем только туда, куда владелец
+#: разрешил». В отличие от спонтанного пинга, общий чат тут не запрещён
+#: (см. _UNPROMPTED_NOTIFICATION_TYPES): проект, о котором договорились в
+#: группе, там же и показывают.
 _PROACTIVE_NOTIFICATION_TYPES = frozenset(
-    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING, NotificationType.FOLLOW_UP}
+    {
+        NotificationType.SPONTANEOUS_PING,
+        NotificationType.SILENCE_PING,
+        NotificationType.FOLLOW_UP,
+        NotificationType.DEV_UPDATE,
+    }
 )
 
 #: Публичные выступления — их результат идёт в социальную память как

@@ -79,6 +79,7 @@ _SERVICE_TITLES: dict[str, tuple[str, str]] = {
     "diary_consolidation": ("Ночная консолидация", "Новеллизация хвостов, дедупликация и мемуары"),
     "random_comment_engager": ("Участие в тредах", "Заглядывает в обсуждения сообщества и иногда вписывается"),
     "memory_pulse": ("Пульс памяти", "Превращает законченный разговор в запись дневника по ходу дня"),
+    "dev_worker": ("Ремесло", "Пишет свои проекты: замысел, код через кодера, проверка и пуш на GitHub"),
 }
 
 
@@ -251,6 +252,7 @@ def _services_overview(context: DashboardContext) -> list[dict[str, Any]]:
     settings = context.settings
     enabled_by_config = {
         "memory_pulse": settings.memory_pulse.enabled,
+        "dev_worker": settings.dev.enabled,
         "random_comment_engager": settings.community.enabled and bool(settings.telegram.community_chats),
         "spontaneous_ping": True,
         "silence_monitor": True,

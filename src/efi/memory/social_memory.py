@@ -62,6 +62,12 @@ class SocialInteractionKind(StrEnum):
     STRANGER_DM = "stranger_dm"
     #: Эфи прочитала тред обсуждения (зашла посмотреть, что пишут).
     THREAD_READ = "thread_read"
+    #: Эфи довела свой проект до репозитория и выложила его
+    #: (efi.dev.reporter.DevReporter). Не «внешний контакт» в узком смысле,
+    #: но по природе то же самое: сделанное во внешнем мире, о чём она потом
+    #: может сослаться в разговоре («я эту штуку сама писала»). Домен H —
+    #: как и у остального прожитого опыта.
+    DEV_RELEASE = "dev_release"
     #: Эфи полезла в интернет прямо по ходу разговора (web_search).
     #: Раньше этот опыт не сохранялся НИГДЕ: результаты поиска приходят
     #: модели TOOL-сообщением, а в таблицу `messages` пишутся только реплика
@@ -82,6 +88,7 @@ _DIARY_TEMPLATES: dict[SocialInteractionKind, str] = {
     SocialInteractionKind.STRANGER_DM: "Мне в ЛС писал {who}: «{text}»",
     SocialInteractionKind.THREAD_READ: "Читала обсуждение {where}. Там: «{text}»",
     SocialInteractionKind.WEB_LOOKUP: "Полезла гуглить и вычитала: «{text}»",
+    SocialInteractionKind.DEV_RELEASE: "Дописала и выложила свой проект: {text}",
 }
 
 TAG_PUBLIC_COMMENT = "#public_comment"

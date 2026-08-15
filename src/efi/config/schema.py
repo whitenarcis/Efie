@@ -862,6 +862,93 @@ class CommunitySettings(BaseModel):
         return self
 
 
+class DevSettings(BaseModel):
+    """
+    Цифровое ремесло Эфи (efi/dev/): собственные проекты, кодогенерация через
+    Qwen Coder и публикация на GitHub.
+
+    ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ, и это не осторожность ради осторожности:
+    подсистема создаёт публичные репозитории от имени владельца токена и
+    пушит туда код, написанный языковой моделью. Такое не включают молча
+    обновлением версии — только явным решением.
+
+    Ключ кодера отдельно можно не задавать: если `coder` не заполнен, он
+    собирается из уже настроенного ключа Groq (тот же приём, что у
+    SttSettings — см. Settings.resolve_coder_endpoint).
+
+    Без `github_token` подсистема работает в локальном режиме: проекты
+    пишутся, проверяются и коммитятся на диск, но никуда не уезжают. Режим
+    рабочий — по нему удобно посмотреть, что она вообще генерирует, прежде
+    чем давать ей доступ к своему GitHub.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=False, description="Полностью включает подсистему разработки")
+    coder: EndpointConfig | None = Field(
+        default=None,
+        description=(
+            "Эндпоинт кодера (Qwen Coder через Groq). Не задан — берётся ключ Groq из llm_roles и "
+            "модель coder_model, см. Settings.resolve_coder_endpoint()"
+        ),
+    )
+    coder_model: str = Field(
+        default="qwen-2.5-coder-32b",
+        description="Модель кодера, когда эндпоинт собирается автоматически из ключа Groq",
+    )
+    coder_base_url: str = Field(
+        default="https://api.groq.com/openai/v1", description="База API кодера при автосборке эндпоинта"
+    )
+    coder_timeout_seconds: float = Field(
+        default=90.0, gt=0.0,
+        description="Таймаут одного запроса к кодеру: файл целиком генерируется дольше реплики в чате",
+    )
+
+    check_interval_seconds: float = Field(
+        default=3600.0, gt=0.0, description="Как часто фоновый воркер смотрит, есть ли работа"
+    )
+    self_initiated_probability: float = Field(
+        default=0.25, ge=0.0, le=1.0,
+        description="Вероятность затеять СВОЙ проект, когда очередь пуста (0 — только совместные)",
+    )
+    max_fix_iterations: int = Field(
+        default=3, ge=0, le=10,
+        description="Сколько раз возвращать файл кодеру с замечаниями песочницы, прежде чем сдаться",
+    )
+    progress_probability: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Вероятность рассказать в чате об очередном этапе работы (не чаще раза в час)",
+    )
+    lint_generated_code: bool = Field(
+        default=True, description="Гонять ruff по сгенерированному коду (если он установлен в системе)"
+    )
+
+    github_token: SecretStr | None = Field(
+        default=None,
+        description="Personal access token с правом repo. Не задан — проекты остаются локальными",
+    )
+    github_owner: str = Field(
+        default="", description="Логин владельца токена; нужен только для повторного взятия существующего репозитория"
+    )
+    github_ssh_key_path: Path | None = Field(
+        default=None,
+        description=(
+            "Приватный SSH-ключ для пуша. Не задан — git возьмёт ключ по умолчанию из ~/.ssh, что в "
+            "общем окружении может оказаться ключом владельца, а не Эфи"
+        ),
+    )
+    repo_private: bool = Field(
+        default=False, description="Создавать репозитории приватными (по умолчанию — публичные: их и показывают)"
+    )
+    push_enabled: bool = Field(default=True, description="Выключает пуш, оставляя локальные репозитории")
+    workspace_dir_name: str = Field(
+        default="projects", description="Каталог с проектами внутри data_dir"
+    )
+
+    def workspace_dir(self, paths: PathsSettings) -> Path:
+        return paths.data_dir / self.workspace_dir_name
+
+
 class QuietHoursSettings(BaseModel):
     """
     Ночные "тихие часы" для проактивных путей (efi.behavior.spontaneous_ping,
@@ -1049,6 +1136,7 @@ class Settings(BaseSettings):
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
     quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
     community: CommunitySettings = Field(default_factory=CommunitySettings)
+    dev: DevSettings = Field(default_factory=DevSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
 
     @classmethod
@@ -1158,6 +1246,31 @@ class Settings(BaseSettings):
                     return endpoint.api_key
         return None
 
+    def resolve_coder_endpoint(self) -> EndpointConfig | None:
+        """
+        Эндпоинт кодера для efi.dev.qwen_client.QwenCoderClient.
+
+        Приоритет тот же, что у ключа Groq для STT: явная секция `dev.coder`,
+        иначе — сборка из уже настроенного ключа Groq и `dev.coder_model`.
+        Дублировать один и тот же секрет в конфиге дважды не нужно.
+
+        None означает «кодер не настроен»: без него подсистема разработки
+        бессмысленна, и приложение просто её не поднимает (см. efi/app.py) —
+        это не ошибка конфигурации, а выключенная возможность.
+        """
+        if self.dev.coder is not None:
+            return self.dev.coder
+
+        api_key = self.resolve_groq_api_key()
+        if api_key is None:
+            return None
+        return EndpointConfig(
+            base_url=self.dev.coder_base_url,
+            api_key=api_key,
+            model=self.dev.coder_model,
+            timeout_seconds=self.dev.coder_timeout_seconds,
+        )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -1199,6 +1312,7 @@ __all__ = [
     "LifeEngineSettings",
     "BusyEngineSettings",
     "CommunitySettings",
+    "DevSettings",
     "QuietHoursSettings",
     "DashboardSettings",
     "Settings",

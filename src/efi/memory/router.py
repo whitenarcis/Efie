@@ -235,6 +235,12 @@ _PROACTIVE_TYPES = frozenset(
         NotificationType.SILENCE_PING,
         NotificationType.FOLLOW_UP,
         NotificationType.NIGHTLY_TASK,
+        # Рассказ о своей работе над проектом. Технических слов в поводе
+        # много («линтер», «async», имена файлов), и без этой строчки
+        # маршрутизатор увёл бы выборку в домен знаний о мире — то есть
+        # подмешал бы к «я тут дописала утилиту» справку про asyncio вместо
+        # памяти о том, с кем она про эту утилиту говорила.
+        NotificationType.DEV_UPDATE,
     }
 )
 

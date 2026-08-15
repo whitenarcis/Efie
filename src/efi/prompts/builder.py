@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from efi.behavior.affinity import (
@@ -61,7 +61,11 @@ from efi.behavior.affinity import (
     AffinityTracker,
 )
 from efi.behavior.ambiguity import PendingClarification, PendingClarifications
+from efi.behavior.collab_coding import CollabCodingDesk, Proposal
 from efi.config.schema import LockdownMode, Settings
+from efi.dev.schemas import DevTask
+from efi.dev.showcase import pick_showcase
+from efi.dev.store import DevTaskStore
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
 from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
 from efi.memory.dedup import KnowledgeStore, StoredFact, render_facts_block
@@ -201,6 +205,22 @@ class _SafeFormatDict(dict[str, str]):
         return "{" + key + "}"
 
 
+#: Типы уведомлений, при которых имеет смысл поднимать выложенные проекты:
+#: живой разговор (могут спросить) и публичное выступление (может оказаться
+#: в тему). Для пинга по таймеру портфолио не нужно.
+_RELEASE_AWARE_TYPES = frozenset(
+    {NotificationType.USER_MESSAGE, NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY}
+)
+
+
+@dataclass(slots=True, frozen=True)
+class _DevContext:
+    """Состояние ремесла на момент сборки промпта: что в работе и что уже выложено."""
+
+    active: list[DevTask] = field(default_factory=list)
+    releases: list[DevTask] = field(default_factory=list)
+
+
 @dataclass(slots=True, frozen=True)
 class RecentContact:
     """Один недавний собеседник — то, что Эфи должна помнить про свой день."""
@@ -239,6 +259,8 @@ class EfiSystemPromptBuilder:
         people: PeopleStore | None = None,
         knowledge: KnowledgeStore | None = None,
         clarifications: PendingClarifications | None = None,
+        dev_store: DevTaskStore | None = None,
+        collab: CollabCodingDesk | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -253,6 +275,11 @@ class EfiSystemPromptBuilder:
         #: или Феникс-проект?» должен прозвучать в её обычной реплике, а не
         #: прилететь роботизированным уведомлением посреди разговора.
         self._clarifications = clarifications
+        #: Своё ремесло (efi/dev/). Оба источника необязательны: при
+        #: выключенной подсистеме разработки блоков про код в промпте просто
+        #: нет — не пустые заглушки, а именно нет.
+        self._dev_store = dev_store
+        self._collab = collab
         #: Без состояния — один на билдер, см. efi/memory/router.py.
         self._memory_router = MemoryRouter()
 
@@ -284,6 +311,7 @@ class EfiSystemPromptBuilder:
         affinity_task = self._resolve_affinity_snapshot(notification)
         person_task = self._resolve_person_profile(notification)
         contacts_task = self._resolve_other_contacts(notification, now=local_now(self._settings.timezone))
+        dev_task = self._resolve_dev_context(notification)
 
         # Вложенный gather, а не один на семь задач: у asyncio.gather
         # перегрузки с точными типами заканчиваются на шести аргументах, и
@@ -296,7 +324,7 @@ class EfiSystemPromptBuilder:
             relevant_beliefs,
             affinity_snapshot,
             person_profile,
-        ), known_facts, other_contacts = await asyncio.gather(
+        ), known_facts, other_contacts, dev_context = await asyncio.gather(
             asyncio.gather(
                 personality_task,
                 rag_task,
@@ -307,6 +335,7 @@ class EfiSystemPromptBuilder:
             ),
             knowledge_task,
             contacts_task,
+            dev_task,
         )
 
         now = local_now(self._settings.timezone)
@@ -323,6 +352,10 @@ class EfiSystemPromptBuilder:
             _build_person_block(person_profile),
             _build_other_contacts_block(other_contacts),
             _build_public_comment_block(notification),
+            _build_dev_status_block(dev_context.active),
+            _build_collab_block(self._collab.pending(notification.chat_id) if self._collab else None),
+            _build_dev_update_block(notification),
+            _build_dev_showcase_block(notification, dev_context.releases),
             _build_stranger_block(
                 self._is_secondary_user(notification),
                 resolve_chat_kind(
@@ -387,6 +420,31 @@ class EfiSystemPromptBuilder:
             # чтения не должен срывать генерацию (тот же принцип, что у RAG).
             logger.warning("prompts: не удалось прочитать проверенные факты", exc_info=True)
             return []
+
+    async def _resolve_dev_context(self, notification: Notification) -> _DevContext:
+        """
+        Чем Эфи занята в коде и что уже выложила.
+
+        Выложенные проекты поднимаются только там, где они могут
+        понадобиться: в личном разговоре (её могут спросить) и в публичном
+        выступлении (может оказаться в тему — см. efi/dev/showcase.py).
+        Тянуть их на каждый служебный повод незачем.
+        """
+        if self._dev_store is None:
+            return _DevContext()
+        try:
+            active = await self._dev_store.active()
+            releases = (
+                await self._dev_store.recent_releases()
+                if notification.type in _RELEASE_AWARE_TYPES
+                else []
+            )
+        except Exception:
+            # Ремесло — не условие ответа: сбой чтения не должен срывать
+            # генерацию (тот же принцип, что у RAG и фактов).
+            logger.warning("prompts: не удалось прочитать задачи разработки", exc_info=True)
+            return _DevContext()
+        return _DevContext(active=active, releases=releases)
 
     async def _resolve_other_contacts(
         self, notification: Notification, *, now: datetime
@@ -664,6 +722,112 @@ def _build_other_contacts_block(contacts: list[RecentContact]) -> str:
         "Отвечать «я ни с кем не переписывалась», когда переписывалась, — прямое враньё, "
         "а не тактичность. Подробности чужих разговоров пересказывать не обязана, но сам "
         "факт общения отрицать нельзя."
+    )
+
+
+def _build_dev_status_block(active: list[DevTask]) -> str:
+    """
+    Чем Эфи занята в коде прямо сейчас.
+
+    Блок нужен не для отчётности, а для честности: пока задача идёт в фоне,
+    на вопрос «чем занимаешься?» модель без этих строк отвечает выдумкой —
+    и выдумка живёт ровно до момента, когда проект реально появится на
+    GitHub с другим названием.
+    """
+    if not active:
+        return ""
+    lines = "\n".join(f"  - {task.render_for_prompt()}" for task in active)
+    return (
+        f"[Твоё ремесло: что в работе]\n{lines}\n"
+        "Это правда: код пишется в фоне прямо сейчас. Спросят — расскажи как есть, своими словами. "
+        "Не выдумывай подробностей, которых тут нет (готовность в процентах, названия функций, сроки), "
+        "и не отчитывайся о статусе по своей инициативе — ты работаешь, а не ведёшь дневник задач."
+    )
+
+
+def _build_collab_block(proposal: Proposal | None) -> str:
+    """
+    Совместное проектирование: человек предложил вместе что-то написать.
+
+    Задача блока — не дать согласиться в ту же реплику. Модель на «давай
+    напишем X» отвечает «отличная идея, приступаю» с вероятностью,
+    близкой к единице, и разговор о том, ЧТО именно писать, не случается
+    никогда. Поэтому здесь прямо перечислено, о чём спросить, — и сказано,
+    что отговорить тоже нормальный исход.
+
+    Технически запуск всё равно закрыт: инструмент start_dev_project модели
+    не показывается, пока обсуждение не состоялось (см.
+    efi/behavior/collab_coding.py и efi/tools/dev_tools/start_project.py).
+    Блок объясняет, ЗАЧЕМ так, — иначе модель просто ищет обходной путь.
+    """
+    if proposal is None:
+        return ""
+
+    if not proposal.is_discussed:
+        return (
+            f"[Предложение проекта] Собеседник предлагает: «{sanitize_text(proposal.idea)}»\n"
+            "НЕ соглашайся с ходу и не обещай «сейчас всё сделаю». Сначала разберитесь по существу: "
+            "какую конкретную проблему это решает и кому; на чём писать и почему именно так; что тут "
+            "самое сложное и где всё развалится; что в первую версию НЕ войдёт.\n"
+            "Спрашивай как человек, который будет это делать сам, — коротко и по делу, одна-две мысли "
+            "за реплику, а не анкета из десяти пунктов. Если затея кажется тебе бессмысленной или "
+            "неподъёмной, так и скажи: отговорить — тоже нормальный итог разговора.\n"
+            "Браться за работу прямо сейчас нельзя: сначала договоритесь."
+        )
+
+    return (
+        f"[Предложение проекта] Вы обсуждаете: «{sanitize_text(proposal.render_idea())}»\n"
+        "Если по существу договорились — бери в работу инструментом start_dev_project и сформулируй "
+        "замысел своими словами (что за штука, на чём, что не делаем). Если остались непонятки — "
+        "дообсудите, спешить некуда."
+    )
+
+
+def _build_dev_update_block(notification: Notification) -> str:
+    """
+    Тон реплики о ходе работы. Отдельный блок, а не общий «пиши первой»
+    (_build_proactive_brevity_block), потому что правила прямо
+    противоположны: там запрещено острить про технику, здесь ирония над
+    собственным кодом — ровно то, что делает эти сообщения живыми.
+
+    Повод (что именно случилось) приходит в самом уведомлении из
+    efi/dev/reporter.py; здесь — только как об этом говорить.
+    """
+    if notification.type is not NotificationType.DEV_UPDATE:
+        return ""
+    return (
+        "[Ты рассказываешь про свой код] Это не отчёт и не анонс релиза, а реплика в переписке про "
+        "то, чем ты сейчас занята. Коротко, своими словами, можно с матом и самоиронией — так и "
+        "говорят про свой код те, кто его пишет.\n"
+        "ЗАПРЕЩЕНО: маркированные списки, заголовки, «статус», «прогресс», проценты готовности, "
+        "эмодзи-галочки, «дайте знать, если есть вопросы» и любые формулировки из корпоративного "
+        "чата. Не проси обратной связи и не спрашивай разрешения продолжать."
+    )
+
+
+def _build_dev_showcase_block(notification: Notification, releases: list[DevTask]) -> str:
+    """
+    Внешний флекс: упомянуть свою наработку там, где она реально в тему.
+
+    Порог совпадения высокий и считается по словам самого проекта (см.
+    efi/dev/showcase.py). Формулировка блока намеренно разрешающая, а не
+    предписывающая: «можешь упомянуть, если в тему» — потому что
+    предписание «упомяни» превращает участие в сообществе в раздачу ссылок,
+    а это ровно то поведение, за которое из сообществ выгоняют.
+    """
+    if not releases or notification.type not in _RELEASE_AWARE_TYPES:
+        return ""
+
+    task = pick_showcase(notification.message, releases)
+    if task is None or task.spec is None:
+        return ""
+
+    return (
+        f"[Твоя наработка по теме] Ты писала ровно про это: {task.spec.render_for_prompt()} "
+        f"— {task.repo_url}\n"
+        "Если это правда к месту в разговоре — можешь сослаться, одной фразой и без рекламы: «я такое "
+        "себе писала, вот». Если разговор не про это — не упоминай вовсе. Навязывать свою ссылку хуже, "
+        "чем промолчать."
     )
 
 

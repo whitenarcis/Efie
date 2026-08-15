@@ -40,6 +40,11 @@ class NotificationType(StrEnum):
     PUBLIC_COMMENT = "public_comment"
     #: Включение в чужую ветку обсуждения (RandomCommentEngager).
     THREAD_REPLY = "thread_reply"
+    #: Ход работы над проектом: короткая реплика о процессе или готовый
+    #: релиз со ссылкой (efi.dev.reporter.DevReporter). Не «инициатива из
+    #: воздуха», как спонтанный пинг: повод конкретный — она правда только
+    #: что это сделала.
+    DEV_UPDATE = "dev_update"
 
 
 class Notification(BaseModel):

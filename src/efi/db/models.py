@@ -135,6 +135,22 @@ CREATE TABLE IF NOT EXISTS conversation_state (
 );
 """
 
+_DEV_TASKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS dev_tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER,                          -- куда рассказывать о ходе работы; NULL — некому
+    idea        TEXT NOT NULL,                    -- замысел словами, как он был сформулирован
+    is_collab   INTEGER NOT NULL DEFAULT 0,       -- 1 = проект заказал человек, 0 = своя затея
+    status      TEXT NOT NULL DEFAULT 'pending',  -- значение efi.dev.schemas.DevTaskStatus
+    spec        TEXT NOT NULL DEFAULT '',         -- JSON ProjectSpec; пусто, пока не спроектировано
+    repo_url    TEXT NOT NULL DEFAULT '',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dev_tasks_status ON dev_tasks (status, created_at);
+"""
+
 _CHAT_DIRECTORY_SCHEMA = """
 CREATE TABLE IF NOT EXISTS chat_directory (
     chat_id     INTEGER PRIMARY KEY,
@@ -285,6 +301,17 @@ async def _migration_014_chat_directory(conn: aiosqlite.Connection) -> None:
     await conn.executescript(_CHAT_DIRECTORY_SCHEMA)
 
 
+async def _migration_015_dev_tasks(conn: aiosqlite.Connection) -> None:
+    """
+    Очередь задач разработки (см. efi/dev/store.py).
+
+    Отдельная таблица, а не `proactive_tasks`: у той жизненный цикл «сработать
+    в назначенный момент», а здесь — конвейер от замысла до запушенного
+    репозитория, со своим статусом и спекой проекта.
+    """
+    await conn.executescript(_DEV_TASKS_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -301,6 +328,7 @@ MIGRATIONS = [
     _migration_012_memory_domains,
     _migration_013_conversation_turns,
     _migration_014_chat_directory,
+    _migration_015_dev_tasks,
 ]
 
 __all__ = ["MIGRATIONS"]

@@ -26,7 +26,8 @@ from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
 from efi.behavior.ambiguity import PendingClarifications
-from efi.behavior.busy_engine import BusyEngine
+from efi.behavior.busy_engine import AnyBusyState, BusyEngine
+from efi.behavior.collab_coding import CollabCodingDesk
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
 from efi.behavior.initiative import InitiativeGate
@@ -47,6 +48,13 @@ from efi.db.chat_directory import ChatDirectory
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
+from efi.dev.engine import DevEngine
+from efi.dev.github_sync import GitHubSync
+from efi.dev.qwen_client import QwenCoderClient
+from efi.dev.reporter import DevReporter
+from efi.dev.sandbox import CodeSandbox
+from efi.dev.store import DevTaskStore
+from efi.dev.worker import DevWorker
 from efi.humanizer.anti_repeat import AntiRepeatTracker
 from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
@@ -84,6 +92,8 @@ from efi.tools.base import Tool
 from efi.tools.chat_management.join_chat import JoinChatTool
 from efi.tools.chat_management.leave_chat import LeaveChatTool
 from efi.tools.chat_management.search_chats import SearchChatsTool
+from efi.tools.dev_tools.project_status import DevProjectStatusTool
+from efi.tools.dev_tools.start_project import StartDevProjectTool
 from efi.tools.memory_tools.ask_diary import AskDiaryTool
 from efi.tools.memory_tools.manage_belief import UpdateBeliefTool
 from efi.tools.memory_tools.manage_promises import CompletePromiseTool, RememberPromiseTool
@@ -187,6 +197,13 @@ class EfiApp:
         # входящих сообщений, читается проактивным путём — единственным, у
         # которого своего Pyrogram-объекта чата нет (см. efi/db/chat_directory.py).
         self._chat_directory = ChatDirectory(self._database)
+        # -- ремесло: свои проекты, код, GitHub ------------------------------
+        # Хранилище задач и стол переговоров поднимаются ВСЕГДА, даже при
+        # выключенной подсистеме: они дёшевы (таблица и словарь в памяти) и
+        # нужны промпту с инструментами, чтобы Эфи знала, что у неё есть и
+        # чего нет. Сам конвейер собирается ниже и только при dev.enabled.
+        self._dev_store = DevTaskStore(self._database)
+        self._collab_desk = CollabCodingDesk(self._dev_store)
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются
         # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
@@ -263,6 +280,11 @@ class EfiApp:
         # -- промпты -----------------------------------------------------
         templates_dir = settings.paths.base_dir / "efi" / "prompts" / "templates"
         self._prompt_loader = PromptLoader(templates_dir)
+        # Чем Эфи интересуется — worldview.json плюс семена любопытства из
+        # разговоров. Нужны и участию в сообществе (efi/telegram/comments.py),
+        # и замыслам собственных проектов (efi/dev/worker.py), поэтому
+        # конструируются здесь, до обоих потребителей.
+        self._community_interests = build_community_interests(self._database, templates_dir / "worldview.json")
         self._prompt_builder = EfiSystemPromptBuilder(
             self._prompt_loader,
             settings,
@@ -273,6 +295,12 @@ class EfiApp:
             self._people,
             knowledge=self._knowledge,
             clarifications=self._pending_clarifications,
+            # Своё ремесло в промпте: чем занята в коде и что уже выложила
+            # (см. efi/prompts/builder.py, блоки «Твоё ремесло» и «Предложение
+            # проекта»). Передаются всегда — блоки просто пусты, пока нечего
+            # рассказывать.
+            dev_store=self._dev_store,
+            collab=self._collab_desk,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -334,10 +362,20 @@ class EfiApp:
             self._organic_ping,
             check_interval_seconds=settings.life_engine.check_interval_seconds,
         )
+        # Конвейер разработки: кодер, песочница, GitHub и фоновый воркер.
+        # Собирается только при dev.enabled и настроенном кодере, поэтому
+        # может быть None — см. _build_dev_worker.
+        self._dev_worker = self._build_dev_worker()
+
         self._busy_engine = BusyEngine(
             self._working_memory,
             self._affinity,
-            self._life_engine,
+            # Занята она не только исследованием: пока пишется проект, «не
+            # сразу увидела сообщение» — правда, а не симуляция.
+            AnyBusyState(
+                lambda: self._life_engine.is_researching,
+                lambda: self._dev_worker is not None and self._dev_worker.is_coding,
+            ),
             settings.busy_engine,
             last_message_source=self._history,
         )
@@ -363,7 +401,6 @@ class EfiApp:
         self._typing_tracker = TypingTracker(ttl_seconds=settings.humanizer.debounce_typing_ttl_seconds)
         # -- участие в сообществе (комментарии/треды) ------------------------
         self._thread_state = ThreadStateStore(self._database)
-        self._community_interests = build_community_interests(self._database, templates_dir / "worldview.json")
         self._channel_post_watcher = ChannelPostWatcher(
             self._notification_manager,
             settings.telegram,
@@ -395,6 +432,7 @@ class EfiApp:
             organic_ping_recorder=self._organic_ping,
             people_recorder=self._people,
             chat_recorder=self._chat_directory,
+            collab_recorder=self._collab_desk,
             stt=self._stt,
             orchestrator=self._orchestrator,
         )
@@ -437,6 +475,80 @@ class EfiApp:
                 settings.dashboard,
             )
 
+    def _build_dev_worker(self) -> DevWorker | None:
+        """
+        Собирает конвейер разработки — или честно возвращает None.
+
+        Две причины не собирать, и обе не ошибки: подсистема выключена
+        (`dev.enabled = false`, дефолт) или не настроен кодер — ключа Groq
+        нет ни явно, ни в llm_roles. Во втором случае об этом говорится в
+        логе: конфиг с `enabled = true` и без ключа — это намерение, которое
+        молча не сработало бы, а такое всегда должно быть слышно.
+
+        GitHub-токена может не быть и при рабочей подсистеме: тогда проекты
+        пишутся и коммитятся локально (см. efi/dev/github_sync.py).
+        """
+        dev_settings = self._settings.dev
+        if not dev_settings.enabled:
+            return None
+
+        coder_endpoint = self._settings.resolve_coder_endpoint()
+        if coder_endpoint is None:
+            logger.warning(
+                "app: dev.enabled = true, но кодер не настроен — нет ни dev.coder, ни ключа Groq "
+                "в llm_roles. Разработка не поднимется"
+            )
+            return None
+
+        workspace = dev_settings.workspace_dir(self._settings.paths)
+        workspace.mkdir(parents=True, exist_ok=True)
+        token = dev_settings.github_token.get_secret_value() if dev_settings.github_token else ""
+
+        engine = DevEngine(
+            self._llm_router,
+            QwenCoderClient(coder_endpoint),
+            CodeSandbox(enable_linter=dev_settings.lint_generated_code),
+            # Замысел придумывает фоновая роль, а не MAIN: никто не ждёт
+            # этого ответа в чате, и занимать им канал живого диалога нельзя
+            # (регламент ролей — см. efi.config.schema.TaskRole).
+            design_role=TaskRole.BACKGROUND,
+            max_fix_iterations=dev_settings.max_fix_iterations,
+        )
+        github = GitHubSync(
+            workspace,
+            token=token,
+            owner=dev_settings.github_owner,
+            ssh_key_path=dev_settings.github_ssh_key_path,
+            private=dev_settings.repo_private,
+            push_enabled=dev_settings.push_enabled,
+        )
+        reporter = DevReporter(
+            self._notification_manager,
+            social_memory=self._social_memory,
+            quiet_hours=self._settings.quiet_hours,
+            timezone=self._settings.timezone,
+            initiative=self._initiative,
+            progress_probability=dev_settings.progress_probability,
+        )
+        logger.info(
+            "app: разработка включена (кодер %s, %s)",
+            coder_endpoint.model,
+            "с пушем на GitHub" if github.can_publish else "локально, без пуша",
+        )
+        return DevWorker(
+            self._dev_store,
+            engine,
+            github,
+            reporter,
+            interests=self._community_interests,
+            # Своя затея рассказывается владельцу: чат для неё выбирается
+            # здесь, а не воркером, — это единственное место, которое знает
+            # про owner_id.
+            owner_chat_id=self._settings.telegram.owner_id,
+            check_interval_seconds=dev_settings.check_interval_seconds,
+            self_initiated_probability=dev_settings.self_initiated_probability,
+        )
+
     def _build_tools(self) -> list[Tool]:
         return [
             AskDiaryTool(self._rag, min_relatedness=self._settings.memory.min_relatedness),
@@ -466,6 +578,8 @@ class EfiApp:
             JoinChatTool(self._telegram_client, enabled=self._settings.telegram.can_join_chats),
             LeaveChatTool(self._telegram_client, enabled=self._settings.telegram.can_leave_chats),
             SearchChatsTool(self._telegram_client),
+            StartDevProjectTool(self._collab_desk),
+            DevProjectStatusTool(self._dev_store),
             self._web_search_tool,
             self._weather_tool,
             GetBatteryStatusTool(),
@@ -580,6 +694,12 @@ class EfiApp:
                 self._spawn_supervised(lambda: self._reminder_scheduler.run(), name="reminders"),
             ]
         )
+
+        if self._dev_worker is not None:
+            dev_worker = self._dev_worker
+            self._background_tasks.append(
+                self._spawn_supervised(lambda: dev_worker.run(), name="dev_worker")
+            )
 
         if self._settings.memory_pulse.enabled:
             self._background_tasks.append(self._spawn_supervised(lambda: self._memory_pulse.run(), name="memory_pulse"))
