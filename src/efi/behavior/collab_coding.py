@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -108,11 +109,42 @@ class CollabCodingDesk:
     (efi/dev/).
     """
 
-    def __init__(self, store: DevTaskStore) -> None:
+    def __init__(
+        self,
+        store: DevTaskStore,
+        *,
+        pipeline_available: bool = True,
+        on_task_created: Callable[[], None] | None = None,
+    ) -> None:
         self._store = store
+        #: Поднят ли конвейер разработки (dev.enabled и настроенный кодер).
+        #: Обсуждать замысел можно и без него — это разговор, а не работа, —
+        #: но БРАТЬСЯ нельзя: задача легла бы в очередь, которую никто не
+        #: разбирает, а Эфи сказала бы «взялась». Обещание, которое некому
+        #: выполнить, хуже честного «не могу»: человек ждёт результата.
+        self._pipeline_available = pipeline_available
+        #: Чем разбудить фоновый цикл, когда задача появилась. Без него между
+        #: «договорились» и первым запросом к кодеру проходит до часа, и по
+        #: чату невозможно понять, взялась она или поддакнула.
+        self._on_task_created = on_task_created
         self._proposals: BoundedDict[int, Proposal] = BoundedDict(
             max_entries=_MAX_TRACKED_CHATS, ttl=_PROPOSAL_TTL_SECONDS
         )
+
+    @property
+    def pipeline_available(self) -> bool:
+        return self._pipeline_available
+
+    def attach_pipeline(self, *, available: bool, on_task_created: Callable[[], None] | None = None) -> None:
+        """
+        Поздняя привязка конвейера — как `SilenceMonitor.set_reasons`, и по
+        той же причине: стол переговоров нужен промпту и инструментам раньше,
+        чем в сборке появляется фоновый воркер (efi/app.py), а тащить
+        половину сборки вверх ради одного флага значило бы перетасовать
+        порядок конструирования всего приложения.
+        """
+        self._pipeline_available = available
+        self._on_task_created = on_task_created
 
     async def consider_message(self, chat_id: int | None, text: str) -> None:
         """
@@ -154,6 +186,8 @@ class CollabCodingDesk:
         Можно ли уже браться за работу. Ровно это и запрещает соглашаться
         слепо: пока обсуждение не состоялось, ответ — нет.
         """
+        if not self._pipeline_available:
+            return False
         proposal = self.pending(chat_id)
         return proposal is not None and proposal.is_discussed
 
@@ -165,14 +199,18 @@ class CollabCodingDesk:
         точнее исходной реплики человека: там уже учтён стек и всё, о чём
         договорились). Пусто — берём накопленное обсуждением.
         """
+        if not self.may_start(chat_id):
+            return None
         proposal = self.pending(chat_id)
-        if proposal is None or not proposal.is_discussed:
+        if proposal is None:  # pragma: no cover — may_start уже это проверил
             return None
 
         final_idea = idea.strip() or proposal.render_idea()
         task = await self._store.create(final_idea, chat_id=chat_id, is_collab=True)
         self._proposals.pop(chat_id, None)
         logger.info("collab: задача #%s из обсуждения в chat_id=%s", task.id, chat_id)
+        if self._on_task_created is not None:
+            self._on_task_created()
         return task
 
     def drop(self, chat_id: int) -> None:

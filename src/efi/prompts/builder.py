@@ -103,12 +103,19 @@ _PERSONALITY_TEMPLATE_NAME = "personality"
 #: Поднимаем с запасом, потому что часть отсеется по давности и по тому, что
 #: это сам спрашивающий; показываем немного — это ответ на вопрос «с кем ты
 #: общалась», а не выгрузка адресной книги.
-_OTHER_CONTACTS_LOOKUP = 12
-_OTHER_CONTACTS_SHOWN = 5
+_OTHER_CONTACTS_LOOKUP = 20
+_OTHER_CONTACTS_SHOWN = 8
 
-#: За какой срок общение ещё считается «недавним». Сутки: на вопрос «ты
-#: сегодня с кем-то переписывалась?» ответ про позавчера — уже не ответ.
-_OTHER_CONTACTS_WINDOW = timedelta(days=1)
+#: За какой срок общение ещё считается «недавним».
+#:
+#: Раньше здесь стояли сутки — с рассуждением «на вопрос про сегодня ответ
+#: про позавчера уже не ответ». Рассуждение верное, вывод неверный: у
+#: человека спрашивают не только «сегодня». Через два дня Эфи отвечала «ни с
+#: кем не переписывалась» про разговор, который прекрасно помнит дневник, —
+#: то есть врала, потому что источник правды до неё просто не доезжал.
+#: Неделя плюс явная дата у каждой строчки (см. RecentContact.render) решает
+#: обе задачи разом: «сегодня» видно по дате, а позавчерашнее не исчезает.
+_OTHER_CONTACTS_WINDOW = timedelta(days=7)
 
 _MOOD_DESCRIPTIONS: dict[str, str] = {
     "skeptical_focused": (
@@ -353,7 +360,10 @@ class EfiSystemPromptBuilder:
             _build_other_contacts_block(other_contacts),
             _build_public_comment_block(notification),
             _build_dev_status_block(dev_context.active),
-            _build_collab_block(self._collab.pending(notification.chat_id) if self._collab else None),
+            _build_collab_block(
+                self._collab.pending(notification.chat_id) if self._collab else None,
+                pipeline_available=self._collab.pipeline_available if self._collab else False,
+            ),
             _build_dev_update_block(notification),
             _build_dev_showcase_block(notification, dev_context.releases),
             _build_stranger_block(
@@ -716,9 +726,11 @@ def _build_other_contacts_block(contacts: list[RecentContact]) -> str:
         return ""
     lines = [contact.render() for contact in contacts]
     return (
-        "[С кем ты ещё общалась]\n"
+        "[С кем ты ещё общалась за последнюю неделю]\n"
         + "\n".join(f"  - {line}" for line in lines)
-        + "\nЭто правда, и скрывать её не надо: спросят — расскажи как есть. "
+        + "\nУ каждой строчки указано, КОГДА это было: «вчера», «в среду» — отвечай по дате, а не "
+        "вали всё в «сегодня». "
+        "Это правда, и скрывать её не надо: спросят — расскажи как есть. "
         "Отвечать «я ни с кем не переписывалась», когда переписывалась, — прямое враньё, "
         "а не тактичность. Подробности чужих разговоров пересказывать не обязана, но сам "
         "факт общения отрицать нельзя."
@@ -745,7 +757,7 @@ def _build_dev_status_block(active: list[DevTask]) -> str:
     )
 
 
-def _build_collab_block(proposal: Proposal | None) -> str:
+def _build_collab_block(proposal: Proposal | None, *, pipeline_available: bool = True) -> str:
     """
     Совместное проектирование: человек предложил вместе что-то написать.
 
@@ -762,6 +774,21 @@ def _build_collab_block(proposal: Proposal | None) -> str:
     """
     if proposal is None:
         return ""
+
+    if not pipeline_available:
+        # Конвейер выключен: обсудить замысел можно (это разговор, а не
+        # работа), а вот пообещать сделать — нельзя. Обещание, которое некому
+        # выполнить, читается как согласие и молча не выполняется — ровно то,
+        # из-за чего непонятно, взялась она или просто поддакнула.
+        return (
+            f"[Предложение проекта] Собеседник предлагает: «{sanitize_text(proposal.idea)}»\n"
+            "Обсудить это можно и нужно — как обсуждают затею с человеком, который в теме: что "
+            "решает, на чём писать, где развалится. Но ВЗЯТЬСЯ ты сейчас не можешь: у тебя не "
+            "включена работа с кодом и репозиториями.\n"
+            "Так и скажи прямо, если разговор дойдёт до «делаем»: обсудить — да, написать сейчас — "
+            "нет. НЕ обещай сделать, не говори «уже приступаю» и не выдумывай сроков: обещание, "
+            "которое некому выполнить, хуже честного отказа."
+        )
 
     if not proposal.is_discussed:
         return (

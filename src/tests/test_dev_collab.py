@@ -32,9 +32,9 @@ _CHAT_ID = 4242
 _IDEA = "давай напишем cli-клиент для отслеживания релизов в репозиториях"
 
 
-def _desk(tmp_path: Path) -> tuple[CollabCodingDesk, DevTaskStore]:
+def _desk(tmp_path: Path, *, pipeline: bool = True) -> tuple[CollabCodingDesk, DevTaskStore]:
     store = DevTaskStore(Database(tmp_path / "efi.db", migrations=MIGRATIONS))
-    return CollabCodingDesk(store), store
+    return CollabCodingDesk(store, pipeline_available=pipeline), store
 
 
 def _context(chat_id: int | None = _CHAT_ID) -> ToolContext:
@@ -172,6 +172,58 @@ async def test_second_proposal_is_ignored_while_a_project_is_running(tmp_path: P
     await desk.consider_message(_CHAT_ID, "давай напишем ещё и парсер логов")
 
     assert desk.pending(_CHAT_ID) is None
+
+
+# -- обещать может только тот, кому есть кому делать --------------------------
+
+
+async def test_without_a_pipeline_she_cannot_take_the_work(tmp_path: Path) -> None:
+    """
+    Конвейер выключен (dev.enabled = false) — обсуждать замысел можно, а
+    браться нельзя: задача легла бы в очередь, которую никто не разбирает, а
+    Эфи сказала бы «взялась». Обещание, которое некому выполнить, хуже
+    честного отказа — человек ведь ждёт результата.
+    """
+    desk, store = _desk(tmp_path, pipeline=False)
+    tool = StartDevProjectTool(desk)
+    await desk.consider_message(_CHAT_ID, _IDEA)
+    await desk.consider_message(_CHAT_ID, "на python, без зависимостей")
+
+    assert desk.may_start(_CHAT_ID) is False
+    assert tool.is_available(_context()) is False
+    assert await desk.start(_CHAT_ID) is None
+    assert await store.active() == [], "задача не заводится, раз её некому взять"
+
+
+async def test_prompt_admits_it_cannot_write_code_right_now(tmp_path: Path) -> None:
+    desk, _store = _desk(tmp_path, pipeline=False)
+    await desk.consider_message(_CHAT_ID, _IDEA)
+
+    block = _build_collab_block(desk.pending(_CHAT_ID), pipeline_available=False)
+
+    assert "ВЗЯТЬСЯ ты сейчас не можешь" in block
+    assert "НЕ обещай сделать" in block
+    assert "Обсудить это можно" in block, "разговор о замысле — не работа, его запрещать незачем"
+
+
+async def test_taking_the_work_wakes_the_background_loop(tmp_path: Path) -> None:
+    """
+    Ждать час между «беру» и первым запросом к кодеру — то же самое, что не
+    взяться: по чату не отличить работу от поддакивания.
+    """
+    store = DevTaskStore(Database(tmp_path / "efi.db", migrations=MIGRATIONS))
+    woken = 0
+
+    def wake() -> None:
+        nonlocal woken
+        woken += 1
+
+    desk = CollabCodingDesk(store, pipeline_available=True, on_task_created=wake)
+    await desk.consider_message(_CHAT_ID, _IDEA)
+    await desk.consider_message(_CHAT_ID, "на python")
+
+    assert await desk.start(_CHAT_ID) is not None
+    assert woken == 1
 
 
 # -- блок промпта -------------------------------------------------------------

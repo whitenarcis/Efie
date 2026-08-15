@@ -30,6 +30,7 @@ efi/dev/store.py): перезапуск посреди работы возвра
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
 from datetime import timedelta
@@ -98,11 +99,26 @@ class DevWorker:
         self._check_interval_seconds = check_interval_seconds
         self._self_initiated_probability = self_initiated_probability
         self._is_coding = False
+        #: Сигнал «появилась работа, не жди следующего тика». Ставится, когда
+        #: человек договорился о проекте в чате: ждать час после «ок, берусь»
+        #: — это ровно то, из-за чего непонятно, взялась она вообще или
+        #: просто поддакнула (см. request_tick).
+        self._wake = asyncio.Event()
 
     @property
     def is_coding(self) -> bool:
         """True на всё время работы над проектом — вход для efi.behavior.busy_engine.BusyEngine."""
         return self._is_coding
+
+    def request_tick(self) -> None:
+        """
+        Разбудить цикл сейчас, не дожидаясь расписания.
+
+        Вызывается, когда задача появилась не из таймера, а из разговора
+        (efi.behavior.collab_coding.CollabCodingDesk.start). Синхронный и
+        дешёвый: ставит событие, которое ждёт `run`.
+        """
+        self._wake.set()
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
@@ -112,7 +128,10 @@ class DevWorker:
             f"{self._self_initiated_probability:.0%}" if self._self_initiated_probability > 0 else "выключена",
         )
         await run_periodically(
-            self._tick, interval_seconds=self._check_interval_seconds, name="dev_worker"
+            self._tick,
+            interval_seconds=self._check_interval_seconds,
+            name="dev_worker",
+            wake_event=self._wake,
         )
 
     async def _tick(self) -> None:

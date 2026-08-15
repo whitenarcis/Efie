@@ -64,7 +64,11 @@ def test_app_assembles_with_the_craft_switched_off(tmp_path: Path) -> None:
     # Хранилище и стол переговоров есть всегда: они дёшевы, а промпту и
     # инструментам нужно знать, что проектов нет, — а не падать на None.
     assert app._dev_store is not None
-    assert "check_my_projects" in _tool_names(app)
+    assert "check_my_projects" in _tool_names(app), "на вопрос про проекты она отвечает честно и без конвейера"
+    # А вот инструмента запуска быть не должно: иначе она «возьмётся» за
+    # проект, которого некому делать, и человек будет ждать результата.
+    assert "start_dev_project" not in _tool_names(app)
+    assert app._collab_desk.pipeline_available is False
 
 
 def test_app_assembles_with_the_craft_switched_on(tmp_path: Path) -> None:
@@ -76,6 +80,7 @@ def test_app_assembles_with_the_craft_switched_on(tmp_path: Path) -> None:
     assert app._dev_worker is not None
     assert app._dev_worker.is_coding is False
     assert {"start_dev_project", "check_my_projects"} <= _tool_names(app)
+    assert app._collab_desk.pipeline_available is True
     # Рабочий каталог проектов создаётся при сборке, а не при первом пуше:
     # ошибка прав должна проявиться на старте, а не через час фоновой работы.
     assert (settings.paths.data_dir / settings.dev.workspace_dir_name).is_dir()

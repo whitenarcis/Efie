@@ -204,7 +204,11 @@ class EfiApp:
         # нужны промпту с инструментами, чтобы Эфи знала, что у неё есть и
         # чего нет. Сам конвейер собирается ниже и только при dev.enabled.
         self._dev_store = DevTaskStore(self._database)
-        self._collab_desk = CollabCodingDesk(self._dev_store)
+        # Стол переговоров нужен промпту и инструментам, которые собираются
+        # раньше фонового воркера, поэтому конвейер привязывается к нему
+        # позже (attach_pipeline), когда станет известно, есть ли кому
+        # исполнять договорённость.
+        self._collab_desk = CollabCodingDesk(self._dev_store, pipeline_available=False)
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются
         # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
@@ -367,6 +371,15 @@ class EfiApp:
         # Собирается только при dev.enabled и настроенном кодере, поэтому
         # может быть None — см. _build_dev_worker.
         self._dev_worker = self._build_dev_worker()
+        # Теперь известно, есть ли кому исполнять договорённость: без
+        # конвейера обсуждать замысел можно, а браться — нет, иначе задача
+        # легла бы в очередь, которую никто не разбирает. И тот же вызов
+        # даёт столу переговоров способ разбудить воркер сразу: ждать час
+        # после «беру» — то же самое, что не взяться.
+        self._collab_desk.attach_pipeline(
+            available=self._dev_worker is not None,
+            on_task_created=self._dev_worker.request_tick if self._dev_worker is not None else None,
+        )
 
         self._busy_engine = BusyEngine(
             self._working_memory,
@@ -599,7 +612,11 @@ class EfiApp:
             JoinChatTool(self._telegram_client, enabled=self._settings.telegram.can_join_chats),
             LeaveChatTool(self._telegram_client, enabled=self._settings.telegram.can_leave_chats),
             SearchChatsTool(self._telegram_client),
-            StartDevProjectTool(self._collab_desk),
+            # Инструмент запуска показывается модели, только когда работу
+            # реально кому делать: «взяла в работу» без конвейера — обещание,
+            # которое некому выполнить. Статус проектов доступен всегда: он
+            # честно отвечает «ничего не пишу».
+            *([StartDevProjectTool(self._collab_desk)] if self._dev_worker is not None else []),
             DevProjectStatusTool(self._dev_store),
             self._web_search_tool,
             self._weather_tool,

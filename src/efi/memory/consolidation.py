@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
@@ -130,7 +131,32 @@ _ENTRY_SPLIT_RE = re.compile(r"\n\s*-{3,}\s*\n")
 #: сохранёнными записями; здесь же, на этапе первого извлечения, экономить
 #: не на чем — потерянная на этом шаге деталь не восстановится никогда.
 _DEFAULT_NOVELIZATION_CHAR_LIMIT = 10_000
-_DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS = 2048
+
+#: Бюджет вывода на один проход новеллизации. 2048 токенов, стоявшие здесь
+#: раньше, — это примерно ОДНА подробная запись по-русски: у токенизаторов
+#: бесплатных моделей кириллица стоит в 2-3 раза дороже английского, а промпт
+#: просит несколько записей и требует подробностей. Отсюда и брались
+#: постоянные обрывы в дневнике: лимит выбирался по английским меркам, а
+#: писала модель по-русски.
+_DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS = 4096
+
+#: Сколько раз просить дописать оборванный текст. Один раз — это ещё столько
+#: же токенов сверху; два прохода закрывают любой реальный эпизод, а дальше
+#: дело не в лимите, а в том, что модель не умеет останавливаться.
+_MAX_CONTINUATION_ROUNDS = 2
+
+#: Сколько последних символов уже написанного показывать при просьбе
+#: дописать. Нужен ровно хвост: по нему модель находит место обрыва, а весь
+#: текст целиком занял бы контекст, который нужен под продолжение.
+_CONTINUATION_TAIL_CHARS = 600
+
+
+@dataclass(slots=True, frozen=True)
+class _Novelization:
+    """Ответ новеллизации: текст и признак того, что он оборван по лимиту."""
+
+    body: str
+    truncated: bool
 
 
 class HistorySource(Protocol):
@@ -474,38 +500,56 @@ class DiaryConsolidator:
             )
 
     async def _extract_memories(self, conversation_text: str) -> list[str]:
+        """
+        Воспоминания за эпизод. Если ответ упёрся в лимит — просит ДОПИСАТЬ,
+        а не обрезает.
+
+        Почему дописать. Промпт требует подробностей («потерянная деталь не
+        восстановится никогда») и нескольких записей за проход, поэтому
+        обрыв по лимиту — не исключительная ситуация, а норма на активном
+        дне. Раньше единственным лечением было отрезание хвоста по последней
+        законченной фразе: дневник наполнялся записями, обрывающимися на
+        полумысли, — ровно то, чего этот код должен был не допустить.
+        Продолжение стоит одного фонового запроса и возвращает потерянное
+        целиком.
+        """
         if not conversation_text:
             return []
 
-        params = LLMParams(
-            model="",
-            system_prompt=_NOVELIZATION_SYSTEM_PROMPT,
-            max_output_tokens=self._novelization_max_output_tokens,
-        )
-        prompt_session = Session(messages=[Message(role=Role.USER, content=conversation_text)])
-        try:
-            response = await self._router.chat(self._summarization_role, params, prompt_session)
-        except LLMError as exc:
-            logger.warning("consolidation: novelization request failed: %s", exc)
+        text = await self._novelize(conversation_text)
+        if text is None:
             return []
 
-        text = response.text.strip()
-        if not text or text.strip().upper() == _NOVELIZATION_EMPTY_MARKER:
+        rounds = 0
+        while text.truncated and rounds < _MAX_CONTINUATION_ROUNDS:
+            rounds += 1
+            logger.info(
+                "consolidation: новеллизация упёрлась в лимит (%s токенов), прошу дописать (%d/%d)",
+                self._novelization_max_output_tokens, rounds, _MAX_CONTINUATION_ROUNDS,
+            )
+            continuation = await self._novelize(conversation_text, written_so_far=text.body)
+            if continuation is None or not continuation.body:
+                break
+            text = _Novelization(body=_join_continuation(text.body, continuation.body),
+                                 truncated=continuation.truncated)
+
+        body = text.body.strip()
+        if not body or body.upper() == _NOVELIZATION_EMPTY_MARKER:
             return []
 
-        pieces = [piece.strip() for piece in _ENTRY_SPLIT_RE.split(text)]
+        pieces = [piece.strip() for piece in _ENTRY_SPLIT_RE.split(body)]
         pieces = [piece for piece in pieces if piece and piece.upper() != _NOVELIZATION_EMPTY_MARKER]
 
-        # Обрыв по лимиту бьёт только по ПОСЛЕДНЕЙ записи: всё, что стоит
-        # перед разделителем, модель успела дописать целиком. Поэтому чинится
-        # ровно хвост, а не выбрасывается весь ответ — иначе один длинный
-        # эпизод стоил бы нам всех воспоминаний за проход.
-        if pieces and response.was_truncated:
+        # Дописать не удалось (лимит держится или продолжение не пришло).
+        # Тогда — как раньше: обрыв бьёт только по ПОСЛЕДНЕЙ записи, всё
+        # перед разделителем модель успела закончить, и выбрасывать весь
+        # проход из-за хвоста нельзя.
+        if pieces and text.truncated:
             tail = salvage_truncated(pieces[-1], truncated=True)
             logger.warning(
-                "consolidation: novelization hit the output limit (%s tokens); last entry %s",
-                self._novelization_max_output_tokens,
-                "trimmed to the last complete sentence" if tail else "dropped, nothing salvageable",
+                "consolidation: дописать не вышло даже за %d подход(а); последняя запись %s",
+                _MAX_CONTINUATION_ROUNDS,
+                "обрезана по последней законченной фразе" if tail else "выброшена: спасать нечего",
             )
             if tail:
                 pieces[-1] = tail
@@ -513,6 +557,34 @@ class DiaryConsolidator:
                 pieces.pop()
 
         return pieces
+
+    async def _novelize(self, conversation_text: str, *, written_so_far: str = "") -> _Novelization | None:
+        """
+        Один запрос новеллизации. `written_so_far` непуст — значит, это
+        просьба продолжить прерванный текст с того места, где он оборвался.
+        """
+        params = LLMParams(
+            model="",
+            system_prompt=_NOVELIZATION_SYSTEM_PROMPT,
+            max_output_tokens=self._novelization_max_output_tokens,
+        )
+        content = conversation_text
+        if written_so_far:
+            content = (
+                f"{conversation_text}\n\n"
+                "--- Ты уже начала записывать этот эпизод, но текст оборвался на полуслове. "
+                "Вот его конец:\n"
+                f"{written_so_far[-_CONTINUATION_TAIL_CHARS:]}\n\n"
+                "Продолжи РОВНО с этого места и допиши до конца: не начинай заново, не повторяй "
+                "уже написанное и не здоровайся. Первый же твой символ — продолжение оборванной фразы."
+            )
+        session = Session(messages=[Message(role=Role.USER, content=content)])
+        try:
+            response = await self._router.chat(self._summarization_role, params, session)
+        except LLMError as exc:
+            logger.warning("consolidation: novelization request failed: %s", exc)
+            return None
+        return _Novelization(body=response.text.strip(), truncated=response.was_truncated)
 
     async def _summarize_via_llm(self, entries: list[DiaryEntry]) -> str | None:
         bodies = "\n\n".join(f"- {entry.body.strip()}" for entry in entries)
@@ -537,6 +609,23 @@ class DiaryConsolidator:
         return summary or None
 
 
+
+
+def _join_continuation(head: str, tail: str) -> str:
+    """
+    Склейка оборванного текста с его продолжением.
+
+    Пробел между ними ставится, только если модель не начала продолжение с
+    разделителя или знака препинания: «…он замет» + «ил раньше меня» должно
+    склеиться в слово, а не в «замет ил».
+    """
+    if not head:
+        return tail
+    if not tail:
+        return head
+    if head[-1].isspace() or tail[0].isspace() or tail[0] in ".,!?;:)»":
+        return f"{head}{tail}"
+    return f"{head} {tail}"
 
 
 def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:

@@ -57,6 +57,7 @@ async def run_periodically(
     *,
     interval_seconds: float,
     name: str,
+    wake_event: asyncio.Event | None = None,
 ) -> None:
     """
     Вызывает `tick()` раз в `interval_seconds`, пока задачу не отменят.
@@ -70,12 +71,19 @@ async def run_periodically(
     появления этого модуля, и на это опирается старт: одновременный залп из
     шести служб в первую же секунду после запуска — не то, чего ждёшь от
     «фоновых» задач, особенно на телефоне.
+
+    `wake_event` — способ разбудить службу раньше срока. Нужен там, где
+    появилась работа, которую бессмысленно откладывать до следующего тика:
+    человек договорился о проекте и ждёт, что за него возьмутся сейчас, а не
+    через час (см. efi.dev.worker.DevWorker.request_tick). Событие
+    сбрасывается перед вызовом `tick()`, поэтому один сигнал даёт ровно один
+    внеочередной проход.
     """
     logger.info("%s: started (interval=%.0fs)", name, interval_seconds)
     failures = 0
     try:
         while True:
-            await asyncio.sleep(_next_delay(interval_seconds, failures))
+            await _sleep_until(_next_delay(interval_seconds, failures), wake_event, name=name)
             try:
                 await tick()
             except asyncio.CancelledError:
@@ -90,6 +98,19 @@ async def run_periodically(
     except asyncio.CancelledError:
         logger.info("%s: stopped", name)
         raise
+
+
+async def _sleep_until(delay: float, wake_event: asyncio.Event | None, *, name: str) -> None:
+    """Пауза до следующего тика — или до внеочередного сигнала, если он пришёл раньше."""
+    if wake_event is None:
+        await asyncio.sleep(delay)
+        return
+    try:
+        await asyncio.wait_for(wake_event.wait(), timeout=delay)
+    except TimeoutError:
+        return
+    wake_event.clear()
+    logger.info("%s: внеочередной проход по сигналу", name)
 
 
 def _next_delay(interval_seconds: float, failures: int) -> float:

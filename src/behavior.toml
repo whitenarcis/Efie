@@ -135,7 +135,7 @@ max_rag_results = 10
 # diary_dir можно не задавать — по умолчанию берётся paths.diary_dir
 novelization_min_messages = 3      # короткий, но содержательный обмен — тоже эпизод
 novelization_char_limit = 10000
-novelization_max_output_tokens = 2048
+novelization_max_output_tokens = 4096   # по-русски 2048 — это одна запись; отсюда были обрывы в дневнике
 
 # Пульс памяти (efi/memory/pulse.py) — как часто прожитое становится
 # воспоминанием. Раньше это происходило РОВНО ОДИН РАЗ в сутки, ночью: день
