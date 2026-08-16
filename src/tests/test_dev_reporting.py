@@ -205,16 +205,25 @@ def test_shared_technical_words_are_not_enough() -> None:
 
 
 class _StubEngine:
-    def __init__(self, *, spec: ProjectSpec | None = _SPEC, build: BuildResult | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        spec: ProjectSpec | None = _SPEC,
+        build: BuildResult | None = None,
+        design_failure: str = "модель ответила чем-то другим",
+    ) -> None:
         self._spec = spec
         self._build = build or BuildResult(
             files=[GeneratedFile(path="src/main.py", content="x = 1", fix_rounds=1)]
         )
+        self._design_failure = design_failure
         self.design_context = ""
+        self.design_calls = 0
 
-    async def design(self, idea: str = "", *, context: str = "") -> ProjectSpec | None:
+    async def design(self, idea: str = "", *, context: str = "") -> tuple[ProjectSpec | None, str]:
+        self.design_calls += 1
         self.design_context = context
-        return self._spec
+        return (self._spec, "") if self._spec is not None else (None, self._design_failure)
 
     async def build(self, spec: ProjectSpec) -> BuildResult:
         return self._build
@@ -362,6 +371,61 @@ async def test_own_projects_can_be_disabled(tmp_path: Path) -> None:
 
     assert await store.active() == []
     assert await store.recent_releases() == []
+
+
+async def test_a_stillborn_idea_leaves_no_trace(tmp_path: Path) -> None:
+    """
+    Замысел придумывается ДО того, как заводится задача. Раньше было наоборот,
+    и каждая неудачная попытка навсегда оседала в базе строчкой «замысел без
+    названия — не вышло»: за сутки их набиралось больше, чем настоящих
+    проектов, а полезного в них нет вообще — ни идеи, ни кода, ни причины
+    возвращаться.
+    """
+    store = _store(tmp_path)
+    manager = _CollectingManager()
+    worker = _worker(store, manager, engine=_StubEngine(spec=None), self_initiated=1.0)
+
+    await worker._tick()
+
+    assert await store.active() == []
+    assert await store.recent_failures() == []
+    assert manager.notifications == [], "не придумалось — не повод писать об этом владельцу"
+
+
+async def test_a_requested_project_that_fails_design_keeps_the_real_reason(tmp_path: Path) -> None:
+    """
+    Заказанная человеком задача — другое дело: она уже обещана, и её провал
+    обязан быть виден. Но с настоящей причиной: под общим «не придумалось»
+    одинаково прятались битый JSON, обрыв по лимиту и отказ от учебной идеи, а
+    чинятся они по-разному.
+    """
+    store = _store(tmp_path)
+    manager = _CollectingManager()
+    task = await store.create("утилита для логов", chat_id=_CHAT_ID, is_collab=True)
+    engine = _StubEngine(spec=None, design_failure="ответ модели оборвался по лимиту в 2048 токенов")
+    worker = _worker(store, manager, engine=engine)
+
+    await worker._tick()
+
+    failed = await store.get(task.id)
+    assert failed is not None
+    assert failed.status is DevTaskStatus.FAILED
+    assert "оборвался по лимиту" in failed.error
+
+
+async def test_old_empty_failures_are_swept_away_once(tmp_path: Path) -> None:
+    """Мусор, накопленный прошлой версией, чистится сам — иначе страница проектов так и остаётся кладбищем."""
+    store = _store(tmp_path)
+    stub = await store.create("", chat_id=_CHAT_ID, is_collab=False)
+    await store.update(stub, status=DevTaskStatus.FAILED, error="не придумалось ничего")
+    real = await store.create("утилита для логов", chat_id=_CHAT_ID, is_collab=True)
+    await store.update(real, status=DevTaskStatus.FAILED, error="кодер не ответил")
+
+    worker = _worker(store, _CollectingManager())
+    await worker._tick()
+
+    left = await store.recent_failures()
+    assert [item.id for item in left] == [real.id], "чистится только пустышка, настоящая неудача остаётся"
 
 
 async def test_own_project_starts_from_what_she_lives_by(tmp_path: Path) -> None:

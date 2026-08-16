@@ -206,6 +206,27 @@ class DevTaskStore:
         )
         return [_row_to_task(row) for row in rows]
 
+    async def purge_empty_failures(self) -> int:
+        """
+        Убирает провалы, в которых не осталось ничего: ни замысла, ни спеки.
+
+        Такие строчки появлялись, когда задача заводилась ПЕРЕД
+        проектированием и падала на нём же (см. DevWorker._maybe_start_own_project):
+        «замысел без названия — не вышло», и так по строчке каждые несколько
+        часов. Ни идеи, ни кода, ни причины возвращаться в них нет — это шум,
+        из-за которого на дашборде не видно настоящих проектов.
+
+        Задачи с текстом замысла или со спекой не трогаются: там есть что
+        показать и о чём вспомнить, даже если работа не удалась.
+        """
+        removed = await self._database.execute_and_count_changes(
+            "DELETE FROM dev_tasks WHERE status = ? AND TRIM(idea) = '' AND spec = ''",
+            (DevTaskStatus.FAILED.value,),
+        )
+        if removed:
+            logger.info("dev_store: убрала %d пустых провал(ов) — в них не было ни замысла, ни кода", removed)
+        return removed
+
     async def recent_failures(self, *, limit: int = 5) -> list[DevTask]:
         """Недавно провалившиеся задачи — только для дашборда: в промпт неудачи не идут, ей о них напоминать незачем."""
         rows = await self._database.fetch_all(

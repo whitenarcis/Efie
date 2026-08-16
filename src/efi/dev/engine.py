@@ -61,17 +61,54 @@ _SPEC_SYSTEM_PROMPT = (
     "ЗАПРЕЩЕНО: hello world, калькулятор, todo-лист, угадай число, «демо», «пример для практики» и "
     "любой другой учебный код. Проект должен решать конкретную проблему конкретного человека — "
     "такую, которую можно назвать одним предложением без слова «пример».\n"
-    "Объём: 2-5 файлов Python плюс README.md. Только стандартная библиотека, если без внешних "
-    "зависимостей действительно можно обойтись.\n"
-    "Ответь ОДНИМ объектом JSON без markdown и без пояснений, строго по схеме:\n"
-    '{"slug": "имя-репозитория-латиницей", "title": "Название", "problem": "какую проблему решает, '
-    '1-2 предложения", "stack": ["python 3.11", "argparse"], "files": [{"path": "src/main.py", '
-    '"purpose": "что делает файл"}], "readme": "текст README.md в markdown"}'
+    "Объём: 2-4 файла Python. Только стандартная библиотека, если без внешних зависимостей "
+    "действительно можно обойтись.\n"
+    "\n"
+    "ФОРМАТ ОТВЕТА: один объект JSON и больше НИЧЕГО — ни пояснений до, ни комментариев после, ни "
+    "```-обёртки. Поля ровно эти:\n"
+    '{"slug":"имя-репозитория-латиницей","title":"Название","problem":"какую проблему решает, 1-2 '
+    'предложения","stack":["python 3.11","argparse"],"files":[{"path":"src/main.py","purpose":"что '
+    'делает файл"}]}\n'
+    "README писать НЕ надо — его напишут отдельно по готовому коду. Пиши компактно: длинный ответ "
+    "обрывается по лимиту и не разбирается вовсе."
 )
 
 #: JSON внутри ```-блока или просто первый объект в тексте — та же болезнь,
 #: что и у кодера (см. efi/dev/qwen_client.py), лечится тем же способом.
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(?P<body>.*?)(?:\n\s*```|\Z)", re.DOTALL)
+
+#: Причина отказа, у которой есть своё лекарство: просить то же самое ещё раз
+#: бессмысленно, надо просить короче.
+_TRUNCATED_PROBLEM = f"ответ модели оборвался по лимиту в {_SPEC_MAX_OUTPUT_TOKENS} токенов"
+
+
+@dataclass(slots=True, frozen=True)
+class _SpecAttempt:
+    """Один поход к главной модели: либо текст, либо причина, почему его нет."""
+
+    text: str = ""
+    problem: str = ""
+    #: Есть ли смысл в следующей попытке. Упавший провайдер за секунду не
+    #: встанет — повтор к нему это лишний запрос и та же ошибка в ответ.
+    retriable: bool = True
+
+
+def _retry_hint(previous_problem: str) -> str:
+    """
+    Что сказать модели во второй попытке. Без этого повтор шёл с той же
+    просьбой и давал тот же результат: слишком длинный ответ обрывался снова,
+    а «придумай другой проект» вместо «пиши короче» — это ответ не на ту
+    проблему.
+    """
+    if previous_problem == _TRUNCATED_PROBLEM:
+        return (
+            "Прошлый ответ не поместился в лимит и пропал целиком. Тот же замысел, но КОРОТКО: "
+            "2-3 файла, problem одним предложением, purpose — несколькими словами."
+        )
+    return (
+        "Прошлый вариант не годится: он был учебным, пустым или не разобрался как JSON. "
+        "Придумай другой — утилитарный, с конкретной проблемой, и ответь одним объектом JSON."
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -130,36 +167,58 @@ class DevEngine:
         #: внятной документации не публикуется (см. efi/dev/readme.py).
         self._readme = readme if readme is not None else ReadmeWriter(coder)
 
-    async def design(self, idea: str = "", *, context: str = "") -> ProjectSpec | None:
+    async def design(self, idea: str = "", *, context: str = "") -> tuple[ProjectSpec | None, str]:
         """
-        Спека проекта. `idea` — если проект заказан (совместная задача или
-        собственная затея с конкретной темой); пусто — придумывает сама.
-        `context` — чем Эфи сейчас живёт (интересы, недавние темы): из этого
-        получаются проекты «про её жизнь», а не случайные утилиты из воздуха.
-        """
-        for attempt in range(1, _MAX_SPEC_ATTEMPTS + 1):
-            raw = await self._ask_for_spec(idea, context=context, attempt=attempt)
-            if raw is None:
-                return None
+        Спека проекта и — если не вышло — ПРИЧИНА, по которой не вышло.
 
+        `idea` — если проект заказан (совместная задача или собственная затея
+        с конкретной темой); пусто — придумывает сама. `context` — чем Эфи
+        сейчас живёт (интересы, недавние темы): из этого получаются проекты
+        «про её жизнь», а не случайные утилиты из воздуха.
+
+        Причина возвращается наружу, а не остаётся в логе, потому что снаружи
+        все отказы выглядели одинаково — «не придумалось ничего, что стоило бы
+        писать». Под этой фразой одинаково прятались битый JSON, обрыв ответа
+        по лимиту и настоящий отказ от учебной идеи, а чинятся они совершенно
+        по-разному.
+        """
+        problems: list[str] = []
+        for attempt in range(1, _MAX_SPEC_ATTEMPTS + 1):
+            answer = await self._ask_for_spec(
+                idea, context=context, previous_problem=problems[-1] if problems else ""
+            )
+            if answer.problem:
+                problems.append(answer.problem)
+                if not answer.retriable:
+                    break
+                continue
+
+            raw = answer.text
             spec, problem = parse_spec(raw)
             if spec is None:
-                logger.warning("dev_engine: спека не разобрана (попытка %d): %s", attempt, problem)
+                logger.warning(
+                    "dev_engine: спека не разобрана (попытка %d): %s; ответ начинался так: %.200s",
+                    attempt, problem, raw.replace("\n", " "),
+                )
+                problems.append(problem)
                 continue
             if spec.looks_like_junk():
                 logger.info("dev_engine: отвергла учебный проект %r (попытка %d)", spec.title, attempt)
+                problems.append(f"замысел «{spec.title}» — учебный пример")
                 continue
             if not spec.is_substantial():
                 logger.info("dev_engine: спека %r без внятной проблемы или без кода", spec.title)
+                problems.append(f"в замысле «{spec.title}» нет ни внятной проблемы, ни файлов с кодом")
                 continue
 
             logger.info(
                 "dev_engine: замысел «%s» (%s), файлов: %d", spec.title, spec.slug, len(spec.files)
             )
-            return spec
+            return spec, ""
 
-        logger.info("dev_engine: за %d попыток не вышло годной спеки", _MAX_SPEC_ATTEMPTS)
-        return None
+        reason = "; ".join(dict.fromkeys(problems)) or "модель не выдала ничего пригодного"
+        logger.info("dev_engine: за %d попыток не вышло годной спеки: %s", _MAX_SPEC_ATTEMPTS, reason)
+        return None, reason
 
     async def build(self, spec: ProjectSpec) -> BuildResult:
         """
@@ -235,17 +294,14 @@ class DevEngine:
             unresolved_diagnostics=report.render(),
         )
 
-    async def _ask_for_spec(self, idea: str, *, context: str, attempt: int) -> str | None:
+    async def _ask_for_spec(self, idea: str, *, context: str, previous_problem: str) -> _SpecAttempt:
         user_parts = []
         if idea.strip():
             user_parts.append(f"Замысел, о котором уже договорились: {idea.strip()}")
         if context.strip():
             user_parts.append(f"Чем ты сейчас живёшь и что тебе интересно: {context.strip()}")
-        if attempt > 1:
-            user_parts.append(
-                "Прошлый вариант не годится: он был учебным или пустым. Придумай другой — "
-                "утилитарный, с конкретной проблемой."
-            )
+        if previous_problem:
+            user_parts.append(_retry_hint(previous_problem))
         if not user_parts:
             user_parts.append("Придумай себе следующий проект.")
 
@@ -256,9 +312,21 @@ class DevEngine:
         try:
             response = await self._router.chat(self._design_role, params, session)
         except LLMError as exc:
+            # Провайдер, который лёг, к следующей попытке не встанет: повтор
+            # здесь — это лишний запрос и то же самое сообщение об ошибке.
             logger.warning("dev_engine: не удалось получить спеку: %s", exc)
-            return None
-        return response.text
+            return _SpecAttempt(problem=f"модель замысла недоступна: {exc}", retriable=False)
+
+        if response.was_truncated:
+            # Оборванный JSON не разбирается в принципе, и «невалидный JSON»
+            # как причина увело бы куда угодно, кроме настоящей: ответ просто
+            # не поместился в лимит. Повторять с той же просьбой смысла нет —
+            # повтор идёт с прямым указанием писать короче (см. _retry_hint).
+            logger.warning(
+                "dev_engine: ответ с замыслом оборвался по лимиту (%s токенов)", _SPEC_MAX_OUTPUT_TOKENS
+            )
+            return _SpecAttempt(problem=_TRUNCATED_PROBLEM)
+        return _SpecAttempt(text=response.text)
 
 
 def parse_spec(raw: str) -> tuple[ProjectSpec | None, str]:
@@ -291,6 +359,7 @@ def parse_spec(raw: str) -> tuple[ProjectSpec | None, str]:
     # Негодные элементы структуры (файл без пути, путь с «..») выбрасываются
     # поштучно, а не роняют всю спеку: терять замысел целиком из-за одной
     # кривой строчки — худший из возможных обменов.
+    payload = _normalize_payload(payload)
     payload["files"] = _valid_files(payload.get("files"))
     payload["stack"] = [str(item).strip() for item in _as_list(payload.get("stack")) if str(item).strip()]
 
@@ -300,15 +369,76 @@ def parse_spec(raw: str) -> tuple[ProjectSpec | None, str]:
         return None, f"спека не прошла валидацию: {exc.errors()[0].get('msg', exc)}"
 
 
+#: Как модели называют одни и те же поля. Требовать ровно наших имён — значит
+#: выбрасывать вполне годный замысел из-за того, что модель написала
+#: "description" вместо "problem": на бесплатных тирах это происходит
+#: постоянно, а стоит ошибка целого проекта.
+_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "slug": ("slug", "repo", "repository", "name"),
+    "title": ("title", "name", "project", "project_name"),
+    "problem": ("problem", "description", "why", "purpose", "idea", "summary"),
+    "stack": ("stack", "tech", "technologies", "dependencies"),
+    "files": ("files", "structure", "modules"),
+}
+
+#: То же для полей одного файла.
+_PATH_ALIASES = ("path", "file", "filename", "name")
+_PURPOSE_ALIASES = ("purpose", "description", "role", "what", "summary")
+
+
+def _first_present(payload: dict[str, object], names: tuple[str, ...]) -> object:
+    for name in names:
+        value = payload.get(name)
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _normalize_payload(payload: dict[str, object]) -> dict[str, object]:
+    """Приводит ответ модели к нашим именам полей — см. _FIELD_ALIASES."""
+    normalized: dict[str, object] = {}
+    for field_name, aliases in _FIELD_ALIASES.items():
+        value = _first_present(payload, aliases)
+        if value is not None:
+            normalized[field_name] = value
+    # Название и имя репозитория взаимозаменяемы: из названия получается slug,
+    # из slug — сносное название. Требовать оба — терять спеку на ровном месте.
+    if "slug" not in normalized and "title" in normalized:
+        normalized["slug"] = normalized["title"]
+    if "title" not in normalized and "slug" in normalized:
+        normalized["title"] = str(normalized["slug"]).replace("-", " ").strip().capitalize()
+    return normalized
+
+
 def _valid_files(raw: object) -> list[dict[str, str]]:
+    """
+    Файлы спеки из чего угодно, похожего на список файлов.
+
+    Модели отвечают тремя способами: списком объектов (как просили), списком
+    строк-путей и словарём «путь -> назначение». Принимать только первый —
+    значит регулярно получать спеку без единого файла и отвергать её как
+    «без кода», хотя замысел был нормальный.
+    """
+    items: list[object]
+    if isinstance(raw, dict):
+        items = [{"path": key, "purpose": value} for key, value in raw.items()]
+    else:
+        items = _as_list(raw)
+
     files: list[dict[str, str]] = []
-    for item in _as_list(raw):
-        if not isinstance(item, dict):
+    for item in items:
+        if isinstance(item, str):
+            candidate = {"path": item, "purpose": ""}
+        elif isinstance(item, dict):
+            candidate = {
+                "path": str(_first_present(item, _PATH_ALIASES) or ""),
+                "purpose": str(_first_present(item, _PURPOSE_ALIASES) or ""),
+            }
+        else:
             continue
+
         try:
-            file_spec = FileSpec.model_validate(
-                {"path": str(item.get("path", "")), "purpose": str(item.get("purpose", ""))}
-            )
+            file_spec = FileSpec.model_validate(candidate)
         except ValidationError:
             logger.debug("dev_engine: пропускаю файл спеки с негодным путём: %r", item)
             continue

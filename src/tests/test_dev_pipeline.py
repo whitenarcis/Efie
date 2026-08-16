@@ -87,6 +87,55 @@ def test_spec_slug_is_normalized_into_a_repo_name() -> None:
     assert spec.slug == "log-digest-2.0"
 
 
+def test_files_come_in_three_shapes_and_all_three_count() -> None:
+    """
+    Модели отвечают структурой файлов тремя способами: списком объектов (как
+    просили), списком путей и словарём «путь -> назначение». Понимать только
+    первый — значит регулярно получать спеку «без единого файла» и отвергать
+    вполне живой замысел как пустой.
+    """
+    as_strings = dict(_GOOD_SPEC, files=["src/parser.py", "src/main.py"])
+    as_mapping = dict(_GOOD_SPEC, files={"src/parser.py": "разбор строк", "src/main.py": "точка входа"})
+
+    for payload in (as_strings, as_mapping):
+        spec, problem = parse_spec(json.dumps(payload, ensure_ascii=False))
+
+        assert problem == ""
+        assert spec is not None
+        assert [item.path for item in spec.files] == ["src/parser.py", "src/main.py"]
+
+
+def test_other_field_names_do_not_cost_the_whole_project() -> None:
+    """
+    «description» вместо «problem» и «name» вместо «slug» — самая частая
+    вольность бесплатных моделей. Цена придирки к именам полей — потерянный
+    проект, а выигрыша нет никакого.
+    """
+    raw = json.dumps(
+        {
+            "name": "Log Digest",
+            "description": "Разбирает многогигабайтные логи nginx и показывает топ ошибок за период",
+            "tech": ["python 3.11"],
+            "structure": [{"file": "src/main.py", "role": "точка входа CLI"}],
+        },
+        ensure_ascii=False,
+    )
+
+    spec, problem = parse_spec(raw)
+
+    assert problem == ""
+    assert spec is not None
+    assert spec.slug == "log-digest", "имя репозитория выводится из названия, если его не дали"
+    assert spec.files[0].purpose == "точка входа CLI"
+
+
+def test_spec_parse_failures_say_what_exactly_went_wrong() -> None:
+    """Причина уходит наружу и доезжает до карточки проекта — общее «не вышло» не чинится ничем."""
+    assert parse_spec("")[1] == "пустой ответ модели"
+    assert "нет объекта JSON" in parse_spec("Конечно, давай сделаем парсер логов!")[1]
+    assert "невалидный JSON" in parse_spec('{"slug": "log-digest", }')[1]
+
+
 def test_junk_projects_are_recognized() -> None:
     """Учебный мусор — самый вероятный ответ модели на «придумай проект», и он должен отсеиваться."""
     junk = ProjectSpec.model_validate(
@@ -289,6 +338,22 @@ class _FailingRouter:
         raise LLMServerError("провайдер лёг", provider="test")
 
 
+class _TruncatingRouter:
+    """Модель, чей ответ каждый раз упирается в лимит токенов (finish_reason='length')."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.prompts: list[str] = []
+
+    async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
+        self.prompts.append(session.messages[-1].content)
+        return Response(
+            choices=[
+                Choice(message=Message(role=Role.ASSISTANT, content=self.text), finish_reason="length")
+            ]
+        )
+
+
 def _engine(coder: Any, router: Any = None, *, max_fix_iterations: int = 3) -> DevEngine:
     return DevEngine(
         router or _StaticRouter(json.dumps(_GOOD_SPEC)),  # type: ignore[arg-type]
@@ -394,14 +459,42 @@ async def test_design_rejects_junk_and_gives_up_honestly() -> None:
     junk = dict(_GOOD_SPEC, slug="hello-world", title="Hello World", problem="Пример для практики: печатает привет")
     router = _StaticRouter(json.dumps(junk))
 
-    spec = await _engine(_ScriptedCoder([]), router).design("")
+    spec, reason = await _engine(_ScriptedCoder([]), router).design("")
 
     assert spec is None
     assert router.calls == 2, "вторая попытка с прямым указанием переделать"
+    assert "учебный" in reason, "причина отказа — своя у каждого случая, а не общее «не придумалось»"
 
 
 async def test_design_survives_a_dead_provider() -> None:
-    assert await _engine(_ScriptedCoder([]), _FailingRouter()).design("напиши парсер логов") is None
+    spec, reason = await _engine(_ScriptedCoder([]), _FailingRouter()).design("напиши парсер логов")
+
+    assert spec is None
+    assert "провайдер лёг" in reason, "владельцу видно, что дело в провайдере, а не в фантазии модели"
+
+
+async def test_truncated_answer_is_named_and_answered_with_write_shorter() -> None:
+    """
+    Оборванный по лимиту JSON не разбирается в принципе, и «невалидный JSON»
+    как причина увело бы куда угодно, кроме настоящей: ответ не поместился.
+    А повтор с той же просьбой дал бы ровно то же самое.
+    """
+    router = _TruncatingRouter(json.dumps(_GOOD_SPEC, ensure_ascii=False)[:120])
+
+    spec, reason = await _engine(_ScriptedCoder([]), router).design("")
+
+    assert spec is None
+    assert "оборвал" in reason
+    assert "КОРОТКО" in router.prompts[1], "во второй раз просим короче, а не «придумай другое»"
+
+
+async def test_truncated_answer_does_not_hide_behind_invalid_json() -> None:
+    """Причина обрыва не должна подменяться следом от разбора обрезанного текста."""
+    router = _TruncatingRouter('{"slug": "log-dig')
+
+    _spec_result, reason = await _engine(_ScriptedCoder([]), router).design("")
+
+    assert "JSON" not in reason
 
 
 async def test_coder_errors_do_not_raise() -> None:

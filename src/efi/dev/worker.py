@@ -104,6 +104,8 @@ class DevWorker:
         #: — это ровно то, из-за чего непонятно, взялась она вообще или
         #: просто поддакнула (см. request_tick).
         self._wake = asyncio.Event()
+        #: Разовая чистка пустых провалов при первом тике (см. _tick).
+        self._purged_stubs = False
 
     @property
     def is_coding(self) -> bool:
@@ -135,6 +137,13 @@ class DevWorker:
         )
 
     async def _tick(self) -> None:
+        # Мусор от прошлых версий: задачи, которые падали на проектировании и
+        # оседали в базе пустыми строчками «замысел без названия». Чистится
+        # один раз, а не каждый тик — см. purge_empty_failures.
+        if not self._purged_stubs:
+            self._purged_stubs = True
+            await self._store.purge_empty_failures()
+
         # Задачи, брошенные посреди работы (процесс упал, телефон убил
         # фоновую задачу), возвращаются в очередь ПЕРЕД выбором следующей:
         # иначе они навсегда остаются в статусе «пишу код», и Эфи месяцами
@@ -143,7 +152,13 @@ class DevWorker:
 
         task = await self._store.next_pending()
         if task is None:
-            task = await self._maybe_start_own_project()
+            # Собственная затея тоже начинается с обращения к модели, поэтому
+            # занятость поднимается до неё, а не только на сборке.
+            self._is_coding = True
+            try:
+                task = await self._maybe_start_own_project()
+            finally:
+                self._is_coding = False
         if task is None:
             # Работы нет — самое время перечитать что-нибудь своё. Именно в
             # этом порядке: новый проект и чужая просьба важнее ревизии
@@ -172,6 +187,14 @@ class DevWorker:
         Затеять что-то своё. Не каждый тик и не поверх уже идущей работы:
         человек, у которого одновременно пять начатых проектов, ничего не
         доводит до конца — и выглядит это так же.
+
+        Замысел придумывается ДО того, как заводится задача. Раньше было
+        наоборот: задача создавалась пустой, потом падала на проектировании, и
+        каждая неудачная попытка навсегда оседала в базе строчкой «замысел без
+        названия — не вышло». За сутки таких строчек набиралось больше, чем
+        настоящих проектов, а полезного в них нет вообще: ни идеи, ни кода, ни
+        причины возвращаться. Не придумалось — просто не придумалось, следов
+        оставаться не должно.
         """
         if self._self_initiated_probability <= 0.0:
             return None
@@ -179,15 +202,25 @@ class DevWorker:
             return None
         if random.random() > self._self_initiated_probability:
             return None
-        return await self._store.create("", chat_id=self._owner_chat_id, is_collab=False)
+
+        spec, reason = await self._engine.design("", context=await self._render_context())
+        if spec is None:
+            logger.info("dev_worker: своя затея не сложилась (%s) — задачу не завожу", reason)
+            return None
+
+        task = await self._store.create(spec.title, chat_id=self._owner_chat_id, is_collab=False)
+        return await self._store.update(task, spec=spec)
 
     async def _process(self, task: DevTask) -> None:
         spec = task.spec
         if spec is None:
             task = await self._store.update(task, status=DevTaskStatus.SPECCING)
-            spec = await self._engine.design(task.idea, context=await self._render_context())
+            spec, reason = await self._engine.design(task.idea, context=await self._render_context())
             if spec is None:
-                await self._fail(task, "не придумалось ничего, что стоило бы писать")
+                # Причина — дословно от движка: под общим «не придумалось»
+                # одинаково прятались битый JSON, обрыв по лимиту и настоящий
+                # отказ от учебной идеи, а чинятся они по-разному.
+                await self._fail(task, f"замысел не сложился: {reason}")
                 return
             task = await self._store.update(task, spec=spec)
             await self._reporter.report_progress(task, _design_note(spec))
