@@ -161,12 +161,18 @@ class DevTaskStore:
         «Давно» считается от последнего просмотра, а если его не было — от
         публикации: свежий проект незачем ревизовать на следующий день после
         релиза, он ровно такой, каким его дописали.
+
+        Наличие ссылки НЕ требуется. Проект, написанный в локальном режиме
+        (без токена GitHub), — такой же её проект: он лежит на диске, его
+        можно перечитать и поправить, и коммит ляжет в локальную историю.
+        Требовать `repo_url` значило бы, что у владельца без токена
+        возвращения к своему коду не существует вовсе.
         """
         cutoff = (datetime.now(UTC) - not_reviewed_for).isoformat()
         rows = await self._database.fetch_all(
             """
             SELECT * FROM dev_tasks
-             WHERE status = ? AND repo_url != ''
+             WHERE status = ? AND spec != ''
                AND (CASE WHEN reviewed_at = '' THEN updated_at ELSE reviewed_at END) < ?
              ORDER BY (CASE WHEN reviewed_at = '' THEN updated_at ELSE reviewed_at END) ASC
             """,
@@ -205,6 +211,36 @@ class DevTaskStore:
             (DevTaskStatus.DONE.value, limit),
         )
         return [_row_to_task(row) for row in rows]
+
+    async def finished_projects(self, *, limit: int = 20) -> list[DevTask]:
+        """
+        Всё, что уже написано и доведено до конца, со ссылкой или без.
+
+        Нужно в двух местах, и оба про качество замысла: в промпт
+        проектирования («вот это ты уже писала, придумай другое») и в проверку
+        имени репозитория. Без первого она раз в неделю придумывает тот же
+        разборщик логов, без второго — второй такой проект не публикуется
+        вовсе: пуш в непустой репозиторий отклоняется.
+        """
+        rows = await self._database.fetch_all(
+            "SELECT * FROM dev_tasks WHERE status = ? AND spec != '' ORDER BY updated_at DESC LIMIT ?",
+            (DevTaskStatus.DONE.value, limit),
+        )
+        return [_row_to_task(row) for row in rows]
+
+    async def taken_slugs(self) -> set[str]:
+        """Имена репозиториев, которые уже заняты её же проектами, — в любом статусе, кроме провала."""
+        rows = await self._database.fetch_all(
+            "SELECT spec FROM dev_tasks WHERE spec != '' AND status != ?", (DevTaskStatus.FAILED.value,)
+        )
+        slugs: set[str] = set()
+        for row in rows:
+            payload = safe_json_loads(str(row["spec"] or ""))
+            if isinstance(payload, dict):
+                slug = str(payload.get("slug", "")).strip().lower()
+                if slug:
+                    slugs.add(slug)
+        return slugs
 
     async def purge_empty_failures(self) -> int:
         """
@@ -252,6 +288,7 @@ class DevTaskStore:
         spec: ProjectSpec | None = None,
         repo_url: str | None = None,
         error: str | None = None,
+        attempts: int | None = None,
     ) -> DevTask:
         """Сохраняет продвижение задачи. Возвращает обновлённую копию — DevTask иммутабелен по смыслу."""
         updated = task.model_copy(
@@ -260,13 +297,14 @@ class DevTaskStore:
                 "spec": spec if spec is not None else task.spec,
                 "repo_url": repo_url if repo_url is not None else task.repo_url,
                 "error": error if error is not None else task.error,
+                "attempts": attempts if attempts is not None else task.attempts,
                 "updated_at": datetime.now(UTC),
             }
         )
         await self._database.execute(
             """
             UPDATE dev_tasks
-               SET status = ?, spec = ?, repo_url = ?, error = ?, updated_at = ?
+               SET status = ?, spec = ?, repo_url = ?, error = ?, attempts = ?, updated_at = ?
              WHERE id = ?
             """,
             (
@@ -274,6 +312,7 @@ class DevTaskStore:
                 compact_json_dumps(updated.spec.model_dump(mode="json")) if updated.spec is not None else "",
                 updated.repo_url,
                 updated.error,
+                updated.attempts,
                 updated.updated_at.isoformat(),
                 updated.id,
             ),
@@ -310,6 +349,7 @@ def _row_to_task(row: aiosqlite.Row) -> DevTask:
         updated_at=datetime.fromisoformat(str(row["updated_at"])),
         reviewed_at=_parse_optional(row["reviewed_at"]),
         revisions=int(row["revisions"] or 0),
+        attempts=int(row["attempts"] or 0),
     )
 
 

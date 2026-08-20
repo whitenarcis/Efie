@@ -326,6 +326,19 @@ async def _migration_016_dev_reviews(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE dev_tasks ADD COLUMN revisions INTEGER NOT NULL DEFAULT 0")
 
 
+async def _migration_017_dev_attempts(conn: aiosqlite.Connection) -> None:
+    """
+    Сколько раз конвейер уже брался за эту задачу (см. efi/dev/worker.py).
+
+    Без счётчика любой временный отказ — 429 на третьем файле из четырёх,
+    оборванная сеть на пуше — хоронил проект навсегда: задача уходила в
+    «не вышло» и больше не поднималась. На бесплатных тирах это самый частый
+    конец работы, и он не имеет отношения ни к качеству замысла, ни к коду.
+    """
+    if not await _has_column(conn, "dev_tasks", "attempts"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -344,6 +357,7 @@ MIGRATIONS = [
     _migration_014_chat_directory,
     _migration_015_dev_tasks,
     _migration_016_dev_reviews,
+    _migration_017_dev_attempts,
 ]
 
 __all__ = ["MIGRATIONS"]

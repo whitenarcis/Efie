@@ -299,6 +299,7 @@ class _ScriptedCoder:
         fixes: list[str] | None = None,
         readme: str | None = _GOOD_README,
         unavailable_reason: str = "",
+        truncated: bool = False,
     ) -> None:
         self._sources = list(sources)
         self._fixes = list(fixes or [])
@@ -306,14 +307,18 @@ class _ScriptedCoder:
         #: Непоправимый отказ провайдера (нет такой модели, отвергнут ключ) —
         #: см. QwenCoderClient.unavailable_reason.
         self.unavailable_reason = unavailable_reason
+        #: Упёрся ли ответ в лимит вывода — см. QwenCoderClient.last_answer_truncated.
+        self.last_answer_truncated = truncated
         self.fix_calls = 0
         self.readme_calls = 0
+        self.diagnostics: list[str] = []
 
     async def write_file(self, spec: ProjectSpec, file_spec: FileSpec, **_: Any) -> str | None:
         return self._sources.pop(0) if self._sources else None
 
     async def fix_file(self, path: str, source: str, diagnostics: str) -> str | None:
         self.fix_calls += 1
+        self.diagnostics.append(diagnostics)
         return self._fixes.pop(0) if self._fixes else None
 
     async def write_document(self, path: str, *, system_prompt: str, request: str) -> str | None:
@@ -327,9 +332,11 @@ class _StaticRouter:
     def __init__(self, text: str) -> None:
         self.text = text
         self.calls = 0
+        self.prompts: list[str] = []
 
     async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
         self.calls += 1
+        self.prompts.append(session.messages[-1].content)
         return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content=self.text))])
 
 
@@ -471,6 +478,38 @@ async def test_design_survives_a_dead_provider() -> None:
 
     assert spec is None
     assert "провайдер лёг" in reason, "владельцу видно, что дело в провайдере, а не в фантазии модели"
+
+
+async def test_she_does_not_write_the_same_project_twice() -> None:
+    """
+    Интересы меняются медленно, и «придумай себе проект» на одном и том же
+    контексте даёт один и тот же ответ. Стоит это не только скуки: имя
+    репозитория занято её же прошлым проектом, и пуш второго такого проекта
+    отклоняется как непустая история.
+    """
+    router = _StaticRouter(json.dumps(_GOOD_SPEC, ensure_ascii=False))
+
+    spec, reason = await _engine(_ScriptedCoder([]), router).design("", built=[_spec()])
+
+    assert spec is None
+    assert "повторяет" in reason
+    assert "Это ты уже написала" in router.prompts[0], "список написанного уходит в промпт, а не только в проверку"
+
+
+async def test_a_different_project_on_the_same_stack_is_not_a_repeat() -> None:
+    """Иначе после второй утилиты на python она не смогла бы написать ничего."""
+    other = dict(
+        _GOOD_SPEC,
+        slug="disk-watch",
+        title="Disk Watch",
+        problem="Следит за свободным местом на дисках и пишет в telegram, когда остаётся мало",
+    )
+    router = _StaticRouter(json.dumps(other, ensure_ascii=False))
+
+    spec, reason = await _engine(_ScriptedCoder([]), router).design("", built=[_spec()])
+
+    assert reason == ""
+    assert spec is not None and spec.slug == "disk-watch"
 
 
 async def test_truncated_answer_is_named_and_answered_with_write_shorter() -> None:

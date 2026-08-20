@@ -89,6 +89,10 @@ class QwenCoderClient:
         #: наружу: имя снятой с обслуживания модели или отвергнутый ключ видны
         #: только здесь (см. `unavailable_reason`).
         self._last_error: LLMError | None = None
+        #: Уперся ли последний ответ в лимит вывода. Обрыв файла на середине
+        #: функции лечится не «почини синтаксис», а «напиши короче» — см.
+        #: efi.dev.engine.DevEngine._write_one.
+        self._last_truncated = False
         #: Провайдер внедряем ради тестов; в бою — обычный OpenAI-совместимый
         #: клиент, тот же, что ходит в Groq для остальных ролей. Имя видно в
         #: логах и метриках (efi/dashboard/): запрос кодера должен быть
@@ -100,6 +104,11 @@ class QwenCoderClient:
     @property
     def model(self) -> str:
         return self._endpoint.model
+
+    @property
+    def last_answer_truncated(self) -> bool:
+        """Оборвался ли последний ответ по лимиту вывода."""
+        return self._last_truncated
 
     @property
     def unavailable_reason(self) -> str:
@@ -180,10 +189,12 @@ class QwenCoderClient:
             response = await self._provider.chat(params, session)
         except LLMError as exc:
             self._last_error = exc
+            self._last_truncated = False
             logger.warning("qwen: %s не удалось (%s)", what, exc)
             return None
 
         self._last_error = None
+        self._last_truncated = response.was_truncated
 
         if response.was_truncated:
             # У кода обрыв по лимиту неисправим в принципе: «последнее

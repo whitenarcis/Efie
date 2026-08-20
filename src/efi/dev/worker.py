@@ -56,6 +56,14 @@ _MAX_CONTEXT_INTERESTS = 5
 #: порог не попадёт живая работа, а не только мёртвая.
 _STALLED_AFTER = timedelta(hours=3)
 
+#: Сколько раз конвейер берётся за одну задачу, прежде чем признать её
+#: несбывшейся. Три — потому что провалы здесь в основном временные: 429 на
+#: третьем файле из четырёх, оборванная сеть на пуше, недоступный на минуту
+#: провайдер. Без повторов такой сбой хоронил проект навсегда, хотя к
+#: следующему часу всё уже работает; с бесконечными повторами Эфи вечно
+#: возвращалась бы к замыслу, который не выходит.
+_MAX_ATTEMPTS = 3
+
 
 class InterestSource(Protocol):
     """
@@ -203,19 +211,36 @@ class DevWorker:
         if random.random() > self._self_initiated_probability:
             return None
 
-        spec, reason = await self._engine.design("", context=await self._render_context())
+        spec, reason = await self._engine.design(
+            "", context=await self._render_context(), built=await self._built_specs()
+        )
         if spec is None:
             logger.info("dev_worker: своя затея не сложилась (%s) — задачу не завожу", reason)
             return None
 
         task = await self._store.create(spec.title, chat_id=self._owner_chat_id, is_collab=False)
-        return await self._store.update(task, spec=spec)
+        task = await self._store.update(task, spec=spec)
+        # Замысел собственного проекта — такой же повод для реплики, как и
+        # заказанного: «придумала себе штуку и сажусь писать» человек говорит
+        # в начале работы, а не только когда всё готово.
+        await self._reporter.report_progress(task, _design_note(spec))
+        return task
 
     async def _process(self, task: DevTask) -> None:
+        if task.attempts >= _MAX_ATTEMPTS:
+            # Сюда попадает задача, которая не доживает даже до отказа: процесс
+            # падает на ней раз за разом, reclaim_stalled возвращает её в
+            # очередь, и так по кругу. Счётчик заходов закрывает и этот случай.
+            await self._fail(task, f"не пережила {task.attempts} заходов конвейера", retriable=False)
+            return
+        task = await self._store.update(task, attempts=task.attempts + 1)
+
         spec = task.spec
         if spec is None:
             task = await self._store.update(task, status=DevTaskStatus.SPECCING)
-            spec, reason = await self._engine.design(task.idea, context=await self._render_context())
+            spec, reason = await self._engine.design(
+                task.idea, context=await self._render_context(), built=await self._built_specs()
+            )
             if spec is None:
                 # Причина — дословно от движка: под общим «не придумалось»
                 # одинаково прятались битый JSON, обрыв по лимиту и настоящий
@@ -228,7 +253,11 @@ class DevWorker:
         task = await self._store.update(task, status=DevTaskStatus.CODING)
         build = await self._engine.build(spec)
         if not build.is_publishable:
-            await self._fail(task, _broken_reason(build))
+            # Отказ кодера как таковой (снятая модель, отвергнутый ключ) к
+            # следующему заходу не исправится — повторять его незачем. А вот
+            # разошедшиеся между собой файлы со второй генерации часто
+            # сходятся: это неудача захода, а не приговор замыслу.
+            await self._fail(task, _broken_reason(build), retriable=not build.permanent)
             return
 
         note = _build_note(build)
@@ -258,10 +287,38 @@ class DevWorker:
         logger.info("dev_worker: проект %s готов: %s", spec.slug, published.url)
         await self._reporter.report_release(task, url=published.url, build=build)
 
-    async def _fail(self, task: DevTask, reason: str) -> None:
+    async def _fail(self, task: DevTask, reason: str, *, retriable: bool = True) -> None:
+        """
+        Провал одного захода. Временный — возвращает задачу в очередь, и в чат
+        не уходит ничего: «не смогла, попробую позже» — это не новость, а шум.
+
+        Разница между временным и окончательным здесь и есть разница между
+        «проект не вышел» и «в тот час лежал провайдер». Без неё 429 на
+        третьем файле из четырёх хоронил замысел навсегда — а это самый
+        частый конец работы на бесплатных лимитах.
+        """
+        if retriable and task.attempts < _MAX_ATTEMPTS:
+            logger.info(
+                "dev_worker: задача #%s не задалась с %d-й попытки (%s) — вернусь к ней",
+                task.id, task.attempts, reason,
+            )
+            await self._store.update(task, status=DevTaskStatus.PENDING, error=reason)
+            return
+
         logger.warning("dev_worker: задача #%s провалилась: %s", task.id, reason)
         failed = await self._store.update(task, status=DevTaskStatus.FAILED, error=reason)
         await self._reporter.report_failure(failed, reason)
+
+    async def _built_specs(self) -> list[ProjectSpec]:
+        """
+        Что она уже написала — материал для замысла, а не для отчёта.
+
+        Без этого списка «придумай себе проект» на медленно меняющихся
+        интересах раз за разом даёт одну и ту же утилиту: тот же разбор
+        логов под новым именем (а иногда и под тем же — тогда пуш ещё и
+        отклоняется, см. efi/dev/engine.py::_find_repeat).
+        """
+        return [task.spec for task in await self._store.finished_projects() if task.spec is not None]
 
     async def _render_context(self) -> str:
         if self._interests is None:

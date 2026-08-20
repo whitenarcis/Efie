@@ -31,15 +31,18 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
 
 from efi.config.schema import TaskRole
+from efi.dev.imports import ImportProblem, cross_file_problems, render_requirements
 from efi.dev.qwen_client import QwenCoderClient
 from efi.dev.readme import README_PATH, ReadmeWriter
 from efi.dev.sandbox import CodeSandbox
 from efi.dev.schemas import MAX_PROJECT_FILES, FileSpec, GeneratedFile, ProjectSpec
+from efi.dev.showcase import significant_tokens
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Role, Session
@@ -81,6 +84,15 @@ _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*\n(?P<body>.*?)(?:\n\s*```|\Z)", re
 #: бессмысленно, надо просить короче.
 _TRUNCATED_PROBLEM = f"ответ модели оборвался по лимиту в {_SPEC_MAX_OUTPUT_TOKENS} токенов"
 
+#: То же самое, но для файла с кодом. Уходит кодеру вместо голого
+#: SyntaxError: по «почини синтаксис» он допишет тот же длинный файл и снова
+#: не поместится, потратив все круги правок на один и тот же обрыв.
+_TRUNCATED_FILE_HINT = (
+    "Файл оборвался: ответ не поместился в лимит вывода. Напиши его ЗАНОВО и КОРОЧЕ — тот же "
+    "публичный интерфейс, но компактнее: без длинных docstring'ов, без примеров использования "
+    "в комментариях, без вынесенных в код таблиц данных."
+)
+
 
 @dataclass(slots=True, frozen=True)
 class _SpecAttempt:
@@ -120,9 +132,14 @@ class BuildResult:
     #: такими файлами не публикуется — см. `is_publishable`.
     broken_paths: list[str] = field(default_factory=list)
     #: Почему сборка оборвалась целиком, если оборвалась: снятая с
-    #: обслуживания модель, отвергнутый ключ. Дословный ответ провайдера —
-    #: это то, по чему владелец найдёт причину за минуту, а не за вечер.
+    #: обслуживания модель, отвергнутый ключ, несходящиеся импорты. Дословная
+    #: причина — это то, по чему владелец найдёт беду за минуту, а не за вечер.
     failure_reason: str = ""
+    #: Повторять бессмысленно: причина не в удаче, а в конфигурации. Снятая с
+    #: обслуживания модель к следующему часу не вернётся, а вот кодер, который
+    #: разошёлся с собственным замыслом, со второй попытки часто сходится —
+    #: разница ровно в этом флаге (см. efi/dev/worker.py).
+    permanent: bool = False
 
     @property
     def is_publishable(self) -> bool:
@@ -167,7 +184,9 @@ class DevEngine:
         #: внятной документации не публикуется (см. efi/dev/readme.py).
         self._readme = readme if readme is not None else ReadmeWriter(coder)
 
-    async def design(self, idea: str = "", *, context: str = "") -> tuple[ProjectSpec | None, str]:
+    async def design(
+        self, idea: str = "", *, context: str = "", built: Sequence[ProjectSpec] = ()
+    ) -> tuple[ProjectSpec | None, str]:
         """
         Спека проекта и — если не вышло — ПРИЧИНА, по которой не вышло.
 
@@ -175,6 +194,12 @@ class DevEngine:
         с конкретной темой); пусто — придумывает сама. `context` — чем Эфи
         сейчас живёт (интересы, недавние темы): из этого получаются проекты
         «про её жизнь», а не случайные утилиты из воздуха.
+
+        `built` — что уже написано. Без этого списка модель раз за разом
+        придумывает то же самое: интересы меняются медленно, а «придумай себе
+        проект» на одном и том же контексте даёт один и тот же ответ. Стоит
+        это не только скуки: имя репозитория занято, и пуш второго такого
+        проекта отклоняется как непустая история.
 
         Причина возвращается наружу, а не остаётся в логе, потому что снаружи
         все отказы выглядели одинаково — «не придумалось ничего, что стоило бы
@@ -185,7 +210,7 @@ class DevEngine:
         problems: list[str] = []
         for attempt in range(1, _MAX_SPEC_ATTEMPTS + 1):
             answer = await self._ask_for_spec(
-                idea, context=context, previous_problem=problems[-1] if problems else ""
+                idea, context=context, built=built, previous_problem=problems[-1] if problems else ""
             )
             if answer.problem:
                 problems.append(answer.problem)
@@ -210,6 +235,13 @@ class DevEngine:
                 logger.info("dev_engine: спека %r без внятной проблемы или без кода", spec.title)
                 problems.append(f"в замысле «{spec.title}» нет ни внятной проблемы, ни файлов с кодом")
                 continue
+            repeat = _find_repeat(spec, built)
+            if repeat is not None:
+                logger.info(
+                    "dev_engine: замысел «%s» повторяет уже написанный «%s»", spec.title, repeat.title
+                )
+                problems.append(f"замысел «{spec.title}» повторяет уже написанный «{repeat.title}»")
+                continue
 
             logger.info(
                 "dev_engine: замысел «%s» (%s), файлов: %d", spec.title, spec.slug, len(spec.files)
@@ -222,8 +254,15 @@ class DevEngine:
 
     async def build(self, spec: ProjectSpec) -> BuildResult:
         """
-        Пишет все файлы спеки. Порядок — как в спеке: первым идёт то, что
-        модель считает основой, и последующие файлы видят его интерфейс.
+        Пишет все файлы спеки, сводит их друг с другом и укомплектовывает
+        проект тем, что есть у любого живого репозитория.
+
+        Порядок написания — не порядок спеки: модули идут первыми, точка
+        входа последней (см. `_writing_order`). Причина в том, что кодер
+        видит интерфейсы только УЖЕ написанных файлов: main.py, написанный
+        первым, выдумывает функции парсера, а парсер потом пишется со своими
+        именами — и проект, у которого каждый файл по отдельности безупречен,
+        не запускается вовсе.
 
         README пишется ПОСЛЕДНИМ и всегда: он документирует то, что реально
         получилось, а не то, что задумывалось, — и без него проект не
@@ -233,7 +272,7 @@ class DevEngine:
         files: list[GeneratedFile] = []
         broken: list[str] = []
 
-        for file_spec in spec.files[:MAX_PROJECT_FILES]:
+        for file_spec in _writing_order(spec.files[:MAX_PROJECT_FILES]):
             generated = await self._write_one(spec, file_spec, written)
             if generated is None:
                 broken.append(file_spec.path)
@@ -244,7 +283,9 @@ class DevEngine:
                 unavailable = self._coder.unavailable_reason
                 if unavailable:
                     logger.error("dev_engine: сборка %s остановлена — %s", spec.slug, unavailable)
-                    return BuildResult(files=[], broken_paths=broken, failure_reason=unavailable)
+                    return BuildResult(
+                        files=[], broken_paths=broken, failure_reason=unavailable, permanent=True
+                    )
                 continue
             written[generated.path] = generated.content
             files.append(generated)
@@ -253,9 +294,84 @@ class DevEngine:
         # выбрасываем: документация по замыслу вместо документации по коду —
         # это ровно тот README, ради которого никто не открывает репозиторий.
         code_files = [item for item in files if item.path.lower() != README_PATH.lower()]
-        if code_files:
-            code_files.append(await self._readme.write(spec, code_files))
+        if not code_files:
+            return BuildResult(files=[], broken_paths=broken)
+
+        code_files, unresolved_imports = await self._reconcile_imports(spec, code_files)
+        if unresolved_imports:
+            # Проект, который падает ImportError'ом на первой строке, — это не
+            # «с замечаниями», это неработающий проект. Выкладывать такой под
+            # своим именем незачем.
+            logger.warning("dev_engine: %s не сходится по импортам: %s", spec.slug, unresolved_imports[0])
+            return BuildResult(
+                files=code_files,
+                broken_paths=[*broken, *sorted({item.path for item in unresolved_imports})],
+                failure_reason=unresolved_imports[0].message,
+            )
+
+        code_files.append(await self._readme.write(spec, code_files))
+        code_files.extend(_scaffolding_files(spec))
         return BuildResult(files=code_files, broken_paths=broken)
+
+    async def _reconcile_imports(
+        self, spec: ProjectSpec, files: list[GeneratedFile]
+    ) -> tuple[list[GeneratedFile], list[ImportProblem]]:
+        """
+        Сводит файлы друг с другом: то, чего не видит ни компилятор, ни линтер
+        по одному файлу (см. efi/dev/imports.py).
+
+        Найденное уходит кодеру теми же словами, что и замечания песочницы, —
+        и повторяется, пока не сойдётся или пока не кончатся круги правок:
+        одна правка часто рождает следующее расхождение.
+        """
+        by_path = {item.path: item for item in files}
+        for _round in range(self._max_fix_iterations):
+            problems = cross_file_problems(
+                {path: item.content for path, item in by_path.items()}, stack=spec.stack
+            )
+            if not problems:
+                return list(by_path.values()), []
+
+            fixed_anything = False
+            for path in sorted({item.path for item in problems}):
+                diagnostics = "\n".join(item.message for item in problems if item.path == path)
+                current = by_path[path]
+                logger.info("dev_engine: %s не сходится с соседями: %s", path, diagnostics.split("\n")[0])
+                repaired = await self._coder.fix_file(path, current.content, diagnostics)
+                if repaired is None or repaired.strip() == current.content.strip():
+                    continue
+                report = await self._sandbox.check(path, repaired)
+                if report.syntax_broken:
+                    continue  # правка хуже болезни: до неё файл хотя бы парсился
+                fixed_anything = True
+                by_path[path] = current.model_copy(
+                    update={
+                        "content": repaired,
+                        "fix_rounds": current.fix_rounds + 1,
+                        "unresolved_diagnostics": report.render(),
+                    }
+                )
+            if not fixed_anything:
+                break
+
+        remaining = cross_file_problems(
+            {path: item.content for path, item in by_path.items()}, stack=spec.stack
+        )
+        for problem in remaining:
+            if problem.fatal:
+                continue
+            # Несмертельное расхождение (неизвестный модуль, который может
+            # оказаться настоящим пакетом) едет в репозиторий как замечание:
+            # это материал и для реплики в чат, и для будущей ревизии.
+            current = by_path[problem.path]
+            by_path[problem.path] = current.model_copy(
+                update={
+                    "unresolved_diagnostics": "\n".join(
+                        filter(None, [current.unresolved_diagnostics, problem.message])
+                    )
+                }
+            )
+        return list(by_path.values()), [item for item in remaining if item.fatal]
 
     async def _write_one(
         self, spec: ProjectSpec, file_spec: FileSpec, already_written: dict[str, str]
@@ -263,6 +379,10 @@ class DevEngine:
         source = await self._coder.write_file(spec, file_spec, already_written=already_written)
         if source is None:
             return None
+        # Файл, оборванный по лимиту вывода, чинится не «исправь синтаксис»:
+        # кодер честно допишет ту же функцию и упрётся в тот же лимит. Ему
+        # нужно сказать, что случилось на самом деле.
+        truncated_hint = _TRUNCATED_FILE_HINT if self._coder.last_answer_truncated else ""
 
         report = await self._sandbox.check(file_spec.path, source)
         rounds = 0
@@ -272,7 +392,9 @@ class DevEngine:
                 "dev_engine: %s — правка %d/%d по замечаниям: %s",
                 file_spec.path, rounds, self._max_fix_iterations, report.render().replace("\n", "; ")[:160],
             )
-            fixed = await self._coder.fix_file(file_spec.path, source, report.render())
+            diagnostics = "\n".join(filter(None, [truncated_hint, report.render()]))
+            truncated_hint = ""
+            fixed = await self._coder.fix_file(file_spec.path, source, diagnostics)
             if fixed is None:
                 break
             source = fixed
@@ -294,12 +416,19 @@ class DevEngine:
             unresolved_diagnostics=report.render(),
         )
 
-    async def _ask_for_spec(self, idea: str, *, context: str, previous_problem: str) -> _SpecAttempt:
+    async def _ask_for_spec(
+        self, idea: str, *, context: str, built: Sequence[ProjectSpec], previous_problem: str
+    ) -> _SpecAttempt:
         user_parts = []
         if idea.strip():
             user_parts.append(f"Замысел, о котором уже договорились: {idea.strip()}")
         if context.strip():
             user_parts.append(f"Чем ты сейчас живёшь и что тебе интересно: {context.strip()}")
+        if built:
+            written = "\n".join(f"- {item.render_for_prompt()}" for item in built[:_MAX_BUILT_SHOWN])
+            user_parts.append(
+                f"Это ты уже написала — НЕ повторяйся ни темой, ни именем репозитория:\n{written}"
+            )
         if previous_problem:
             user_parts.append(_retry_hint(previous_problem))
         if not user_parts:
@@ -327,6 +456,76 @@ class DevEngine:
             )
             return _SpecAttempt(problem=_TRUNCATED_PROBLEM)
         return _SpecAttempt(text=response.text)
+
+
+#: Сколько уже написанных проектов показывать модели. Список нужен, чтобы не
+#: повторяться, а не чтобы занять им весь промпт: десяток строк хватает,
+#: дальше начинается пересказ портфолио вместо задания.
+_MAX_BUILT_SHOWN = 10
+
+#: С какой доли общих слов замысел считается повтором уже написанного. Порог
+#: тот же, что у показа проекта в чужом разговоре (efi/dev/showcase.py): «оба
+#: про логи» — совпадение, «оба на питоне» — нет, стоп-слова не в счёт.
+_REPEAT_SCORE = 0.6
+
+
+def _find_repeat(spec: ProjectSpec, built: Sequence[ProjectSpec]) -> ProjectSpec | None:
+    """
+    Не придумала ли она заново то, что уже написала.
+
+    Проверяется и имя репозитория, и суть: одинаковый slug — это ещё и
+    сорванный пуш (в непустой репозиторий история не заезжает), а одинаковая
+    суть под новым именем — второй такой же проект в профиле, по которому
+    видно, что автор себя не помнит.
+    """
+    subject = significant_tokens(f"{spec.title} {spec.problem}")
+    for other in built:
+        if other.slug == spec.slug:
+            return other
+        if not subject:
+            continue
+        overlap = subject & significant_tokens(f"{other.title} {other.problem}")
+        if len(overlap) / len(subject) >= _REPEAT_SCORE:
+            return other
+    return None
+
+
+#: Имена, по которым файл узнаётся как точка входа. Он пишется последним:
+#: точке входа нужны чужие интерфейсы, а её собственный не нужен никому.
+_ENTRYPOINT_SUFFIXES = ("main.py", "cli.py", "__main__.py", "app.py")
+
+
+def _writing_order(files: list[FileSpec]) -> list[FileSpec]:
+    """Модули вперёд, точка входа в конец — при устойчивом порядке внутри групп."""
+    modules = [item for item in files if not item.path.lower().endswith(_ENTRYPOINT_SUFFIXES)]
+    entrypoints = [item for item in files if item.path.lower().endswith(_ENTRYPOINT_SUFFIXES)]
+    return [*modules, *entrypoints]
+
+
+#: .gitignore проекта на Python. Не «на всякий случай»: без него первый же
+#: запуск оставляет __pycache__, и репозиторий, в который никто не заглядывал
+#: после релиза, выглядит именно так, как и есть.
+_GITIGNORE = (
+    "__pycache__/\n*.py[cod]\n*.egg-info/\n.venv/\nvenv/\n.env\n.ruff_cache/\n"
+    ".pytest_cache/\n.mypy_cache/\n"
+)
+
+
+def _scaffolding_files(spec: ProjectSpec) -> list[GeneratedFile]:
+    """
+    Обвязка репозитория, которую не надо сочинять: .gitignore всегда,
+    requirements.txt — только если в стеке действительно есть чужие пакеты.
+
+    Пишется детерминированно, а не кодером: это не творческая задача, а
+    разница между «сгенерированной папкой с файлами» и репозиторием, который
+    не стыдно открыть. Пустой requirements.txt при этом хуже отсутствующего —
+    он сообщает читателю ровно ничего.
+    """
+    files = [GeneratedFile(path=".gitignore", content=_GITIGNORE)]
+    requirements = render_requirements(spec.stack)
+    if requirements:
+        files.append(GeneratedFile(path="requirements.txt", content=requirements))
+    return files
 
 
 def parse_spec(raw: str) -> tuple[ProjectSpec | None, str]:

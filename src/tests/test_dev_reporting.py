@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -219,10 +220,14 @@ class _StubEngine:
         self._design_failure = design_failure
         self.design_context = ""
         self.design_calls = 0
+        self.built_seen: list[ProjectSpec] = []
 
-    async def design(self, idea: str = "", *, context: str = "") -> tuple[ProjectSpec | None, str]:
+    async def design(
+        self, idea: str = "", *, context: str = "", built: Sequence[ProjectSpec] = ()
+    ) -> tuple[ProjectSpec | None, str]:
         self.design_calls += 1
         self.design_context = context
+        self.built_seen = list(built)
         return (self._spec, "") if self._spec is not None else (None, self._design_failure)
 
     async def build(self, spec: ProjectSpec) -> BuildResult:
@@ -275,6 +280,12 @@ def _store(tmp_path: Path) -> DevTaskStore:
     return DevTaskStore(Database(tmp_path / "efi.db", migrations=MIGRATIONS))
 
 
+async def _tick_until_settled(worker: DevWorker, *, limit: int = 5) -> None:
+    """Гоняет цикл, пока задача не придёт к терминальному статусу: сбой теперь не хоронит с первого раза."""
+    for _ in range(limit):
+        await worker._tick()
+
+
 async def test_pending_task_goes_all_the_way_to_a_link(tmp_path: Path) -> None:
     store = _store(tmp_path)
     manager = _CollectingManager()
@@ -305,6 +316,7 @@ async def test_the_worker_is_busy_while_coding(tmp_path: Path) -> None:
 
 
 async def test_unbuildable_project_fails_loudly_for_the_person_who_asked(tmp_path: Path) -> None:
+    """Провал заказанной задачи обязан быть слышен — но только окончательный, а не каждый заход."""
     store = _store(tmp_path)
     manager = _CollectingManager()
     task = await store.create("утилита", chat_id=_CHAT_ID, is_collab=True)
@@ -313,11 +325,42 @@ async def test_unbuildable_project_fails_loudly_for_the_person_who_asked(tmp_pat
 
     await worker._tick()
 
+    retrying = await store.get(task.id)
+    assert retrying is not None
+    assert retrying.status is DevTaskStatus.PENDING, "первый сбой — повод вернуться, а не хоронить"
+    assert not any("не вышел" in item.message for item in manager.notifications)
+
+    await _tick_until_settled(worker)
+
     failed = await store.get(task.id)
     assert failed is not None
     assert failed.status is DevTaskStatus.FAILED
     assert "src/main.py" in failed.error
     assert any("не вышел" in item.message for item in manager.notifications)
+
+
+async def test_a_dead_coder_is_not_retried(tmp_path: Path) -> None:
+    """
+    Снятая с обслуживания модель к следующему часу не вернётся. Повторять
+    такое — тратить запросы на заведомо тот же ответ, а человеку показывать
+    «делаю», когда делать нечем.
+    """
+    store = _store(tmp_path)
+    manager = _CollectingManager()
+    task = await store.create("утилита", chat_id=_CHAT_ID, is_collab=True)
+    dead = BuildResult(
+        files=[],
+        failure_reason="модель 'qwen' недоступна: HTTP 404 model_decommissioned",
+        permanent=True,
+    )
+    worker = _worker(store, manager, engine=_StubEngine(build=dead))
+
+    await worker._tick()
+
+    failed = await store.get(task.id)
+    assert failed is not None
+    assert failed.status is DevTaskStatus.FAILED
+    assert "model_decommissioned" in failed.error
 
 
 async def test_github_failure_keeps_the_task_honest(tmp_path: Path) -> None:
@@ -326,7 +369,7 @@ async def test_github_failure_keeps_the_task_honest(tmp_path: Path) -> None:
     task = await store.create("утилита", chat_id=_CHAT_ID, is_collab=True)
     worker = _worker(store, manager, github=_StubGitHub(error="токен без прав repo"))
 
-    await worker._tick()
+    await _tick_until_settled(worker)
 
     failed = await store.get(task.id)
     assert failed is not None
@@ -405,7 +448,7 @@ async def test_a_requested_project_that_fails_design_keeps_the_real_reason(tmp_p
     engine = _StubEngine(spec=None, design_failure="ответ модели оборвался по лимиту в 2048 токенов")
     worker = _worker(store, manager, engine=engine)
 
-    await worker._tick()
+    await _tick_until_settled(worker)
 
     failed = await store.get(task.id)
     assert failed is not None
@@ -437,3 +480,32 @@ async def test_own_project_starts_from_what_she_lives_by(tmp_path: Path) -> None
     await worker._tick()
 
     assert "разбор логов" in engine.design_context
+
+
+async def test_the_next_idea_knows_what_is_already_written(tmp_path: Path) -> None:
+    """Без этого списка она раз в неделю придумывает ту же утилиту — и упирается в занятое имя репозитория."""
+    store = _store(tmp_path)
+    done = await store.create("прошлый проект", chat_id=_CHAT_ID)
+    await store.update(done, spec=_SPEC, status=DevTaskStatus.DONE, repo_url=_REPO.html_url)
+    engine = _StubEngine()
+    worker = _worker(store, _CollectingManager(), engine=engine, self_initiated=1.0)
+
+    await worker._tick()
+
+    assert [item.slug for item in engine.built_seen] == ["log-digest"]
+
+
+async def test_her_own_idea_is_worth_mentioning_when_it_appears(tmp_path: Path) -> None:
+    """
+    «Придумала себе штуку и сажусь писать» человек говорит в начале работы, а
+    не только когда всё готово. Без этой реплики собственный проект молчит
+    ровно до релиза — то есть пока не станет фактом, к которому уже нечего
+    добавить.
+    """
+    store = _store(tmp_path)
+    manager = _CollectingManager()
+    worker = _worker(store, manager, self_initiated=1.0)
+
+    await worker._tick()
+
+    assert any("придумала структуру" in item.message for item in manager.notifications)

@@ -112,6 +112,40 @@ async def test_live_work_is_not_reclaimed(tmp_path: Path) -> None:
     assert await store.reclaim_stalled(older_than=timedelta(hours=3)) == []
 
 
+async def test_finished_work_is_remembered_for_the_next_idea(tmp_path: Path) -> None:
+    """
+    Список написанного нужен не для отчёта, а для замысла: без него «придумай
+    себе проект» на медленно меняющихся интересах раз за разом даёт ту же
+    утилиту, а имя репозитория оказывается занято её же прошлым проектом.
+    """
+    store = DevTaskStore(_database(tmp_path))
+    done = await store.create("идея", chat_id=1)
+    done = await store.update(done, spec=_SPEC, status=DevTaskStatus.DONE, repo_url="https://git/x")
+    running = await store.create("вторая идея", chat_id=1)
+    await store.update(running, spec=_SPEC.model_copy(update={"slug": "disk-watch"}))
+
+    finished = await store.finished_projects()
+
+    assert [item.id for item in finished] == [done.id]
+    assert await store.taken_slugs() == {"log-digest", "disk-watch"}, "занято и то, что ещё пишется"
+
+
+async def test_a_project_without_a_link_is_still_hers_to_revisit(tmp_path: Path) -> None:
+    """
+    Локальный режим (без токена GitHub) — рабочий: код есть, ссылки нет.
+    Требовать ссылку для ревизии значило бы, что у владельца без токена
+    возвращения к своему коду не существует вовсе.
+    """
+    store = DevTaskStore(_database(tmp_path))
+    task = await store.create("идея", chat_id=1)
+    task = await store.update(task, spec=_SPEC, status=DevTaskStatus.DONE)
+    await store.update(task, error="без пуша: не настроен доступ к GitHub")
+
+    due = await store.due_for_review(not_reviewed_for=timedelta(seconds=0))
+
+    assert [item.id for item in due] == [task.id]
+
+
 async def test_open_task_is_visible_per_chat(tmp_path: Path) -> None:
     """По этому признаку стол переговоров не берёт вторую идею в чате, где уже что-то пишется."""
     store = DevTaskStore(_database(tmp_path))

@@ -55,8 +55,15 @@ _STOP_TOKENS = frozenset(
 )
 
 
-def _significant_tokens(text: str) -> set[str]:
-    """Значимые слова текста, усечённые до основы (см. _STEM_LENGTH)."""
+def significant_tokens(text: str) -> set[str]:
+    """
+    Значимые слова текста, усечённые до основы (см. _STEM_LENGTH).
+
+    Публичная: тем же способом efi.dev.engine узнаёт, не придумала ли она
+    заново проект, который уже написала. Правило «что считать одной и той же
+    темой» должно быть одно на всю подсистему, иначе повтор, который здесь
+    считается совпадением, там окажется новой идеей.
+    """
     return {
         token.lower()[:_STEM_LENGTH]
         for token in _TOKEN_RE.findall(text or "")
@@ -73,11 +80,11 @@ def showcase_score(text: str, task: DevTask) -> float:
         return 0.0
 
     subject = f"{task.spec.title} {task.spec.problem}"
-    project_tokens = _significant_tokens(subject)
+    project_tokens = significant_tokens(subject)
     if not project_tokens:
         return 0.0
 
-    text_tokens = _significant_tokens(text)
+    text_tokens = significant_tokens(text)
     if not text_tokens:
         return 0.0
     return len(project_tokens & text_tokens) / len(project_tokens)
@@ -100,4 +107,4 @@ def pick_showcase(
     return best[1] if best is not None else None
 
 
-__all__ = ["MIN_SHOWCASE_SCORE", "pick_showcase", "showcase_score"]
+__all__ = ["MIN_SHOWCASE_SCORE", "pick_showcase", "showcase_score", "significant_tokens"]
