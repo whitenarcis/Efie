@@ -25,6 +25,15 @@ Worker'а, где есть личность, история чата и теку
     failure  — честное «не получилось». Только для совместных задач: человек,
                который заказал проект, обязан узнать, что проект не вышел, а
                вот отчитываться о провале собственной затеи никто не просил.
+
+Отдельно от рассказов — ПАМЯТЬ. Всё, что с проектом происходило, пишется в
+журнал прожитого (efi/memory/social_memory.py, домен H) независимо от того,
+сказала она об этом кому-нибудь или нет: взялась, бросила и почему, вернулась
+и поправила. Разница принципиальная. Рассказ живёт в чате один вечер и
+уходит из истории; память всплывает через неделю сама, когда человек
+спрашивает «а почему ты забросила ту штуку с логами?» — и без записи ответом
+будет вежливая выдумка, потому что признаться «не помню» модели тяжелее, чем
+сочинить.
 """
 
 from __future__ import annotations
@@ -125,7 +134,11 @@ class DevReporter:
         услышал ли кто-то об этом. Сообщение же ставится только при наличии
         чата.
         """
-        await self._remember(task, url=url)
+        await self._remember(
+            task,
+            kind=SocialInteractionKind.DEV_RELEASE,
+            text=f"Дописала и выложила {_subject_for_memory(task)} {url}".strip(),
+        )
         if task.chat_id is None:
             return
         await self._put(task, _render_release_reason(task, url=url, build=build), priority=_RELEASE_PRIORITY)
@@ -150,11 +163,50 @@ class DevReporter:
         await self._put(task, _render_question_reason(task, question), priority=_RELEASE_PRIORITY)
 
     async def report_failure(self, task: DevTask, reason: str) -> None:
-        """Не получилось. Только для совместных задач — см. докстринг модуля."""
+        """
+        Не получилось. В чат — только для совместных задач (см. докстринг
+        модуля), в память — всегда.
+
+        Собственная затея, которая не вышла, никому не докладывается, но
+        помнить о ней она обязана: это её вечер работы и её решение бросить.
+        Без записи «почему ты забросила ту штуку?» останется без ответа —
+        точнее, с придуманным.
+        """
+        await self._remember(
+            task,
+            kind=SocialInteractionKind.DEV_ABANDONED,
+            text=f"{_subject_for_memory(task)}. Бросила после {task.attempts} захода(ов): {reason}",
+        )
         if task.chat_id is None or not task.is_collab:
             logger.info("dev_reporter: задача #%s провалилась (%s), рассказывать некому", task.id, reason)
             return
         await self._put(task, _render_failure_reason(task, reason), priority=_PROGRESS_PRIORITY)
+
+    async def remember_start(self, task: DevTask) -> None:
+        """
+        Запись «взялась за это»: замысел, стек, из чего он вырос.
+
+        Пишется в момент, когда спека готова, а не когда проект дописан:
+        между этими событиями часы, и всё это время на вопрос «чем занята?»
+        отвечать было нечем, кроме текущего статуса в промпте, который живёт
+        ровно до конца работы.
+        """
+        spec = task.spec
+        if spec is None:
+            return
+        whose = "Задачу принесли в разговоре" if task.is_collab else "Затеяла сама"
+        files = ", ".join(item.path for item in spec.files)
+        await self._remember(
+            task,
+            kind=SocialInteractionKind.DEV_STARTED,
+            text=f"{spec.render_for_prompt()}. {whose}. Задумала так: {files}",
+        )
+
+    async def remember_revision(self, task: DevTask, note: str) -> None:
+        """Возвращение к старому проекту: что увидела и что с этим сделала (efi/dev/maintenance.py)."""
+        await self._remember(
+            task, kind=SocialInteractionKind.DEV_REVISION, text=f"{_subject_for_memory(task)}. {note}"
+        )
 
     async def _put(self, task: DevTask, message: str, *, priority: int) -> None:
         await self._manager.put(
@@ -167,24 +219,30 @@ class DevReporter:
             )
         )
 
-    async def _remember(self, task: DevTask, *, url: str) -> None:
-        if self._social_memory is None:
+    async def _remember(self, task: DevTask, *, kind: SocialInteractionKind, text: str) -> None:
+        """
+        Одна запись о ремесле в журнал прожитого. Не бросает: память ценна,
+        но сбой записи не отменяет уже сделанной работы и не должен ронять
+        фоновый цикл.
+        """
+        if self._social_memory is None or not text.strip():
             return
-        title = task.spec.title if task.spec is not None else task.idea
-        problem = task.spec.problem if task.spec is not None else ""
-        text = f"Дописала и выложила {title}. {problem}".strip()
         try:
             await self._social_memory.record(
-                SocialInteraction(
-                    kind=SocialInteractionKind.DEV_RELEASE,
-                    text=f"{text} {url}".strip(),
-                    chat_id=task.chat_id,
-                )
+                SocialInteraction(kind=kind, text=text.strip(), chat_id=task.chat_id)
             )
         except Exception:
-            # Память о релизе ценна, но уже отправленную ссылку она не
-            # отменяет — сбой записи не должен ронять фоновый цикл.
-            logger.warning("dev_reporter: не удалось записать релиз #%s в память", task.id, exc_info=True)
+            logger.warning(
+                "dev_reporter: не удалось записать %s по задаче #%s в память", kind.value, task.id,
+                exc_info=True,
+            )
+
+
+def _subject_for_memory(task: DevTask) -> str:
+    """Как проект называется в памяти: название и суть, а не номер задачи."""
+    if task.spec is not None:
+        return f"«{task.spec.title}» — {task.spec.problem.strip()}"
+    return task.idea.strip() or "замысел без названия"
 
 
 def _render_progress_reason(task: DevTask, note: str) -> str:

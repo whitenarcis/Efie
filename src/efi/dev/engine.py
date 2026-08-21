@@ -31,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
@@ -40,7 +40,7 @@ from efi.config.schema import TaskRole
 from efi.dev.imports import ImportProblem, cross_file_problems, render_requirements
 from efi.dev.qwen_client import QwenCoderClient
 from efi.dev.readme import README_PATH, ReadmeWriter
-from efi.dev.sandbox import CodeSandbox
+from efi.dev.sandbox import CodeSandbox, SandboxReport, salvage_python
 from efi.dev.schemas import MAX_PROJECT_FILES, FileSpec, GeneratedFile, ProjectSpec
 from efi.dev.showcase import significant_tokens
 from efi.llm.errors import LLMError
@@ -87,6 +87,12 @@ _TRUNCATED_PROBLEM = f"ответ модели оборвался по лими�
 #: То же самое, но для файла с кодом. Уходит кодеру вместо голого
 #: SyntaxError: по «почини синтаксис» он допишет тот же длинный файл и снова
 #: не поместится, потратив все круги правок на один и тот же обрыв.
+_REWRITE_HINT = (
+    "ВАЖНО: прошлая попытка этого файла оказалась нерабочей — оборвалась по лимиту вывода или не "
+    "разбиралась как Python. Напиши его заново и КОМПАКТНЕЕ: тот же публичный интерфейс, короткие "
+    "docstring'и, без примеров использования в комментариях и без длинных таблиц данных в коде."
+)
+
 _TRUNCATED_FILE_HINT = (
     "Файл оборвался: ответ не поместился в лимит вывода. Напиши его ЗАНОВО и КОРОЧЕ — тот же "
     "публичный интерфейс, но компактнее: без длинных docstring'ов, без примеров использования "
@@ -252,10 +258,16 @@ class DevEngine:
         logger.info("dev_engine: за %d попыток не вышло годной спеки: %s", _MAX_SPEC_ATTEMPTS, reason)
         return None, reason
 
-    async def build(self, spec: ProjectSpec) -> BuildResult:
+    async def build(self, spec: ProjectSpec, *, existing: Mapping[str, str] | None = None) -> BuildResult:
         """
         Пишет все файлы спеки, сводит их друг с другом и укомплектовывает
         проект тем, что есть у любого живого репозитория.
+
+        `existing` — файлы, написанные в ПРОШЛЫЙ заход по этой же задаче
+        (efi/dev/worker.py хранит их в задаче). Заново они не пишутся: если в
+        прошлый раз проект развалился на четвёртом файле из-за лимита, то
+        переписывать первые три — это и лишние запросы к тому же лимиту, и
+        новый шанс разойтись с тем, что уже сходилось.
 
         Порядок написания — не порядок спеки: модули идут первыми, точка
         входа последней (см. `_writing_order`). Причина в том, что кодер
@@ -271,8 +283,15 @@ class DevEngine:
         written: dict[str, str] = {}
         files: list[GeneratedFile] = []
         broken: list[str] = []
+        reused = dict(existing or {})
 
         for file_spec in _writing_order(spec.files[:MAX_PROJECT_FILES]):
+            carried = reused.get(file_spec.path)
+            if carried is not None:
+                logger.info("dev_engine: %s остался с прошлого захода, не переписываю", file_spec.path)
+                written[file_spec.path] = carried
+                files.append(GeneratedFile(path=file_spec.path, content=carried))
+                continue
             generated = await self._write_one(spec, file_spec, written)
             if generated is None:
                 broken.append(file_spec.path)
@@ -401,13 +420,18 @@ class DevEngine:
             report = await self._sandbox.check(file_spec.path, source)
 
         if report.syntax_broken:
-            # Здесь и проходит граница между «неидеально» и «нельзя
-            # публиковать»: файл, который не парсится, — это не файл.
-            logger.warning(
-                "dev_engine: %s так и не парсится после %d правок, проект без него не соберётся",
-                file_spec.path, rounds,
-            )
-            return None
+            rescued = await self._rescue(spec, file_spec, source, already_written)
+            if rescued is None:
+                # Здесь и проходит граница между «неидеально» и «нельзя
+                # публиковать»: файл, который не парсится, — это не файл.
+                logger.warning(
+                    "dev_engine: %s так и не парсится после %d правок и переписывания заново, "
+                    "проект без него не соберётся",
+                    file_spec.path, rounds,
+                )
+                return None
+            source, report = rescued
+            rounds += 1
 
         return GeneratedFile(
             path=file_spec.path,
@@ -415,6 +439,47 @@ class DevEngine:
             fix_rounds=rounds,
             unresolved_diagnostics=report.render(),
         )
+
+    async def _rescue(
+        self,
+        spec: ProjectSpec,
+        file_spec: FileSpec,
+        broken_source: str,
+        already_written: dict[str, str],
+    ) -> tuple[str, SandboxReport] | None:
+        """
+        Последняя попытка спасти файл, который не парсится: сначала написать
+        его ЗАНОВО, потом — отрезать оборванный хвост.
+
+        Почему заново, а не ещё одна правка. Круг исправлений просит кодера
+        починить сломанный текст, и когда текст сломан обрывом посреди
+        функции, кодер честно дописывает ту же функцию — и упирается в тот же
+        лимит. Просьба написать компактнее с нуля рвёт этот круг.
+
+        Почему обрезка. Всё, что выше обрыва, — нормальный рабочий код, и
+        терять из-за одной незавершённой функции в конце весь проект, где
+        остальные файлы уже написаны, — худший из возможных обменов. Огрызок
+        при этом не выдаётся за целый файл: если он не отдаёт того, что
+        импортируют соседи, проект всё равно не соберётся (см.
+        `_reconcile_imports`).
+        """
+        fresh = await self._coder.write_file(
+            spec, file_spec, already_written=already_written, hint=_REWRITE_HINT
+        )
+        if fresh is not None:
+            report = await self._sandbox.check(file_spec.path, fresh)
+            if not report.syntax_broken:
+                logger.info("dev_engine: %s переписан заново и на этот раз парсится", file_spec.path)
+                return fresh, report
+
+        salvaged = salvage_python(fresh or broken_source)
+        if not salvaged:
+            return None
+        logger.info(
+            "dev_engine: %s спасён обрезкой оборванного хвоста (%d строк из %d)",
+            file_spec.path, len(salvaged.splitlines()), len((fresh or broken_source).splitlines()),
+        )
+        return salvaged, await self._sandbox.check(file_spec.path, salvaged)
 
     async def _ask_for_spec(
         self, idea: str, *, context: str, built: Sequence[ProjectSpec], previous_problem: str

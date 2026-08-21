@@ -27,6 +27,7 @@ efi.llm.router.LLMRouter — и вот почему.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
@@ -35,7 +36,7 @@ from efi.dev.schemas import FileSpec, ProjectSpec
 from efi.llm.base import LLMProvider
 from efi.llm.errors import LLMAuthError, LLMError, LLMRateLimitError, LLMServerError
 from efi.llm.providers.openai_compatible import OpenAICompatibleProvider
-from efi.llm.schemas import LLMParams, Message, Role, Session
+from efi.llm.schemas import LLMParams, Message, Response, Role, Session
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,20 @@ _FILE_MAX_OUTPUT_TOKENS = 4096
 #: Температура кодера. Ниже разговорной: от кода нужна предсказуемость, а не
 #: разнообразие формулировок.
 _CODER_TEMPERATURE = 0.2
+
+#: Паузы перед повтором запроса, упёршегося во ВРЕМЕННЫЙ отказ (429, 5xx,
+#: таймаут); длина кортежа — это и есть число повторов. Здесь это не
+#: перестраховка, а разница между «проект написан» и «проект потерян»: на
+#: бесплатном тире лимит токенов в минуту выбирается третьим-четвёртым файлом
+#: подряд, и без повтора файл просто не пишется, а за ним разваливается весь
+#: проект. Ждать при этом можно сколько угодно — конвейер фоновый, ответа
+#: никто не держит.
+_RETRY_BACKOFF_SECONDS = (5.0, 20.0, 45.0)
+
+#: Потолок ожидания по Retry-After. Groq на исчерпанном дневном лимите
+#: присылает часы — столько ждать бессмысленно, лучше вернуться к задаче
+#: следующим заходом воркера (см. efi/dev/worker.py).
+_MAX_RETRY_WAIT_SECONDS = 90.0
 
 _SYSTEM_PROMPT = (
     "Ты — опытный Python-разработчик. Пишешь ТОЛЬКО код одного файла, без объяснений, без markdown, "
@@ -82,8 +97,18 @@ class QwenCoderClient:
     единственная разумная реакция — без файла проекта нет.
     """
 
-    def __init__(self, endpoint: EndpointConfig, *, provider: LLMProvider | None = None) -> None:
+    def __init__(
+        self,
+        endpoint: EndpointConfig,
+        *,
+        provider: LLMProvider | None = None,
+        retry_delays: tuple[float, ...] = _RETRY_BACKOFF_SECONDS,
+    ) -> None:
         self._endpoint = endpoint
+        #: Лесенка ожиданий перед повторами. Параметр — ради тестов: пустой
+        #: кортеж означает «не ждать и не повторять», и проверка отказа не
+        #: превращается в минутный сон.
+        self._retry_delays = retry_delays
         #: Последняя причина отказа — дословный ответ провайдера. Нужна, чтобы
         #: «файл не написался» не оставалось единственным, что известно
         #: наружу: имя снятой с обслуживания модели или отвергнутый ключ видны
@@ -138,7 +163,12 @@ class QwenCoderClient:
         return ""
 
     async def write_file(
-        self, spec: ProjectSpec, file_spec: FileSpec, *, already_written: dict[str, str] | None = None
+        self,
+        spec: ProjectSpec,
+        file_spec: FileSpec,
+        *,
+        already_written: dict[str, str] | None = None,
+        hint: str = "",
     ) -> str | None:
         """
         Пишет один файл проекта.
@@ -148,12 +178,17 @@ class QwenCoderClient:
         каждый раз выдумывает интерфейс соседнего модуля заново, и проект
         разваливается на несовместимые куски, каждый из которых по
         отдельности проходит проверку.
+
+        `hint` — дополнительное указание на этот раз: например, что прошлая
+        попытка оборвалась и писать надо компактнее (см.
+        efi.dev.engine.DevEngine._rescue).
         """
         user_content = (
             f"{_render_project_brief(spec)}\n\n"
             f"Сейчас напиши файл `{file_spec.path}`.\n"
             f"Назначение файла: {file_spec.purpose or 'см. структуру проекта выше'}\n"
             f"{_render_context(already_written or {})}"
+            f"{chr(10) + hint if hint else ''}"
         )
         return await self._ask(_SYSTEM_PROMPT, user_content, what=f"write {file_spec.path}")
 
@@ -177,6 +212,41 @@ class QwenCoderClient:
         )
         return await self._ask(_FIX_SYSTEM_PROMPT, user_content, what=f"fix {path}")
 
+    async def _chat_with_retries(
+        self, params: LLMParams, session: Session, *, what: str
+    ) -> Response | None:
+        """
+        Один запрос к кодеру, переживающий временный отказ провайдера.
+
+        Повторяется только то, что от повтора чинится: 429, 5xx, таймаут.
+        Отвергнутый ключ и снятая с обслуживания модель повторов не получают —
+        они не «сейчас занято», а «так больше не работает» (см.
+        `unavailable_reason`), и десять попыток дадут десять одинаковых
+        ответов.
+        """
+        attempts = len(self._retry_delays) + 1
+        for attempt in range(attempts):
+            try:
+                response = await self._provider.chat(params, session)
+            except LLMError as exc:
+                self._last_error = exc
+                self._last_truncated = False
+                wait = _retry_delay(exc, attempt, self._retry_delays)
+                if wait is None or attempt == attempts - 1:
+                    logger.warning("qwen: %s не удалось (%s)", what, exc)
+                    return None
+                logger.info(
+                    "qwen: %s — %s, жду %.0fс и повторяю (%d/%d)",
+                    what, exc, wait, attempt + 1, len(self._retry_delays),
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            self._last_error = None
+            self._last_truncated = response.was_truncated
+            return response
+        return None
+
     async def _ask(self, system_prompt: str, user_content: str, *, what: str) -> str | None:
         params = LLMParams(
             model=self._endpoint.model,
@@ -185,16 +255,9 @@ class QwenCoderClient:
             temperature=_CODER_TEMPERATURE,
         )
         session = Session(messages=[Message(role=Role.USER, content=user_content)])
-        try:
-            response = await self._provider.chat(params, session)
-        except LLMError as exc:
-            self._last_error = exc
-            self._last_truncated = False
-            logger.warning("qwen: %s не удалось (%s)", what, exc)
+        response = await self._chat_with_retries(params, session, what=what)
+        if response is None:
             return None
-
-        self._last_error = None
-        self._last_truncated = response.was_truncated
 
         if response.was_truncated:
             # У кода обрыв по лимиту неисправим в принципе: «последнее
@@ -209,6 +272,25 @@ class QwenCoderClient:
             logger.warning("qwen: %s вернуло пустой ответ", what)
             return None
         return code
+
+
+def _retry_delay(error: LLMError, attempt: int, delays: tuple[float, ...]) -> float | None:
+    """
+    Сколько ждать перед повтором — или None, если повторять нечего.
+
+    Ответ провайдера важнее нашей лесенки: Retry-After он присылает не из
+    вежливости, а потому что знает, когда лимит освободится. Но и ему есть
+    потолок — на исчерпанном дневном лимите приходят часы, а фоновый цикл
+    вернётся к задаче и сам.
+    """
+    if not delays:
+        return None
+    fallback = delays[min(attempt, len(delays) - 1)]
+    if isinstance(error, LLMRateLimitError):
+        return min(error.retry_after or fallback, _MAX_RETRY_WAIT_SECONDS)
+    if isinstance(error, LLMServerError):  # включая LLMTimeoutError
+        return fallback
+    return None
 
 
 def strip_code_fences(raw: str) -> str:

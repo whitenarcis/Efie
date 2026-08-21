@@ -257,6 +257,9 @@ class ProjectMaintainer:
         assert task.spec is not None
 
         if verdict.wants_discussion and verdict.importance >= self._discuss_threshold:
+            await self._reporter.remember_revision(
+                task, f"Упёрлась в развилку, которую не решаю одна: {verdict.question}"
+            )
             await self._reporter.report_question(task, verdict.question)
             logger.info(
                 "dev_maintenance: %s — вопрос владельцу (важность %.2f)", task.spec.slug, verdict.importance
@@ -307,7 +310,15 @@ class ProjectMaintainer:
             return False
 
         if committed:
-            await self._reporter.report_progress(task, verdict.note or _fallback_note(verdict))
+            note = verdict.note or _fallback_note(verdict)
+            # В память — всегда, в чат — по настроению и кулдауну. Правка,
+            # о которой она не успела рассказать, всё равно её работа: через
+            # неделю «я к этой штуке возвращалась и вот что поправила» должно
+            # находиться, а не сочиняться.
+            await self._reporter.remember_revision(
+                task, f"Поправила {verdict.path}: {verdict.what}. Коммит: {_commit_message(verdict)}"
+            )
+            await self._reporter.report_progress(task, note)
         return committed
 
 

@@ -64,6 +64,18 @@ _STALLED_AFTER = timedelta(hours=3)
 #: возвращалась бы к замыслу, который не выходит.
 _MAX_ATTEMPTS = 3
 
+#: Через сколько после провала имеет смысл вернуться к брошенному проекту.
+#: Полсуток — потому что чаще всего провал случается из-за упёршегося лимита
+#: провайдера, а он отпускает к следующему дню; плюс это просто похоже на
+#: правду: к тому, что не пошло вечером, возвращаются наутро, а не через
+#: минуту.
+_REVIVE_AFTER = timedelta(hours=12)
+
+#: Сколько раз возвращаться к одному и тому же брошенному замыслу. Дважды:
+#: третий круг по проекту, который не собрался ни разу за два дня, стоит
+#: квоты, за которую пишется что-то новое.
+_MAX_REVIVALS = 2
+
 
 class InterestSource(Protocol):
     """
@@ -160,6 +172,11 @@ class DevWorker:
 
         task = await self._store.next_pending()
         if task is None:
+            # Довести до конца начатое важнее, чем затеять новое: человек, у
+            # которого пять брошенных проектов и шестой начатый, ничего не
+            # доводит — и выглядит это именно так.
+            task = await self._revive_abandoned()
+        if task is None:
             # Собственная затея тоже начинается с обращения к модели, поэтому
             # занятость поднимается до неё, а не только на сборке.
             self._is_coding = True
@@ -180,6 +197,38 @@ class DevWorker:
             await self._process(task)
         finally:
             self._is_coding = False
+
+    async def _revive_abandoned(self) -> DevTask | None:
+        """
+        Второе дыхание для брошенного проекта.
+
+        Возвращается он не с нуля: спека уже есть, написанные файлы лежат в
+        задаче (`artifacts`), и заход начнётся ровно с того места, где в
+        прошлый раз кончились силы или лимиты. Счётчик заходов обнуляется —
+        это новый подход к снаряду, а не продолжение старого.
+        """
+        candidate = await self._store.abandoned_worth_another_try(
+            not_touched_for=_REVIVE_AFTER, max_revivals=_MAX_REVIVALS
+        )
+        if candidate is None:
+            return None
+
+        logger.info(
+            "dev_worker: возвращаюсь к брошенной задаче #%s (%s), заход %d",
+            candidate.id, candidate.error, candidate.revivals + 1,
+        )
+        revived = await self._store.update(
+            candidate,
+            status=DevTaskStatus.PENDING,
+            attempts=0,
+            revivals=candidate.revivals + 1,
+        )
+        await self._reporter.remember_revision(
+            revived,
+            f"Вернулась к брошенному проекту и попробовала снова. В прошлый раз встало на: "
+            f"{candidate.error or 'непонятно чём'}",
+        )
+        return revived
 
     async def _maybe_review_old_work(self) -> None:
         if self._maintainer is None:
@@ -222,7 +271,10 @@ class DevWorker:
         task = await self._store.update(task, spec=spec)
         # Замысел собственного проекта — такой же повод для реплики, как и
         # заказанного: «придумала себе штуку и сажусь писать» человек говорит
-        # в начале работы, а не только когда всё готово.
+        # в начале работы, а не только когда всё готово. И такой же повод для
+        # записи в память: между замыслом и результатом часы, и всё это время
+        # «чем ты занята?» — вопрос без ответа.
+        await self._reporter.remember_start(task)
         await self._reporter.report_progress(task, _design_note(spec))
         return task
 
@@ -248,11 +300,17 @@ class DevWorker:
                 await self._fail(task, f"замысел не сложился: {reason}")
                 return
             task = await self._store.update(task, spec=spec)
+            await self._reporter.remember_start(task)
             await self._reporter.report_progress(task, _design_note(spec))
 
         task = await self._store.update(task, status=DevTaskStatus.CODING)
-        build = await self._engine.build(spec)
+        build = await self._engine.build(spec, existing=task.artifacts)
         if not build.is_publishable:
+            # То, что успело написаться, остаётся при задаче: следующий заход
+            # не будет переписывать три готовых файла ради четвёртого — это и
+            # лишние запросы к тому же лимиту, и новый шанс разойтись с тем,
+            # что уже сходилось.
+            task = await self._store.update(task, artifacts=_keep_written(spec, build))
             # Отказ кодера как таковой (снятая модель, отвергнутый ключ) к
             # следующему заходу не исправится — повторять его незачем. А вот
             # разошедшиеся между собой файлы со второй генерации часто
@@ -329,6 +387,15 @@ class DevWorker:
             logger.warning("dev_worker: не удалось получить интересы", exc_info=True)
             return ""
         return ", ".join(interests[:_MAX_CONTEXT_INTERESTS])
+
+
+def _keep_written(spec: ProjectSpec, build: BuildResult) -> dict[str, str]:
+    """
+    Файлы спеки, которые в этом заходе получились. README и обвязка не
+    сохраняются: они собираются по готовому коду и должны пересобираться.
+    """
+    wanted = {item.path for item in spec.files}
+    return {item.path: item.content for item in build.files if item.path in wanted}
 
 
 def _design_note(spec: ProjectSpec) -> str:

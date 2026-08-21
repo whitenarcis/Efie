@@ -31,6 +31,7 @@ efi/dev/sandbox.py
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 from dataclasses import dataclass, field
@@ -189,6 +190,77 @@ def _check_syntax(path: str, source: str) -> str | None:
     return None
 
 
+#: Какую долю файла должен сохранить обрезок, чтобы считаться спасённым.
+#: Ниже этого — уже не «файл без последней функции», а огрызок, который
+#: только выглядит рабочим: лучше честно признать, что файла нет.
+_MIN_SALVAGE_RATIO = 0.6
+
+
+def salvage_python(source: str) -> str:
+    """
+    Последний рабочий кусок оборванного файла — или пусто, если спасать нечего.
+
+    Нужно ровно для одного случая, зато самого частого: генерация упёрлась в
+    лимит вывода посреди последней функции. Всё, что выше обрыва, — нормальный
+    рабочий код, и терять его вместе с проектом жалко: одна незавершённая
+    функция в конце стоит проекту жизни, хотя половина файлов уже написана.
+
+    Обрезка идёт по строкам с конца до первого варианта, который парсится, а
+    затем ОБЯЗАТЕЛЬНО выбрасывается последнее определение: именно на нём
+    оборвалась генерация, и «парсится» тут ничего не значит. Функция, у
+    которой уцелели первые три строки тела, синтаксически безупречна и молча
+    возвращает None — это хуже отсутствующего файла, потому что выглядит
+    рабочей.
+
+    Пусто, если после обрезки не осталось большинства файла или не осталось
+    ни одного определения: спасать нечего, и делать вид, что есть, не надо.
+    """
+    lines = source.splitlines()
+    if not lines:
+        return ""
+
+    for end in range(len(lines), 0, -1):
+        if end / len(lines) < _MIN_SALVAGE_RATIO:
+            return ""
+        candidate = "\n".join(lines[:end]).rstrip() + "\n"
+        if _check_syntax("<salvage>", candidate) is not None:
+            continue
+        trimmed = _drop_last_definition(candidate)
+        if not trimmed or len(trimmed.splitlines()) / len(lines) < _MIN_SALVAGE_RATIO:
+            return ""
+        if _has_definitions(trimmed):
+            return trimmed
+    return ""
+
+
+def _drop_last_definition(source: str) -> str:
+    """
+    Убирает последнее определение верхнего уровня вместе с декораторами.
+
+    Это и есть та штука, на которой оборвалась генерация: остальное выше неё
+    — законченный код.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # pragma: no cover — сюда приходит только то, что уже скомпилировалось
+        return ""
+    if not tree.body:
+        return ""
+
+    last = tree.body[-1]
+    start = last.lineno
+    decorators = getattr(last, "decorator_list", [])
+    if decorators:
+        start = min(start, min(item.lineno for item in decorators))
+    kept = "\n".join(source.splitlines()[: start - 1]).rstrip()
+    return f"{kept}\n" if kept else ""
+
+
+def _has_definitions(source: str) -> bool:
+    """Огрызок без единого определения бесполезен: импортировать из него нечего."""
+    return any(line.startswith(("def ", "async def ", "class ")) for line in source.splitlines())
+
+
 def write_project_files(root: Path, files: dict[str, str]) -> list[Path]:
     """
     Раскладывает файлы проекта по диску под `root`.
@@ -209,4 +281,4 @@ def write_project_files(root: Path, files: dict[str, str]) -> list[Path]:
     return written
 
 
-__all__ = ["CodeSandbox", "SandboxReport", "write_project_files"]
+__all__ = ["CodeSandbox", "SandboxReport", "salvage_python", "write_project_files"]

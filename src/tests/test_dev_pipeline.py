@@ -25,7 +25,7 @@ from efi.dev.qwen_client import QwenCoderClient, strip_code_fences
 from efi.dev.readme import missing_sections, problems, render_fallback
 from efi.dev.sandbox import CodeSandbox, write_project_files
 from efi.dev.schemas import FileSpec, GeneratedFile, ProjectSpec
-from efi.llm.errors import LLMServerError
+from efi.llm.errors import LLMAuthError, LLMRateLimitError, LLMServerError
 from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session
 
 _GOOD_SPEC = {
@@ -43,6 +43,11 @@ _GOOD_SPEC = {
 
 def _endpoint() -> EndpointConfig:
     return EndpointConfig(base_url="https://api.groq.com/openai/v1", api_key=SecretStr("k"), model="qwen")
+
+
+def _client(provider: Any, **kwargs: Any) -> QwenCoderClient:
+    """Кодер без пауз между повторами: проверяется поведение, а не терпение."""
+    return QwenCoderClient(_endpoint(), provider=provider, **kwargs)
 
 
 def _spec() -> ProjectSpec:
@@ -387,16 +392,72 @@ async def test_broken_file_is_sent_back_to_the_coder_and_fixed() -> None:
 
 async def test_file_that_never_parses_blocks_publication() -> None:
     """
-    Файл, который не парсится и после трёх правок, — это не «неидеально», а
-    отсутствующий файл: публиковать такой проект нельзя.
+    Файл, который не парсится ни после правок, ни после переписывания
+    заново, — это не «неидеально», а отсутствующий файл: публиковать такой
+    проект нельзя.
     """
-    coder = _ScriptedCoder(["def f(:\n", "def main() -> None:\n    pass\n"], fixes=["still broken(:\n"] * 3)
+    coder = _ScriptedCoder(
+        ["def f(:\n", "def f( всё ещё сломано(:\n", "def main() -> None:\n    pass\n"],
+        fixes=["still broken(:\n"] * 3,
+    )
 
     build = await _engine(coder).build(_spec())
 
     assert coder.fix_calls == 3, "должно быть ровно max_fix_iterations попыток"
     assert build.is_publishable is False
     assert build.broken_paths == ["src/parser.py"]
+
+
+async def test_a_file_that_never_parses_is_rewritten_from_scratch_before_giving_up() -> None:
+    """
+    Круг исправлений просит починить сломанный текст, и когда текст сломан
+    обрывом посреди функции, кодер честно дописывает ту же функцию и
+    упирается в тот же лимит. Просьба написать заново и компактнее рвёт этот
+    круг — и часто спасает весь проект, а не только файл.
+    """
+    coder = _ScriptedCoder(
+        ["def parse(:\n", "def parse_line(raw: str) -> dict:\n    return {}\n", "y = 2\n"],
+        fixes=["ещё хуже(:\n"] * 3,
+    )
+
+    build = await _engine(coder).build(_spec())
+
+    assert build.is_publishable is True
+    assert "def parse_line" in build.as_file_map()["src/parser.py"]
+
+
+async def test_a_truncated_tail_is_cut_off_instead_of_losing_the_whole_project() -> None:
+    """
+    Всё, что выше обрыва, — рабочий код. Терять из-за одной незавершённой
+    функции в конце проект, где остальные файлы уже написаны, — худший из
+    возможных обменов.
+    """
+    truncated = (
+        "import re\n"
+        "\n"
+        "_LINE_RE = re.compile(r'^(?P<ip>\\S+) (?P<code>\\d+)$')\n"
+        "\n"
+        "\n"
+        "def parse_line(raw: str) -> dict:\n"
+        "    match = _LINE_RE.match(raw.strip())\n"
+        "    if match is None:\n"
+        "        return {}\n"
+        "    return match.groupdict()\n"
+        "\n"
+        "\n"
+        "def summarize(rows: list[dict]) -> dict:\n"
+        "    totals: dict[str, int] = {}\n"
+        "    for row in rows:\n"
+        "        key = row.get(\n"
+    )
+    coder = _ScriptedCoder([truncated, truncated, "y = 2\n"], fixes=[None] * 3)  # type: ignore[list-item]
+
+    build = await _engine(coder).build(_spec())
+
+    parser = build.as_file_map()["src/parser.py"]
+    assert build.is_publishable is True
+    assert "def parse_line" in parser
+    assert "summarize" not in parser, "оборванный хвост отрезан, а не выложен как есть"
 
 
 async def test_every_project_gets_a_readme_written_from_the_real_code() -> None:
@@ -538,7 +599,7 @@ async def test_truncated_answer_does_not_hide_behind_invalid_json() -> None:
 
 async def test_coder_errors_do_not_raise() -> None:
     """Сбой провайдера у кодера — это «файл не написался», а не исключение посреди фонового цикла."""
-    client = QwenCoderClient(_endpoint(), provider=_FailingProvider())  # type: ignore[arg-type]
+    client = _client(_FailingProvider(), retry_delays=())
 
     assert await client.write_file(_spec(), _spec().files[0]) is None
     assert await client.fix_file("src/main.py", "x = 1", "E999") is None
@@ -547,6 +608,48 @@ async def test_coder_errors_do_not_raise() -> None:
 class _FailingProvider:
     async def chat(self, params: LLMParams, session: Session) -> Response:
         raise LLMServerError("нет связи", provider="coder")
+
+
+class _FlakyProvider:
+    """Провайдер, который отказывает заданное число раз, а потом отвечает."""
+
+    def __init__(self, error: Exception, *, failures: int) -> None:
+        self._error = error
+        self._left = failures
+        self.calls = 0
+
+    async def chat(self, params: LLMParams, session: Session) -> Response:
+        self.calls += 1
+        if self._left > 0:
+            self._left -= 1
+            raise self._error
+        return Response(choices=[Choice(message=Message(role=Role.ASSISTANT, content="x = 1\n"))])
+
+
+async def test_a_rate_limited_file_is_asked_for_again_instead_of_being_lost() -> None:
+    """
+    На бесплатном тире лимит токенов в минуту выбирается третьим-четвёртым
+    файлом подряд. Без повтора файл просто не пишется — а за ним разваливается
+    весь проект, хотя ждать было нужно полминуты и ждать было некому: конвейер
+    фоновый.
+    """
+    provider = _FlakyProvider(LLMRateLimitError("too many requests", provider="coder"), failures=2)
+    client = _client(provider, retry_delays=(0.0, 0.0, 0.0))
+
+    source = await client.write_file(_spec(), _spec().files[0])
+
+    assert source == "x = 1"
+    assert provider.calls == 3
+
+
+async def test_a_rejected_key_is_not_retried() -> None:
+    """Отвергнутый ключ — это не «сейчас занято»: десять попыток дадут десять одинаковых ответов."""
+    provider = _FlakyProvider(LLMAuthError("invalid api key", provider="coder"), failures=5)
+    client = _client(provider, retry_delays=(0.0, 0.0))
+
+    assert await client.write_file(_spec(), _spec().files[0]) is None
+    assert provider.calls == 1
+    assert "отверг ключ" in client.unavailable_reason
 
 
 class _EchoProvider:
@@ -568,7 +671,7 @@ async def test_coder_sees_the_interfaces_of_already_written_files() -> None:
     проходит проверку.
     """
     provider = _EchoProvider("x = 1\n")
-    client = QwenCoderClient(_endpoint(), provider=provider)  # type: ignore[arg-type]
+    client = _client(provider)
 
     parser_source = "def parse_line(raw: str) -> dict:\n    ...\n\ndef _private() -> None:\n    ...\n"
 

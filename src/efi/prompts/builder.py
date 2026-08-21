@@ -226,6 +226,10 @@ class _DevContext:
 
     active: list[DevTask] = field(default_factory=list)
     releases: list[DevTask] = field(default_factory=list)
+    #: Недавно брошенные проекты с причинами. В промпте они не для отчётности,
+    #: а для разговора: «а что там с той штукой?» — вопрос, на который у неё
+    #: должен быть ответ, а не правдоподобная выдумка.
+    abandoned: list[DevTask] = field(default_factory=list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -359,7 +363,7 @@ class EfiSystemPromptBuilder:
             _build_person_block(person_profile),
             _build_other_contacts_block(other_contacts),
             _build_public_comment_block(notification),
-            _build_dev_status_block(dev_context.active),
+            _build_dev_status_block(dev_context.active, dev_context.abandoned),
             _build_collab_block(
                 self._collab.pending(notification.chat_id) if self._collab else None,
                 pipeline_available=self._collab.pipeline_available if self._collab else False,
@@ -444,17 +448,15 @@ class EfiSystemPromptBuilder:
             return _DevContext()
         try:
             active = await self._dev_store.active()
-            releases = (
-                await self._dev_store.recent_releases()
-                if notification.type in _RELEASE_AWARE_TYPES
-                else []
-            )
+            wants_history = notification.type in _RELEASE_AWARE_TYPES
+            releases = await self._dev_store.recent_releases() if wants_history else []
+            abandoned = await self._dev_store.recent_failures(limit=3) if wants_history else []
         except Exception:
             # Ремесло — не условие ответа: сбой чтения не должен срывать
             # генерацию (тот же принцип, что у RAG и фактов).
             logger.warning("prompts: не удалось прочитать задачи разработки", exc_info=True)
             return _DevContext()
-        return _DevContext(active=active, releases=releases)
+        return _DevContext(active=active, releases=releases, abandoned=abandoned)
 
     async def _resolve_other_contacts(
         self, notification: Notification, *, now: datetime
@@ -737,24 +739,45 @@ def _build_other_contacts_block(contacts: list[RecentContact]) -> str:
     )
 
 
-def _build_dev_status_block(active: list[DevTask]) -> str:
+def _build_dev_status_block(active: list[DevTask], abandoned: list[DevTask] | None = None) -> str:
     """
-    Чем Эфи занята в коде прямо сейчас.
+    Чем Эфи занята в коде прямо сейчас — и что недавно бросила.
 
     Блок нужен не для отчётности, а для честности: пока задача идёт в фоне,
     на вопрос «чем занимаешься?» модель без этих строк отвечает выдумкой —
     и выдумка живёт ровно до момента, когда проект реально появится на
     GitHub с другим названием.
+
+    Брошенное здесь по той же причине, что и текущее, только цена ошибки
+    выше. «А что там с той штукой?» — нормальный вопрос про её работу, и без
+    строчки с настоящей причиной («два файла так и не собрались») ответом
+    будет либо «всё идёт по плану» про давно закрытую задачу, либо
+    придуманная драма. Причина — то, что делает провал предметом разговора,
+    а не пятном.
     """
-    if not active:
-        return ""
-    lines = "\n".join(f"  - {task.render_for_prompt()}" for task in active)
-    return (
-        f"[Твоё ремесло: что в работе]\n{lines}\n"
-        "Это правда: код пишется в фоне прямо сейчас. Спросят — расскажи как есть, своими словами. "
-        "Не выдумывай подробностей, которых тут нет (готовность в процентах, названия функций, сроки), "
-        "и не отчитывайся о статусе по своей инициативе — ты работаешь, а не ведёшь дневник задач."
-    )
+    sections: list[str] = []
+    if active:
+        lines = "\n".join(f"  - {task.render_for_prompt()}" for task in active)
+        sections.append(
+            f"[Твоё ремесло: что в работе]\n{lines}\n"
+            "Это правда: код пишется в фоне прямо сейчас. Спросят — расскажи как есть, своими словами. "
+            "Не выдумывай подробностей, которых тут нет (готовность в процентах, названия функций, "
+            "сроки), и не отчитывайся о статусе по своей инициативе — ты работаешь, а не ведёшь "
+            "дневник задач."
+        )
+    if abandoned:
+        lines = "\n".join(
+            f"  - {task.render_for_prompt()} — не вышло: {task.error or 'без внятной причины'}"
+            for task in abandoned
+        )
+        sections.append(
+            f"[Твоё ремесло: что не срослось]\n{lines}\n"
+            "Спросят про эти проекты — отвечай по существу: что задумывала и на чём встало. Это "
+            "рабочие неудачи, а не провинность: без самобичевания, без обещаний «доделаю завтра» и "
+            "без притворства, будто проект ещё идёт. Сама об этом заговаривай только если правда к "
+            "слову."
+        )
+    return "\n\n".join(sections)
 
 
 def _build_collab_block(proposal: Proposal | None, *, pipeline_available: bool = True) -> str:

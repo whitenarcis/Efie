@@ -242,6 +242,30 @@ class DevTaskStore:
                     slugs.add(slug)
         return slugs
 
+    async def abandoned_worth_another_try(
+        self, *, not_touched_for: timedelta, max_revivals: int
+    ) -> DevTask | None:
+        """
+        Брошенный проект, к которому стоит вернуться на свежую голову.
+
+        Условий три, и каждое отсекает бессмысленный повтор. Спека должна
+        быть: без неё это не проект, а несложившийся замысел, и возвращаться
+        не к чему. Времени должно пройти достаточно: провал чаще всего
+        случается из-за упёршегося лимита, а лимит отпускает к следующему дню.
+        И возвращений должно быть немного: замысел, который не собрался и на
+        третий раз, стоит квоты, за которую пишется что-то новое.
+        """
+        cutoff = (datetime.now(UTC) - not_touched_for).isoformat()
+        row = await self._database.fetch_one(
+            """
+            SELECT * FROM dev_tasks
+             WHERE status = ? AND spec != '' AND revivals < ? AND updated_at < ?
+             ORDER BY updated_at ASC LIMIT 1
+            """,
+            (DevTaskStatus.FAILED.value, max_revivals, cutoff),
+        )
+        return _row_to_task(row) if row is not None else None
+
     async def purge_empty_failures(self) -> int:
         """
         Убирает провалы, в которых не осталось ничего: ни замысла, ни спеки.
@@ -289,6 +313,8 @@ class DevTaskStore:
         repo_url: str | None = None,
         error: str | None = None,
         attempts: int | None = None,
+        artifacts: dict[str, str] | None = None,
+        revivals: int | None = None,
     ) -> DevTask:
         """Сохраняет продвижение задачи. Возвращает обновлённую копию — DevTask иммутабелен по смыслу."""
         updated = task.model_copy(
@@ -298,13 +324,16 @@ class DevTaskStore:
                 "repo_url": repo_url if repo_url is not None else task.repo_url,
                 "error": error if error is not None else task.error,
                 "attempts": attempts if attempts is not None else task.attempts,
+                "artifacts": artifacts if artifacts is not None else task.artifacts,
+                "revivals": revivals if revivals is not None else task.revivals,
                 "updated_at": datetime.now(UTC),
             }
         )
         await self._database.execute(
             """
             UPDATE dev_tasks
-               SET status = ?, spec = ?, repo_url = ?, error = ?, attempts = ?, updated_at = ?
+               SET status = ?, spec = ?, repo_url = ?, error = ?, attempts = ?, artifacts = ?,
+                   revivals = ?, updated_at = ?
              WHERE id = ?
             """,
             (
@@ -313,6 +342,8 @@ class DevTaskStore:
                 updated.repo_url,
                 updated.error,
                 updated.attempts,
+                compact_json_dumps(updated.artifacts) if updated.artifacts else "",
+                updated.revivals,
                 updated.updated_at.isoformat(),
                 updated.id,
             ),
@@ -350,7 +381,17 @@ def _row_to_task(row: aiosqlite.Row) -> DevTask:
         reviewed_at=_parse_optional(row["reviewed_at"]),
         revisions=int(row["revisions"] or 0),
         attempts=int(row["attempts"] or 0),
+        artifacts=_parse_artifacts(row["artifacts"]),
+        revivals=int(row["revivals"] or 0),
     )
+
+
+def _parse_artifacts(raw: object) -> dict[str, str]:
+    """Файлы прошлого захода. Битый JSON — не повод не начать заход заново."""
+    payload = safe_json_loads(str(raw or "")) if raw else None
+    if not isinstance(payload, dict):
+        return {}
+    return {str(key): str(value) for key, value in payload.items()}
 
 
 def _parse_optional(raw: object) -> datetime | None:

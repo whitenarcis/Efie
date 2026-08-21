@@ -10,6 +10,11 @@ efi/tools/dev_tools/project_status.py
 
 Ссылки берутся из БД, а не из памяти разговора: пересказанный по памяти
 адрес репозитория — это адрес, которого не существует.
+
+Здесь же — и то, что НЕ вышло, с причинами. «Почему ты забросила ту штуку?»
+— такой же вопрос про её работу, как «что ты сейчас пишешь?», и отвечать на
+него выдумкой ещё хуже: выдуманная причина превращает рабочую неудачу в
+несуществующую историю, которую потом обсуждают всерьёз.
 """
 
 from __future__ import annotations
@@ -29,9 +34,11 @@ class DevProjectStatusTool(Tool):
 
     name = "check_my_projects"
     description = (
-        "Смотрит, над каким проектом ты сейчас работаешь и какие уже выложила на GitHub (со ссылками). "
-        "Вызывай, когда собеседник спрашивает про твой код, проекты или GitHub, — и когда сама хочешь "
-        "сослаться на свою наработку. Не выдумывай статус и ссылки по памяти: здесь они настоящие."
+        "Смотрит, над каким проектом ты сейчас работаешь, какие уже выложила на GitHub (со ссылками) и "
+        "что не вышло — с настоящей причиной. Вызывай, когда собеседник спрашивает про твой код, "
+        "проекты или GitHub, включая «а что там с той штукой?» и «почему забросила», — и когда сама "
+        "хочешь сослаться на свою наработку. Не выдумывай статус, ссылки и причины по памяти: здесь "
+        "они настоящие."
     )
 
     def __init__(self, store: DevTaskStore) -> None:
@@ -40,8 +47,9 @@ class DevProjectStatusTool(Tool):
     async def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         active = await self._store.active()
         released = await self._store.recent_releases(limit=_RECENT_LIMIT)
+        abandoned = await self._store.recent_failures(limit=_RECENT_LIMIT)
 
-        if not active and not released:
+        if not active and not released and not abandoned:
             return "Сейчас ты ничего не пишешь и выложенных проектов пока нет."
 
         parts: list[str] = []
@@ -52,6 +60,15 @@ class DevProjectStatusTool(Tool):
                 "Выложено:\n"
                 + "\n".join(
                     f"- {task.spec.title if task.spec else task.idea}: {task.repo_url}" for task in released
+                )
+            )
+        if abandoned:
+            parts.append(
+                "Не вышло:\n"
+                + "\n".join(
+                    f"- {task.spec.title if task.spec else task.idea}: "
+                    f"{task.error or 'причина не записана'}"
+                    for task in abandoned
                 )
             )
         return "\n\n".join(parts)

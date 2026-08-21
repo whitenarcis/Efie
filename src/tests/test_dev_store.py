@@ -178,6 +178,29 @@ async def test_status_tool_answers_with_real_links(tmp_path: Path) -> None:
     assert "https://github.com/efi/old" in answer
 
 
+async def test_status_tool_tells_why_a_project_did_not_happen(tmp_path: Path) -> None:
+    """
+    «Почему ты забросила ту штуку?» — такой же вопрос про её работу, как «что
+    ты сейчас пишешь?». Выдуманная причина превращает рабочую неудачу в
+    несуществующую историю, которую потом обсуждают всерьёз.
+    """
+    store = DevTaskStore(_database(tmp_path))
+    dead = await store.create("sesslog", chat_id=1)
+    await store.update(
+        dead, status=DevTaskStatus.FAILED, spec=_SPEC, error="два файла так и не собрались"
+    )
+
+    answer = await DevProjectStatusTool(store).execute(
+        {},
+        ToolContext(
+            notification=Notification(type=NotificationType.USER_MESSAGE, message="а что с sesslog?")
+        ),
+    )
+
+    assert "Не вышло:" in answer
+    assert "два файла так и не собрались" in answer
+
+
 async def test_status_tool_admits_having_nothing(tmp_path: Path) -> None:
     store = DevTaskStore(_database(tmp_path))
 
@@ -206,6 +229,20 @@ def test_status_block_states_what_is_really_happening() -> None:
 
 def test_status_block_is_empty_when_nothing_is_in_work() -> None:
     assert _build_dev_status_block([]) == ""
+
+
+def test_status_block_carries_the_real_reason_a_project_died() -> None:
+    """
+    Без строчки с причиной ответом на «а что там с той штукой?» будет либо
+    «всё идёт по плану» про давно закрытую задачу, либо придуманная драма.
+    """
+    block = _build_dev_status_block(
+        [], [_task(status=DevTaskStatus.FAILED, error="два файла так и не собрались")]
+    )
+
+    assert "не срослось" in block
+    assert "два файла так и не собрались" in block
+    assert "без самобичевания" in block.lower()
 
 
 def test_dev_update_block_forbids_the_status_report_tone() -> None:

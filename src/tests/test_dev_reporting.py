@@ -11,14 +11,17 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 from efi.config.schema import QuietHoursSettings
 from efi.db.core import Database
 from efi.db.models import MIGRATIONS
+from efi.dev import worker as worker_module
 from efi.dev.engine import BuildResult
 from efi.dev.github_sync import GitHubSyncError, PublishResult, RepoRef
 from efi.dev.reporter import DevReporter
@@ -178,6 +181,51 @@ async def test_failure_is_reported_only_for_joint_projects() -> None:
     assert "кодер не осилил" in manager.notifications[0].message
 
 
+# -- память о ремесле ---------------------------------------------------------
+
+
+async def test_an_abandoned_project_is_remembered_with_its_reason() -> None:
+    """
+    Рассказ живёт в чате один вечер, память всплывает через неделю сама.
+    «Почему ты забросила ту штуку с логами?» — вопрос, на который без записи
+    ответом будет вежливая выдумка: признаться «не помню» модели тяжелее, чем
+    сочинить.
+    """
+    memory = _RecordingMemory()
+    reporter = DevReporter(_CollectingManager(), social_memory=memory)  # type: ignore[arg-type]
+
+    await reporter.report_failure(_task(is_collab=False, attempts=3), "два файла так и не собрались")
+
+    record = memory.records[0]
+    assert record.kind.value == "dev_abandoned"
+    assert "два файла так и не собрались" in record.text
+    assert "Log Digest" in record.text
+    assert "3 захода" in record.text
+
+
+async def test_taking_on_a_project_is_remembered_before_it_is_finished() -> None:
+    """Между замыслом и результатом часы, и всё это время «чем ты занята?» — вопрос без ответа."""
+    memory = _RecordingMemory()
+    reporter = DevReporter(_CollectingManager(), social_memory=memory)  # type: ignore[arg-type]
+
+    await reporter.remember_start(_task(is_collab=False))
+
+    record = memory.records[0]
+    assert record.kind.value == "dev_started"
+    assert "Затеяла сама" in record.text
+    assert "src/main.py" in record.text, "в памяти остаётся и то, как она задумала это делать"
+
+
+async def test_returning_to_an_old_project_is_remembered_too() -> None:
+    memory = _RecordingMemory()
+    reporter = DevReporter(_CollectingManager(), social_memory=memory)  # type: ignore[arg-type]
+
+    await reporter.remember_revision(_task(), "Поправила README: пример запуска не работал")
+
+    assert memory.records[0].kind.value == "dev_revision"
+    assert "пример запуска не работал" in memory.records[0].text
+
+
 # -- внешний флекс ------------------------------------------------------------
 
 
@@ -221,6 +269,7 @@ class _StubEngine:
         self.design_context = ""
         self.design_calls = 0
         self.built_seen: list[ProjectSpec] = []
+        self.existing_seen: dict[str, str] = {}
 
     async def design(
         self, idea: str = "", *, context: str = "", built: Sequence[ProjectSpec] = ()
@@ -230,7 +279,10 @@ class _StubEngine:
         self.built_seen = list(built)
         return (self._spec, "") if self._spec is not None else (None, self._design_failure)
 
-    async def build(self, spec: ProjectSpec) -> BuildResult:
+    async def build(
+        self, spec: ProjectSpec, *, existing: Mapping[str, str] | None = None
+    ) -> BuildResult:
+        self.existing_seen = dict(existing or {})
         return self._build
 
 
@@ -263,13 +315,14 @@ def _worker(
     *,
     engine: Any = None,
     github: Any = None,
+    memory: Any = None,
     self_initiated: float = 0.0,
 ) -> DevWorker:
     return DevWorker(
         store,
         engine or _StubEngine(),  # type: ignore[arg-type]
         github or _StubGitHub(),  # type: ignore[arg-type]
-        DevReporter(manager, progress_probability=1.0),
+        DevReporter(manager, progress_probability=1.0, social_memory=memory),
         interests=_StubInterests(),
         owner_chat_id=_CHAT_ID,
         self_initiated_probability=self_initiated,
@@ -391,6 +444,81 @@ async def test_local_only_run_does_not_brag_about_a_link_it_does_not_have(tmp_pa
     assert done.status is DevTaskStatus.DONE
     assert done.repo_url == ""
     assert not any("запушила" in item.message for item in manager.notifications)
+
+
+async def test_written_files_survive_a_failed_attempt(tmp_path: Path) -> None:
+    """
+    Проект развалился на четвёртом файле из-за лимита — переписывать первые
+    три в следующий заход значит потратить те же запросы на тот же лимит и
+    получить новый шанс разойтись с тем, что уже сходилось.
+    """
+    store = _store(tmp_path)
+    task = await store.create("утилита", chat_id=_CHAT_ID, is_collab=True)
+    half_done = BuildResult(
+        files=[GeneratedFile(path="src/main.py", content="x = 1")], broken_paths=["src/parser.py"]
+    )
+    engine = _StubEngine(build=half_done)
+    worker = _worker(store, _CollectingManager(), engine=engine)
+
+    await worker._tick()
+
+    kept = await store.get(task.id)
+    assert kept is not None
+    assert kept.artifacts == {"src/main.py": "x = 1"}, "написанное остаётся при задаче"
+
+    await worker._tick()
+
+    assert engine.existing_seen == {"src/main.py": "x = 1"}, "второй заход не переписывает готовое"
+
+
+async def test_an_abandoned_project_gets_a_second_wind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Довести до конца начатое важнее, чем затеять новое: человек, у которого
+    пять брошенных проектов и шестой начатый, ничего не доводит. Возвращается
+    проект не с нуля — спека и написанные файлы при нём, и заход начинается
+    с того места, где в прошлый раз кончились лимиты.
+    """
+    store = _store(tmp_path)
+    memory = _RecordingMemory()
+    dead = await store.create("sesslog", chat_id=_CHAT_ID, is_collab=False)
+    dead = await store.update(
+        dead,
+        spec=_SPEC,
+        status=DevTaskStatus.FAILED,
+        error="два файла так и не собрались",
+        attempts=3,
+        artifacts={"src/main.py": "x = 1"},
+    )
+    monkeypatch.setattr(worker_module, "_REVIVE_AFTER", timedelta(0))
+    engine = _StubEngine()
+    worker = _worker(store, _CollectingManager(), engine=engine, memory=memory, self_initiated=1.0)
+
+    await worker._tick()
+
+    revived = await store.get(dead.id)
+    assert revived is not None
+    assert revived.status is DevTaskStatus.DONE, "к брошенному вернулись и довели"
+    assert revived.revivals == 1
+    assert engine.existing_seen == {"src/main.py": "x = 1"}, "написанное в прошлый раз не переписывалось"
+    assert any(record.kind.value == "dev_revision" for record in memory.records)
+
+
+async def test_a_project_is_not_revived_forever(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Замысел, который не собрался и на третий раз, стоит квоты, за которую пишется что-то новое."""
+    store = _store(tmp_path)
+    dead = await store.create("sesslog", chat_id=_CHAT_ID)
+    dead = await store.update(dead, spec=_SPEC, status=DevTaskStatus.FAILED, revivals=2)
+    monkeypatch.setattr(worker_module, "_REVIVE_AFTER", timedelta(0))
+    worker = _worker(store, _CollectingManager())
+
+    await worker._tick()
+
+    left = await store.get(dead.id)
+    assert left is not None and left.status is DevTaskStatus.FAILED
 
 
 async def test_own_project_is_started_only_when_nothing_else_is_running(tmp_path: Path) -> None:

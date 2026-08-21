@@ -339,6 +339,32 @@ async def _migration_017_dev_attempts(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE dev_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
 
 
+async def _migration_018_dev_artifacts(conn: aiosqlite.Connection) -> None:
+    """
+    Файлы, уже написанные по этой задаче (см. efi/dev/worker.py).
+
+    Без них повторный заход переписывал проект с нуля: те же запросы к тому
+    же исчерпанному лимиту и новый шанс разойтись с тем, что в прошлый раз
+    уже сходилось. Работа, которая пережила заход, должна пережить и его
+    провал.
+    """
+    if not await _has_column(conn, "dev_tasks", "artifacts"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN artifacts TEXT NOT NULL DEFAULT ''")
+
+
+async def _migration_019_dev_revivals(conn: aiosqlite.Connection) -> None:
+    """
+    Сколько раз Эфи возвращалась к брошенному проекту (см. efi/dev/worker.py).
+
+    Счётчик, а не флаг: возвращаться стоит, но не бесконечно. Замысел, который
+    не собрался трижды подряд в двух заходах через день, — это уже не «не
+    повезло с лимитами», и десятый круг по нему стоит квоты, за которую можно
+    написать что-то новое.
+    """
+    if not await _has_column(conn, "dev_tasks", "revivals"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN revivals INTEGER NOT NULL DEFAULT 0")
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -358,6 +384,8 @@ MIGRATIONS = [
     _migration_015_dev_tasks,
     _migration_016_dev_reviews,
     _migration_017_dev_attempts,
+    _migration_018_dev_artifacts,
+    _migration_019_dev_revivals,
 ]
 
 __all__ = ["MIGRATIONS"]
