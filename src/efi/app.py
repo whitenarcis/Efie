@@ -59,10 +59,11 @@ from efi.dev.sandbox import CodeSandbox
 from efi.dev.schemas import DevTask
 from efi.dev.store import DevTaskStore
 from efi.dev.swe_engine import SweEngine
+from efi.dev.verify import ProjectVerifier
 from efi.dev.worker import DevWorker
 from efi.dev.workspace import WorkspaceManager
 from efi.humanizer.anti_repeat import AntiRepeatTracker
-from efi.llm.network_router import LaptopLink, NetworkModelRouter
+from efi.llm.network_router import LaptopLink, NetworkModelRouter, as_fixer
 from efi.llm.resilience import ConcurrencyGate
 from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
@@ -542,6 +543,20 @@ class EfiApp:
 
         coder = QwenCoderClient(coder_endpoint)
         sandbox = CodeSandbox(enable_linter=dev_settings.lint_generated_code)
+        reporter = DevReporter(
+            self._notification_manager,
+            social_memory=self._social_memory,
+            quiet_hours=self._settings.quiet_hours,
+            timezone=self._settings.timezone,
+            initiative=self._initiative,
+            progress_probability=dev_settings.progress_probability,
+        )
+        # Один сетевой роутер на всю разработку: и правки в чужом коде, и
+        # проверка своих проектов думают там, где сейчас лучше, — на ноутбуке
+        # или облачным кодером (см. efi/llm/network_router.py).
+        network = self._build_network_router(coder)
+        workspaces = WorkspaceManager(Path(dev_settings.workspaces_dir))
+        narrator = self._make_dev_narrator(reporter)
         engine = DevEngine(
             self._llm_router,
             coder,
@@ -551,6 +566,16 @@ class EfiApp:
             # (регламент ролей — см. efi.config.schema.TaskRole).
             design_role=TaskRole.BACKGROUND,
             max_fix_iterations=dev_settings.max_fix_iterations,
+            # Проверка запуском: пока её не было, проект мог месяцами
+            # «дописываться» и не выходить в свет. Теперь он либо
+            # запускается, либо выкладывается без того куска, который так и
+            # не завёлся (efi/dev/verify.py).
+            verifier=ProjectVerifier(
+                workspaces,
+                as_fixer(network),
+                max_rounds=dev_settings.max_repair_rounds,
+                narrator=narrator,
+            ),
         )
         github = GitHubSync(
             workspace,
@@ -559,14 +584,6 @@ class EfiApp:
             ssh_key_path=dev_settings.github_ssh_key_path,
             private=dev_settings.repo_private,
             push_enabled=dev_settings.push_enabled,
-        )
-        reporter = DevReporter(
-            self._notification_manager,
-            social_memory=self._social_memory,
-            quiet_hours=self._settings.quiet_hours,
-            timezone=self._settings.timezone,
-            initiative=self._initiative,
-            progress_probability=dev_settings.progress_probability,
         )
         # Возвращение к своим проектам: перечитать, поправить, изредка
         # спросить. Отдельный объект, а не метод воркера, потому что это
@@ -595,7 +612,7 @@ class EfiApp:
             github,
             reporter,
             maintainer=maintainer,
-            swe=self._build_swe_engine(coder, reporter),
+            swe=self._build_swe_engine(network, workspaces, narrator),
             interests=self._community_interests,
             # Своя затея рассказывается владельцу: чат для неё выбирается
             # здесь, а не воркером, — это единственное место, которое знает
@@ -605,23 +622,40 @@ class EfiApp:
             self_initiated_probability=dev_settings.self_initiated_probability,
         )
 
-    def _build_swe_engine(self, coder: QwenCoderClient, reporter: DevReporter) -> SweEngine | None:
+    def _build_swe_engine(
+        self,
+        network: NetworkModelRouter,
+        workspaces: WorkspaceManager,
+        narrator: Callable[[str], Awaitable[None]],
+    ) -> SweEngine | None:
         """
-        Собирает движок работы с чужим кодом — или честно возвращает None.
+        Собирает движок работы с чужим кодом — или честно возвращает None,
+        если работа с репозиториями выключена (`dev.swe_enabled`).
 
-        Два яруса вычислений (efi/llm/network_router.py): ноутбук в домашней
-        сети, если он настроен и отвечает, и тот же самый облачный кодер, если
-        нет. Второй ярус обязателен, первый — нет: без ноутбука всё работает
-        ровно как раньше, просто модель слабее.
-
-        Живые реплики по ходу починки уходят в тот же репортёр, что и
-        рассказы о своих проектах: у неё один голос, а не отдельный «режим
-        разработчика».
+        Роутер и рабочие копии общие с проверкой собственных проектов: это
+        одна и та же работа с кодом, и разводить под неё два набора
+        одинаковых объектов незачем.
         """
         dev_settings = self._settings.dev
         if not dev_settings.swe_enabled:
             return None
+        return SweEngine(
+            network,
+            workspaces,
+            gate=ConcurrencyGate(limit=dev_settings.max_parallel_model_calls),
+            narrator=narrator,
+            max_repair_rounds=dev_settings.max_repair_rounds,
+            keep_workspace=dev_settings.keep_workspaces,
+        )
 
+    def _build_network_router(self, coder: QwenCoderClient) -> NetworkModelRouter:
+        """
+        Два яруса вычислений (efi/llm/network_router.py): ноутбук в домашней
+        сети, если он настроен и отвечает, и тот же самый облачный кодер, если
+        нет. Второй ярус обязателен, первый — нет: без ноутбука всё работает
+        ровно как раньше, просто модель слабее.
+        """
+        dev_settings = self._settings.dev
         laptop_endpoint = self._settings.resolve_laptop_endpoint()
         laptop = (
             LaptopLink(
@@ -638,16 +672,7 @@ class EfiApp:
         else:
             logger.info("app: ноутбук не настроен (OMNIROUTE_URL), тяжёлые задачи идут через кодер")
 
-        router = NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
-        workspaces = WorkspaceManager(Path(dev_settings.workspaces_dir))
-        return SweEngine(
-            router,
-            workspaces,
-            gate=ConcurrencyGate(limit=dev_settings.max_parallel_model_calls),
-            narrator=self._make_dev_narrator(reporter),
-            max_repair_rounds=dev_settings.max_repair_rounds,
-            keep_workspace=dev_settings.keep_workspaces,
-        )
+        return NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
 
     def _make_dev_narrator(self, reporter: DevReporter) -> Callable[[str], Awaitable[None]]:
         """
@@ -799,6 +824,9 @@ class EfiApp:
                 clarifications=self._pending_clarifications,
                 initiative=self._initiative,
                 chat_directory=self._chat_directory,
+                # Кто ловит её обещания, данные словами вместо вызова
+                # инструмента: «набросаю за ночь», «сейчас гляну».
+                commitment_recorders=(self._collab_desk, self._dev_desk),
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 

@@ -43,6 +43,7 @@ from efi.dev.readme import README_PATH, ReadmeWriter
 from efi.dev.sandbox import CodeSandbox, SandboxReport, salvage_python
 from efi.dev.schemas import MAX_PROJECT_FILES, FileSpec, GeneratedFile, ProjectSpec
 from efi.dev.showcase import significant_tokens
+from efi.dev.verify import ProjectVerifier
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Role, Session
@@ -146,6 +147,11 @@ class BuildResult:
     #: разошёлся с собственным замыслом, со второй попытки часто сходится —
     #: разница ровно в этом флаге (см. efi/dev/worker.py).
     permanent: bool = False
+    #: Что случилось по дороге — материал для живой реплики: «линтер задушил»,
+    #: «пришлось выкинуть модуль, который так и не завёлся».
+    notes: list[str] = field(default_factory=list)
+    #: Файлы, выброшенные ради работоспособности остального.
+    dropped: list[str] = field(default_factory=list)
 
     @property
     def is_publishable(self) -> bool:
@@ -180,6 +186,7 @@ class DevEngine:
         design_role: TaskRole = TaskRole.BACKGROUND,
         max_fix_iterations: int = 3,
         readme: ReadmeWriter | None = None,
+        verifier: ProjectVerifier | None = None,
     ) -> None:
         self._router = router
         self._coder = coder
@@ -189,6 +196,12 @@ class DevEngine:
         #: README — обязательная часть сборки, а не постобработка: проект без
         #: внятной документации не публикуется (см. efi/dev/readme.py).
         self._readme = readme if readme is not None else ReadmeWriter(coder)
+        #: Проверка ЗАПУСКОМ (efi/dev/verify.py). Необязательна — без неё
+        #: сборка остаётся такой же статической, какой была, — но именно она
+        #: отличает «код выглядит правильным» от «программа работает», и
+        #: именно она не даёт проекту зависнуть навсегда: то, что не
+        #: срослось, выбрасывается, а работающий остаток выходит в свет.
+        self._verifier = verifier
 
     async def design(
         self, idea: str = "", *, context: str = "", built: Sequence[ProjectSpec] = ()
@@ -317,10 +330,9 @@ class DevEngine:
             return BuildResult(files=[], broken_paths=broken)
 
         code_files, unresolved_imports = await self._reconcile_imports(spec, code_files)
-        if unresolved_imports:
-            # Проект, который падает ImportError'ом на первой строке, — это не
-            # «с замечаниями», это неработающий проект. Выкладывать такой под
-            # своим именем незачем.
+        if unresolved_imports and self._verifier is None:
+            # Без проверки запуском судить больше не по чему: проект, который
+            # падает ImportError'ом на первой строке, выкладывать нельзя.
             logger.warning("dev_engine: %s не сходится по импортам: %s", spec.slug, unresolved_imports[0])
             return BuildResult(
                 files=code_files,
@@ -328,9 +340,29 @@ class DevEngine:
                 failure_reason=unresolved_imports[0].message,
             )
 
+        notes: list[str] = []
+        dropped: list[str] = []
+        if self._verifier is not None:
+            # Настоящая проверка: код раскладывается в изолированный каталог,
+            # импортируется, линтуется и ЗАПУСКАЕТСЯ. Всё, что чинится по
+            # трейсбэку, чинится; всё, что так и не заработало и без чего
+            # проект живёт, выбрасывается — потому что выложенный проект без
+            # одного модуля полезнее невыложенного целого.
+            checked = await self._verifier.verify(spec, code_files)
+            code_files = checked.files
+            notes, dropped = checked.notes, checked.dropped
+            if not checked.is_publishable:
+                logger.warning("dev_engine: %s не запускается: %s", spec.slug, checked.failure)
+                return BuildResult(
+                    files=code_files,
+                    broken_paths=[*broken, *sorted({item.path for item in unresolved_imports})] or ["проект"],
+                    failure_reason=checked.failure or "проект не запускается",
+                    notes=notes,
+                )
+
         code_files.append(await self._readme.write(spec, code_files))
         code_files.extend(_scaffolding_files(spec))
-        return BuildResult(files=code_files, broken_paths=broken)
+        return BuildResult(files=code_files, broken_paths=broken, notes=notes, dropped=dropped)
 
     async def _reconcile_imports(
         self, spec: ProjectSpec, files: list[GeneratedFile]

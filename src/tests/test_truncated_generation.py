@@ -265,3 +265,38 @@ async def test_truncated_perception_names_the_real_cause(finish_reason: str) -> 
 
     assert batch.parse_error
     assert ("оборван лимитом" in batch.parse_error) is (finish_reason == "length")
+
+
+async def test_a_slow_model_gets_a_smaller_diary_instead_of_none(tmp_path: Path) -> None:
+    """
+    Медленная модель не успевает написать столько, сколько попросили, — и
+    тогда пропадает ВСЯ запись, а не её часть. Короткий эпизод в дневнике
+    лучше, чем ещё одна дыра в памяти за этот вечер.
+    """
+    from efi.llm.errors import LLMTimeoutError
+
+    budgets: list[int] = []
+
+    class _SlowRouter:
+        async def chat(self, role: object, params: LLMParams, session: Session) -> Response:
+            budgets.append(params.max_output_tokens)
+            if len(budgets) == 1:
+                raise LLMTimeoutError("request timed out after 15s", provider="test")
+            return Response(
+                choices=[
+                    Choice(message=Message(role=Role.ASSISTANT, content="Короткая, но живая запись."))
+                ]
+            )
+
+    consolidator = DiaryConsolidator(
+        Diary(tmp_path / "diary"),
+        _SlowRouter(),  # type: ignore[arg-type]
+        rag=None,
+        novelization_max_output_tokens=4096,
+    )
+
+    written = await consolidator._novelize("Разговор был такой.")
+
+    assert written is not None
+    assert budgets == [4096, 2048], "просим не дольше ждать, а написать короче"
+    assert "живая запись" in written.body

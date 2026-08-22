@@ -155,6 +155,9 @@ class Workspace:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 cwd=str(cwd or self.root),
+                # Ввода нет и не будет: программа, которая ждёт stdin, должна
+                # получить EOF и завершиться, а не висеть до таймаута.
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=self._child_env(env),
@@ -274,6 +277,23 @@ class WorkspaceManager:
     ) -> None:
         self._root = root
         self._git = git_executable
+
+    async def prepare_empty(self, *, session_id: str) -> Workspace:
+        """
+        Пустая рабочая копия — под проект, который ещё нигде не лежит.
+
+        Нужна для проверки СВОИХ проектов запуском (efi/dev/verify.py): код
+        уже написан в памяти, клонировать нечего, а разложить и запустить его
+        надо в том же изолированном каталоге и с теми же лимитами, что и
+        чужой репозиторий.
+        """
+        destination = self._root / _safe_name(session_id)
+        try:
+            _prepare_destination(destination, "")
+            destination.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise WorkspaceError(f"не удалось создать рабочий каталог {destination}: {exc}") from exc
+        return Workspace(destination, session_id=session_id)
 
     async def prepare(self, source: str, *, session_id: str) -> Workspace:
         """

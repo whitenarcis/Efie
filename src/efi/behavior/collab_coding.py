@@ -213,6 +213,35 @@ class CollabCodingDesk:
             self._on_task_created()
         return task
 
+    async def consider_reply(self, chat_id: int | None, text: str) -> DevTask | None:
+        """
+        Её собственная реплика: пообещала — значит, работа началась.
+
+        Это лечит самый неприятный исход обсуждения: они договорились, Эфи
+        написала «набросаю за ночь» — и не вызвала инструмент. Снаружи это
+        неотличимо от согласия: человек ложится спать, ожидая проект, а
+        задачи не существует. Слово, сказанное вслух, должно становиться
+        задачей — иначе оно ничем не отличается от поддакивания.
+
+        Обещание засчитывается и за обсуждение: если она уже говорит «берусь»,
+        значит, для неё разговор состоялся, и требовать ещё один обмен
+        репликами поздно.
+        """
+        if not self._pipeline_available or chat_id is None:
+            return None
+        proposal = self.pending(chat_id)
+        if proposal is None or not promises_work(text):
+            return None
+
+        proposal.turns_since = max(proposal.turns_since, REQUIRED_DISCUSSION_TURNS)
+        task = await self.start(chat_id)
+        if task is not None:
+            logger.info(
+                "collab: обещание в chat_id=%s превращено в задачу #%s без вызова инструмента",
+                chat_id, task.id,
+            )
+        return task
+
     def drop(self, chat_id: int) -> None:
         """Забыть предложение — например, когда человек передумал."""
         self._proposals.pop(chat_id, None)
@@ -231,6 +260,34 @@ def detect_proposal(text: str) -> str | None:
     if not _MARKER_RE.search(lowered) or not _ARTIFACT_RE.search(lowered):
         return None
     return normalized[:_MAX_IDEA_LENGTH]
+
+
+#: Слова, которыми берутся за работу. Проверяются только в её СОБСТВЕННОЙ
+#: реплике и только когда в этом чате обсуждается проект, — поэтому список
+#: может быть широким: «сделаю» в разговоре про кофе сюда не попадёт.
+_PROMISE_MARKERS = (
+    "набросаю", "накидаю", "напишу", "сделаю", "запилю", "соберу", "берусь", "возьмусь",
+    "займусь", "приступаю", "начинаю", "сяду", "сделаю к утру", "будет к утру", "за ночь",
+    "сегодня ночью", "к утру", "погнали", "поехали", "давай сделаю", "уже делаю",
+)
+_PROMISE_RE = re.compile("|".join(re.escape(marker) for marker in _PROMISE_MARKERS))
+
+#: Отказ выглядит похоже («не буду делать», «не возьмусь») — и обещанием не
+#: является. Проверяется отдельно, потому что отрицание может стоять далеко
+#: от глагола.
+_REFUSAL_MARKERS = ("не буду", "не возьмусь", "не стану", "не хочу", "не вижу смысла", "не сейчас")
+_REFUSAL_RE = re.compile("|".join(re.escape(marker) for marker in _REFUSAL_MARKERS))
+
+
+def promises_work(text: str) -> bool:
+    """
+    Похоже ли на «беру и делаю» в её собственной реплике. Чистая функция —
+    проверяется без чатов и без БД.
+    """
+    lowered = (text or "").strip().lower()
+    if not lowered or _REFUSAL_RE.search(lowered):
+        return False
+    return bool(_PROMISE_RE.search(lowered))
 
 
 #: Уточнения по ходу обсуждения: на чём писать и чего не делать. Ищем ровно
@@ -256,4 +313,5 @@ __all__ = [
     "CollabCodingDesk",
     "Proposal",
     "detect_proposal",
+    "promises_work",
 ]

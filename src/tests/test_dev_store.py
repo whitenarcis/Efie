@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import timedelta
 from pathlib import Path
 
+from efi.behavior.collab_coding import CollabCodingDesk, promises_work
 from efi.db.core import Database
 from efi.db.models import MIGRATIONS
 from efi.dev.schemas import DevTask, DevTaskStatus, ProjectSpec
@@ -209,6 +210,51 @@ async def test_status_tool_admits_having_nothing(tmp_path: Path) -> None:
     )
 
     assert "ничего не пишешь" in answer
+
+
+# -- обещание вместо вызова инструмента ---------------------------------------
+
+
+async def test_words_of_commitment_start_the_work(tmp_path: Path) -> None:
+    """
+    «Набросаю за ночь» — это обещание, а не реплика. Человек ложится спать,
+    ожидая проект; если задачи не появилось, его слово ничем не отличается от
+    поддакивания.
+    """
+    store = DevTaskStore(_database(tmp_path))
+    desk = CollabCodingDesk(store, pipeline_available=True)
+    await desk.consider_message(5, "давай напишем утилиту для разбора логов")
+
+    task = await desk.consider_reply(5, "окей, набросаю за ночь и покажу утром")
+
+    assert task is not None
+    assert task.is_collab is True
+    assert desk.pending(5) is None, "обсуждение закрыто — работа началась"
+
+
+async def test_a_refusal_is_not_a_promise(tmp_path: Path) -> None:
+    store = DevTaskStore(_database(tmp_path))
+    desk = CollabCodingDesk(store, pipeline_available=True)
+    await desk.consider_message(5, "давай напишем ещё один парсер логов")
+
+    assert await desk.consider_reply(5, "не буду я это делать, таких уже сто штук") is None
+    assert await store.next_pending() is None
+
+
+async def test_without_a_pipeline_words_stay_words(tmp_path: Path) -> None:
+    """Обещание, которое некому выполнить, не должно превращаться в задачу-призрак."""
+    store = DevTaskStore(_database(tmp_path))
+    desk = CollabCodingDesk(store, pipeline_available=False)
+    await desk.consider_message(5, "давай напишем утилиту для бэкапов")
+
+    assert await desk.consider_reply(5, "сделаю к утру") is None
+
+
+def test_promise_detection_knows_the_difference() -> None:
+    assert promises_work("окей, набросаю за ночь") is True
+    assert promises_work("берусь, к утру будет") is True
+    assert promises_work("а зачем нам это вообще?") is False
+    assert promises_work("не возьмусь, это неподъёмно") is False
 
 
 # -- блоки промпта ------------------------------------------------------------

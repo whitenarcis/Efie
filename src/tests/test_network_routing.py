@@ -16,7 +16,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from efi.config.schema import EndpointConfig, LaptopLinkSettings
+from efi.config.schema import EndpointConfig, LaptopLinkSettings, RoleRoute, TaskRole
 from efi.llm.errors import LLMAuthError, LLMRateLimitError, LLMServerError
 from efi.llm.network_router import LaptopLink, NetworkModelRouter
 from efi.llm.resilience import (
@@ -28,7 +28,9 @@ from efi.llm.resilience import (
     with_failover,
     with_retries,
 )
+from efi.llm.router import LLMRouter
 from efi.llm.schemas import Choice, LLMParams, Message, Response, Role, Session
+from efi.llm.timeouts import request_timeout
 
 
 class _Clock:
@@ -308,6 +310,82 @@ async def test_a_laptop_that_dies_mid_generation_does_not_lose_the_task() -> Non
 
     assert response.text == "ответ облака", "задача доехала, хоть ноутбук и отвалился"
     assert fallback.calls == 1
+
+
+# -- бюджет времени на запрос -------------------------------------------------
+
+
+def _router_with(provider: object) -> tuple[LLMRouter, EndpointConfig]:
+    """Роутер на один эндпоинт с подставленным провайдером — без сети и без ключей."""
+    endpoint = EndpointConfig(
+        base_url="https://slow.test/v1", api_key=SecretStr("k"), model="m", timeout_seconds=15.0
+    )
+    router = LLMRouter({role: RoleRoute(primary=endpoint) for role in TaskRole})
+    router._providers[(endpoint.base_url, endpoint.model)] = provider  # type: ignore[assignment]
+    return router, endpoint
+
+
+def test_a_chat_reply_and_a_diary_cannot_share_one_timeout() -> None:
+    """
+    Пятнадцать секунд разумны для реплики в чат и гарантированно обрывают
+    дневник на четыре тысячи токенов — на любой модели. Именно так и
+    выглядели «request timed out after 15.0s» подряд у всех кандидатов роли.
+    """
+    short = request_timeout(15.0, max_output_tokens=256, interactive=True)
+    diary = request_timeout(15.0, max_output_tokens=4096, interactive=False)
+
+    assert short < 30.0, "короткая реплика не должна ждать дольше, чем нужно"
+    assert diary > 120.0, "на четыре тысячи токенов пятнадцати секунд не хватит никогда"
+
+
+def test_the_owner_setting_is_a_floor_not_the_whole_answer() -> None:
+    assert request_timeout(60.0, max_output_tokens=1, interactive=True) >= 60.0
+
+
+def test_waiting_has_a_ceiling_too() -> None:
+    """Неограниченный таймаут превращает один медленный ответ в зависшую задачу."""
+    assert request_timeout(15.0, max_output_tokens=100_000, interactive=True) <= 90.0
+    assert request_timeout(15.0, max_output_tokens=100_000, interactive=False) <= 300.0
+
+
+async def test_the_router_gives_a_background_task_the_time_it_needs() -> None:
+    """Проверяется то, что реально уходит в провайдер: бюджет считает роутер, а не эндпоинт."""
+    seen: list[float | None] = []
+
+    class _Recording:
+        name = "test"
+
+        async def chat(self, params: LLMParams, session: Session) -> Response:
+            seen.append(params.timeout_seconds)
+            return _response("ок")
+
+    router, endpoint = _router_with(_Recording())
+
+    await router.chat(
+        TaskRole.BACKGROUND, LLMParams(model="", max_output_tokens=4096), _session()
+    )
+
+    assert seen and seen[0] is not None
+    assert seen[0] > 120.0
+
+
+async def test_an_explicit_timeout_from_the_caller_is_respected() -> None:
+    seen: list[float | None] = []
+
+    class _Recording:
+        name = "test"
+
+        async def chat(self, params: LLMParams, session: Session) -> Response:
+            seen.append(params.timeout_seconds)
+            return _response("ок")
+
+    router, endpoint = _router_with(_Recording())
+
+    await router.chat(
+        TaskRole.MAIN, LLMParams(model="", max_output_tokens=4096, timeout_seconds=7.0), _session()
+    )
+
+    assert seen == [7.0], "тот, кто просит, иногда знает про задачу больше нас"
 
 
 # -- конфигурация -------------------------------------------------------------

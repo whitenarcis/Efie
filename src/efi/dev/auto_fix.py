@@ -53,6 +53,10 @@ DEFAULT_MAX_ROUNDS = 4
 _PYTEST_TIMEOUT = 240.0
 _QUICK_TIMEOUT = 90.0
 
+#: Запуск программы. Короче остальных: за двадцать секунд `--help` успевает
+#: любая утилита, а то, что не успело, — это не «медленно», это висит.
+_SMOKE_TIMEOUT = 20.0
+
 #: Сколько вывода отдавать модели. Трейсбэк целиком обычно короче, а вот
 #: вывод упавшего pytest на сто тестов вытеснит из контекста сам код.
 _MAX_FAILURE_CHARS = 6000
@@ -74,6 +78,9 @@ class CheckKind(StrEnum):
     IMPORTS = "imports"
     LINT = "lint"
     TESTS = "tests"
+    #: Запуск точки входа. Последняя и самая честная проверка: программа,
+    #: которая импортируется, но падает на `--help`, — это не программа.
+    SMOKE = "smoke"
 
     @property
     def human(self) -> str:
@@ -85,6 +92,7 @@ _CHECK_WORDS: dict[CheckKind, str] = {
     CheckKind.IMPORTS: "импорты",
     CheckKind.LINT: "линтер",
     CheckKind.TESTS: "тесты",
+    CheckKind.SMOKE: "запуск",
 }
 
 
@@ -155,7 +163,9 @@ class RepairLoop:
         self._narrator = narrator
         self._ruff = ruff_executable
 
-    async def run(self, workspace: Workspace, touched: list[str]) -> RepairReport:
+    async def run(
+        self, workspace: Workspace, touched: list[str], *, entrypoint: str = ""
+    ) -> RepairReport:
         """
         Гоняет проверки и чинит найденное, пока не станет зелено или не
         кончатся круги.
@@ -163,10 +173,15 @@ class RepairLoop:
         `touched` — файлы, которых касалась правка. По ним же идут дешёвые
         проверки: компилировать весь чужой репозиторий на каждом круге
         бессмысленно, а импортировать — и вредно.
+
+        `entrypoint` — если у проекта есть точка входа, её ещё и ЗАПУСКАЮТ
+        (`--help`). Это единственная проверка, которая отличает «код выглядит
+        правильным» от «программа работает», и для своих проектов она главная:
+        выкладывать то, что падает на первом же запуске, нельзя.
         """
         report = RepairReport()
         for round_number in range(self._max_rounds + 1):
-            outcome = await self._check(workspace, touched)
+            outcome = await self._check(workspace, touched, entrypoint=entrypoint)
             report.checks.append(outcome)
             if outcome.ok or outcome.skipped:
                 report.green = True
@@ -188,13 +203,51 @@ class RepairLoop:
             report.rounds += 1
         return report
 
-    async def _check(self, workspace: Workspace, touched: list[str]) -> CheckOutcome:
+    async def _check(
+        self, workspace: Workspace, touched: list[str], *, entrypoint: str = ""
+    ) -> CheckOutcome:
         """Первая упавшая проверка — она же и есть задача на этот круг."""
         for check in (self._syntax, self._imports, self._lint, self._tests):
             outcome = await check(workspace, touched)
             if not outcome.ok and not outcome.skipped:
                 return outcome
+        smoke = await self._smoke(workspace, entrypoint)
+        if not smoke.ok and not smoke.skipped:
+            return smoke
         return CheckOutcome(kind=CheckKind.TESTS, ok=True)
+
+    async def _smoke(self, workspace: Workspace, entrypoint: str) -> CheckOutcome:
+        """
+        Запуск точки входа: сначала `--help`, потом вообще без аргументов.
+
+        Два запуска, потому что они ловят разное. `--help` проверяет, что
+        программа поднимается и разбирает командную строку, но у argparse он
+        завершается ДО всякой полезной работы — то есть падение в самом теле
+        так и осталось бы незамеченным. Запуск без аргументов доходит дальше и
+        ловит именно его.
+
+        Что считается провалом: трейсбэк в выводе — всегда, даже при нулевом
+        коде возврата (скрипт, печатающий исключение и выходящий с нулём,
+        работающим не является). Код возврата сам по себе провалом не
+        считается: `2` — это argparse, честно сказавший «не хватает
+        аргументов», и это признак работающей программы, а не сломанной.
+        Зависший запуск без аргументов — тоже не провал: так ведёт себя
+        сервер или интерактивный TUI, которому просто нечего делать в
+        одноразовом каталоге.
+        """
+        if not entrypoint:
+            return CheckOutcome(kind=CheckKind.SMOKE, ok=True, skipped=True)
+
+        helped = await workspace.run(
+            workspace.python_executable, entrypoint, "--help", timeout=_SMOKE_TIMEOUT
+        )
+        if _crashed(helped) or helped.timed_out:
+            return CheckOutcome(kind=CheckKind.SMOKE, ok=False, output=_trim(helped))
+
+        bare = await workspace.run(workspace.python_executable, entrypoint, timeout=_SMOKE_TIMEOUT)
+        if _crashed(bare):
+            return CheckOutcome(kind=CheckKind.SMOKE, ok=False, output=_trim(bare))
+        return CheckOutcome(kind=CheckKind.SMOKE, ok=True)
 
     async def _syntax(self, workspace: Workspace, touched: list[str]) -> CheckOutcome:
         python_files = [path for path in touched if path.endswith(".py")]
@@ -321,6 +374,11 @@ def _failure_note(failure: CheckOutcome) -> str:
         first,
     )
     return f"{failure.kind.human} не прошли: {last_error[:200]}"
+
+
+def _crashed(result: CommandResult) -> bool:
+    """Упала ли программа с трейсбэком — единственный признак падения, которому можно верить."""
+    return "Traceback (most recent call last)" in result.output
 
 
 def _trim(result: CommandResult) -> str:

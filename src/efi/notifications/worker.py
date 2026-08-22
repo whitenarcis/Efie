@@ -101,8 +101,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Sequence
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol
 
 from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
@@ -268,6 +269,7 @@ class Worker:
         clarifications: PendingClarifications | None = None,
         initiative: InitiativeGate | None = None,
         chat_directory: ChatDirectory | None = None,
+        commitment_recorders: Sequence[Any] = (),
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -298,6 +300,12 @@ class Worker:
         #: которую проходят ВСЕ уведомления, поэтому контекст чата
         #: восстанавливается здесь, а не в каждой инициативной службе.
         self._chat_directory = chat_directory
+        #: Столы переговоров о работе (efi/behavior/collab_coding.py,
+        #: efi/behavior/dev_dialogue.py). Воркер — единственное место, где
+        #: известно, ЧТО она на самом деле сказала собеседнику, и потому
+        #: единственное, где можно поймать обещание, данное словами вместо
+        #: вызова инструмента.
+        self._commitment_recorders = list(commitment_recorders)
 
     async def run(self) -> None:
         """
@@ -493,9 +501,36 @@ class Worker:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
 
         await self._close_delivered_promise(notification, tool_context)
+        await self._record_commitments(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
         await self._spend_energy(tool_context)
         await self._record_initiative(notification, tool_context)
+
+    async def _record_commitments(self, notification: Notification, tool_context: ToolContext) -> None:
+        """
+        «Набросаю за ночь» — это обещание, а не реплика.
+
+        Самый неприятный исход обсуждения выглядит так: договорились, она
+        написала, что берётся, и не вызвала инструмент. Для человека это
+        неотличимо от согласия — он ложится спать, ожидая проект, которого
+        никто не начинал. Поэтому её собственный текст проверяется на
+        обещание, и обещание становится задачей.
+
+        Смотрим на то, что РЕАЛЬНО ушло собеседнику (`sent_texts`): обещание,
+        не дошедшее до человека, никого ни к чему не обязывает.
+        """
+        sent_texts = tool_context.extra.get("sent_texts")
+        if not sent_texts or notification.chat_id is None or not self._commitment_recorders:
+            return
+        said = "\n".join(sent_texts)
+        for recorder in self._commitment_recorders:
+            try:
+                await recorder.consider_reply(notification.chat_id, said)
+            except Exception:
+                logger.warning(
+                    "worker[%d]: не удалось проверить обещание в chat_id=%s",
+                    self._worker_index, notification.chat_id, exc_info=True,
+                )
 
     async def _spend_energy(self, tool_context: ToolContext) -> None:
         """

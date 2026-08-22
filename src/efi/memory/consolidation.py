@@ -40,7 +40,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from efi.config.schema import TaskRole
-from efi.llm.errors import LLMError
+from efi.llm.errors import LLMError, LLMTimeoutError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata, LLMParams, Message, Role, Session
 from efi.memory.diary import Diary
@@ -144,6 +144,10 @@ _DEFAULT_NOVELIZATION_MAX_OUTPUT_TOKENS = 4096
 #: же токенов сверху; два прохода закрывают любой реальный эпизод, а дальше
 #: дело не в лимите, а в том, что модель не умеет останавливаться.
 _MAX_CONTINUATION_ROUNDS = 2
+
+#: Ниже этого урезать бюджет бессмысленно: получится не короткая запись, а
+#: обрывок фразы, из которого потом нечего вспомнить.
+_MIN_NOVELIZATION_TOKENS = 512
 
 #: Сколько последних символов уже написанного показывать при просьбе
 #: дописать. Нужен ровно хвост: по нему модель находит место обрыва, а весь
@@ -581,9 +585,39 @@ class DiaryConsolidator:
         session = Session(messages=[Message(role=Role.USER, content=content)])
         try:
             response = await self._router.chat(self._summarization_role, params, session)
+        except LLMTimeoutError as exc:
+            # Медленная модель не успевает написать столько, сколько мы
+            # попросили, — и тогда пропадает ВСЯ запись, а не её часть. Проще
+            # попросить меньше: короткий эпизод в дневнике лучше, чем ещё
+            # одна дыра в памяти за этот вечер.
+            logger.warning("consolidation: novelization timed out (%s), retrying with a smaller budget", exc)
+            return await self._novelize_briefly(params, session)
         except LLMError as exc:
             logger.warning("consolidation: novelization request failed: %s", exc)
             return None
+        return _Novelization(body=response.text.strip(), truncated=response.was_truncated)
+
+    async def _novelize_briefly(self, params: LLMParams, session: Session) -> _Novelization | None:
+        """
+        Повтор после таймаута — с половинным бюджетом вывода.
+
+        Урезается именно объём, а не время: если модель пишет медленно, ждать
+        её дольше на том же объёме значит упереться в тот же таймаут. Просьба
+        написать короче — единственное, что здесь действительно помогает.
+        """
+        smaller = max(_MIN_NOVELIZATION_TOKENS, params.max_output_tokens // 2)
+        if smaller >= params.max_output_tokens:
+            return None
+        try:
+            response = await self._router.chat(
+                self._summarization_role,
+                params.model_copy(update={"max_output_tokens": smaller}),
+                session,
+            )
+        except LLMError as exc:
+            logger.warning("consolidation: shortened novelization failed too: %s", exc)
+            return None
+        logger.info("consolidation: novelized within a smaller budget of %d tokens", smaller)
         return _Novelization(body=response.text.strip(), truncated=response.was_truncated)
 
     async def _summarize_via_llm(self, entries: list[DiaryEntry]) -> str | None:

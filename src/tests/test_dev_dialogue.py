@@ -194,6 +194,35 @@ async def test_branches_she_made_are_remembered_for_the_talk(tmp_path: Path) -> 
     assert "fix/import-bug" in context.render_for_prompt()
 
 
+# -- обещание словами ---------------------------------------------------------
+
+
+async def test_a_promise_in_her_own_words_becomes_a_task(tmp_path: Path) -> None:
+    """
+    Самый неприятный исход обсуждения: договорились, она написала «сейчас
+    гляну» — и не вызвала инструмент. Для человека это неотличимо от
+    согласия, но не порождает ничего.
+    """
+    store = DevTaskStore(Database(tmp_path / "efi.db", migrations=MIGRATIONS))
+    desk = DevPartnerDesk(store, available=True)
+    desk.consider_message(_CHAT, "глянь https://github.com/user/repo, там импорт сломан")
+
+    task = await desk.consider_reply(_CHAT, "ага, сейчас гляну и напишу, что там")
+
+    assert task is not None
+    assert task.kind is DevTaskKind.SWE
+
+
+async def test_an_ordinary_reply_promises_nothing(tmp_path: Path) -> None:
+    store = DevTaskStore(Database(tmp_path / "efi.db", migrations=MIGRATIONS))
+    desk = DevPartnerDesk(store, available=True)
+    desk.consider_message(_CHAT, "глянь https://github.com/user/repo")
+
+    assert await desk.consider_reply(_CHAT, "а что там за проект вообще?") is None
+    assert await desk.consider_reply(_CHAT, "не буду я это чинить, там всё гнилое") is None
+    assert await store.next_pending(kind=DevTaskKind.SWE) is None
+
+
 # -- инструмент и промпт ------------------------------------------------------
 
 

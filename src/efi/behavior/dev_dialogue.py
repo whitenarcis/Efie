@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
+from efi.behavior.collab_coding import promises_work
 from efi.dev.schemas import DevTask, DevTaskKind
 from efi.dev.store import DevTaskStore
 from efi.utils.bounded import BoundedDict
@@ -317,6 +318,25 @@ class DevPartnerDesk:
             return intent.source
         context = self.context(chat_id)
         return context.source if context is not None else ""
+
+    async def consider_reply(self, chat_id: int | None, text: str) -> DevTask | None:
+        """
+        Её собственная реплика: сказала «гляну» — значит, идёт смотреть.
+
+        Ровно та же болезнь, что у обсуждения проектов: обещание словами без
+        вызова инструмента неотличимо от согласия, но не порождает ничего.
+        Разница только в том, что здесь обещание короче и звучит между делом
+        («ок, сейчас посмотрю»).
+        """
+        if chat_id is None or not self.may_work(chat_id) or not promises_work(text):
+            return None
+        task = await self.start(chat_id)
+        if task is not None:
+            logger.info(
+                "dev_dialogue: обещание в chat_id=%s превращено в задачу #%s без вызова инструмента",
+                chat_id, task.id,
+            )
+        return task
 
     async def start(self, chat_id: int, *, instruction: str = "", source: str = "") -> DevTask | None:
         """

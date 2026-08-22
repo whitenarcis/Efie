@@ -431,7 +431,11 @@ async def test_github_failure_keeps_the_task_honest(tmp_path: Path) -> None:
 
 
 async def test_local_only_run_does_not_brag_about_a_link_it_does_not_have(tmp_path: Path) -> None:
-    """Без пуша ссылки нет — и хвастаться нечем, хотя проект написан и лежит на диске."""
+    """
+    Без пуша ссылки нет — и выдумывать её нельзя. Но и молчать неправильно:
+    со стороны «дописала, но не выложила» неотличимо от «вечно что-то пишет и
+    ничего не показывает».
+    """
     store = _store(tmp_path)
     manager = _CollectingManager()
     task = await store.create("утилита", chat_id=_CHAT_ID, is_collab=True)
@@ -444,6 +448,9 @@ async def test_local_only_run_does_not_brag_about_a_link_it_does_not_have(tmp_pa
     assert done.status is DevTaskStatus.DONE
     assert done.repo_url == ""
     assert not any("запушила" in item.message for item in manager.notifications)
+    said = "\n".join(item.message for item in manager.notifications)
+    assert "лежит у тебя локально" in said
+    assert "Ссылки нет" in said
 
 
 async def test_written_files_survive_a_failed_attempt(tmp_path: Path) -> None:

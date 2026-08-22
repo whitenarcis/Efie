@@ -144,6 +144,24 @@ class DevReporter:
             return
         await self._put(task, _render_release_reason(task, url=url, build=build), priority=_RELEASE_PRIORITY)
 
+    async def report_local_release(self, task: DevTask, *, path: str, build: BuildResult | None = None) -> None:
+        """
+        Проект дописан, но ссылки нет: не настроен доступ к GitHub.
+
+        Раньше этот исход был виден только в логе — и со стороны выглядел как
+        «она вечно что-то пишет и ничего не показывает». Работа сделана, и
+        сказать об этом надо: человек хотя бы узнает, что проект есть и что
+        мешает ему уехать наружу.
+        """
+        await self._remember(
+            task,
+            kind=SocialInteractionKind.DEV_RELEASE,
+            text=f"Дописала {_subject_for_memory(task)} — лежит локально в {path}, пуш не настроен",
+        )
+        if task.chat_id is None:
+            return
+        await self._put(task, _render_local_release_reason(task, path, build), priority=_RELEASE_PRIORITY)
+
     async def report_question(self, task: DevTask, question: str) -> None:
         """
         Вопрос по своему проекту — то, что она решила не решать в одиночку
@@ -307,6 +325,23 @@ def _render_release_reason(task: DevTask, *, url: str, build: BuildResult | None
         "Скажи об этом собеседнику сама, одной-двумя короткими репликами, и ОБЯЗАТЕЛЬНО дай ссылку — "
         "без неё сообщение бессмысленно. Тон: «сделала штуку, глянь», а не презентация релиза. "
         "Не перечисляй файлы, не расписывай возможности по пунктам и не благодари за внимание."
+    )
+
+
+def _render_local_release_reason(task: DevTask, path: str, build: BuildResult | None) -> str:
+    """Повод для реплики о проекте, который готов, но никуда не уехал."""
+    subject = task.spec.render_for_prompt() if task.spec is not None else task.idea.strip()
+    struggle = (
+        f" По дороге переписывала файлы {build.fix_rounds} раз(а)."
+        if build is not None and build.fix_rounds
+        else ""
+    )
+    return (
+        f"Ты дописала проект: {subject}\n"
+        f"Он собран и проверен запуском, лежит у тебя локально ({path}). Ссылки нет: доступ к "
+        f"GitHub не настроен, поэтому выложить его ты не можешь.{struggle}\n"
+        "Скажи об этом коротко и по-человечески: что сделала и почему ссылки нет. Без обиды и без "
+        "инструкций по настройке токенов — просто факт."
     )
 
 

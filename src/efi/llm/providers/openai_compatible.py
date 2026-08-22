@@ -84,13 +84,25 @@ class OpenAICompatibleProvider(LLMProvider):
         self._owns_client = client is None
         self._client = client or _build_client(endpoint)
 
+    def _timeout_for(self, params: LLMParams) -> float:
+        """
+        Бюджет запроса: пер-запросный, если его посчитал роутер, иначе общий
+        для эндпоинта. Провайдер ничего не решает сам — он только исполняет:
+        знание о том, кто ждёт ответа (человек в чате или фоновая задача),
+        живёт выше (efi/llm/router.py).
+        """
+        return params.timeout_seconds or self._endpoint.timeout_seconds
+
     async def chat(self, params: LLMParams, session: Session) -> Response:
         payload = self._build_payload(params, session, stream=False)
+        timeout = self._timeout_for(params)
         try:
-            http_response = await self._client.post(_CHAT_COMPLETIONS_PATH, json=payload)
+            http_response = await self._client.post(
+                _CHAT_COMPLETIONS_PATH, json=payload, timeout=httpx.Timeout(timeout)
+            )
         except httpx.TimeoutException as exc:
             raise LLMTimeoutError(
-                f"{self.name}: request timed out after {self._endpoint.timeout_seconds}s", provider=self.name
+                f"{self.name}: request timed out after {timeout:.0f}s", provider=self.name
             ) from exc
         except httpx.HTTPError as exc:
             raise LLMServerError(f"{self.name}: transport error: {exc}", provider=self.name) from exc
@@ -147,7 +159,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     yield accumulated.model_copy(deep=True)
         except httpx.TimeoutException as exc:
             raise LLMTimeoutError(
-                f"{self.name}: stream timed out after {self._endpoint.timeout_seconds}s", provider=self.name
+                f"{self.name}: stream timed out after {self._timeout_for(params):.0f}s", provider=self.name
             ) from exc
         except httpx.HTTPError as exc:
             raise LLMServerError(f"{self.name}: transport error during streaming: {exc}", provider=self.name) from exc

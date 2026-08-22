@@ -390,8 +390,10 @@ class DevWorker:
             return
 
         if not published.pushed:
-            # Локальный режим: код есть, ссылки нет. Это не провал задачи —
-            # но и хвастаться нечем, поэтому в чат ничего не уходит.
+            # Локальный режим: код есть, ссылки нет. Это не провал задачи — и
+            # молчать о нём тоже неправильно: со стороны «дописала, но не
+            # выложила» неотличимо от «вечно что-то пишет и ничего не
+            # показывает». Работа сделана, и сказать об этом надо.
             task = await self._store.update(
                 task, status=DevTaskStatus.DONE, error="без пуша: не настроен доступ к GitHub"
             )
@@ -399,6 +401,7 @@ class DevWorker:
                 "dev_worker: проект %s собран локально в %s (%d коммитов), пуш не настроен",
                 spec.slug, published.local_path, len(published.commits),
             )
+            await self._reporter.report_local_release(task, path=str(published.local_path), build=build)
             return
 
         task = await self._store.update(task, status=DevTaskStatus.DONE, repo_url=published.url)
@@ -474,6 +477,15 @@ def _build_note(build: BuildResult) -> str:
     фактуры реплика про работу превращается в «всё идёт по плану», а с ней
     получается то самое «линтер задушил меня из-за аннотаций».
     """
+    if build.dropped:
+        # Самое важное, что можно сказать о проекте: он вышел не целиком.
+        # Умолчать об этом — значит выдать урезанную вещь за задуманную.
+        return (
+            f"пришлось выкинуть {', '.join(build.dropped)} — этот кусок так и не завёлся, "
+            "остальное запускается"
+        )
+    if build.notes:
+        return build.notes[-1]
     if build.fix_rounds:
         worst = max(build.files, key=lambda item: item.fix_rounds)
         detail = worst.unresolved_diagnostics.splitlines()[0] if worst.unresolved_diagnostics else ""

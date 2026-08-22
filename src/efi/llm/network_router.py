@@ -53,7 +53,7 @@ from efi.llm.base import LLMProvider
 from efi.llm.errors import LLMError
 from efi.llm.providers.openai_compatible import OpenAICompatibleProvider
 from efi.llm.resilience import AttemptLog, Backend, RetryPolicy, Sleeper, with_failover
-from efi.llm.schemas import LLMParams, Response, Session
+from efi.llm.schemas import LLMParams, Message, Response, Role, Session
 
 logger = logging.getLogger(__name__)
 
@@ -233,9 +233,35 @@ class NetworkModelRouter:
             raise
 
 
+def as_fixer(
+    router: NetworkModelRouter, *, max_output_tokens: int = 4096
+) -> Callable[[str, str], Awaitable[str | None]]:
+    """
+    Роутер в виде «спроси модель текстом» — контракт, который ждут циклы
+    починки (efi/dev/auto_fix.py, efi/dev/verify.py).
+
+    Отказ модели превращается в None: для цикла починки это «правок не
+    пришло», а не повод падать. Решение, что делать дальше, принимает он —
+    ему виднее, остались ли круги.
+    """
+
+    async def call(system_prompt: str, request: str) -> str | None:
+        params = LLMParams(model="", system_prompt=system_prompt, max_output_tokens=max_output_tokens)
+        session = Session(messages=[Message(role=Role.USER, content=request)])
+        try:
+            response = await router.chat(params, session)
+        except LLMError as exc:
+            logger.warning("network_router: модель не ответила на запрос починки (%s)", exc)
+            return None
+        return response.text
+
+    return call
+
+
 __all__ = [
     "DEFAULT_HEALTH_TIMEOUT_SECONDS",
     "FallbackChat",
     "LaptopLink",
     "NetworkModelRouter",
+    "as_fixer",
 ]
