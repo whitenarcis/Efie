@@ -22,6 +22,8 @@ import pytest
 
 from efi.app import EfiApp
 from efi.config.schema import Settings
+from efi.notifications.schemas import Notification, NotificationType
+from efi.tools.base import ToolContext
 
 _GROQ_ENDPOINT = {
     "base_url": "https://api.groq.com/openai/v1",
@@ -84,6 +86,59 @@ def test_app_assembles_with_the_craft_switched_on(tmp_path: Path) -> None:
     # Рабочий каталог проектов создаётся при сборке, а не при первом пуше:
     # ошибка прав должна проявиться на старте, а не через час фоновой работы.
     assert (settings.paths.data_dir / settings.dev.workspace_dir_name).is_dir()
+
+
+def test_working_with_code_comes_up_together_with_the_craft(tmp_path: Path) -> None:
+    """
+    Движок работы с чужим кодом надстраивается над тем же кодером: включён
+    dev — есть и он. Ноутбук при этом не обязателен: без него всё работает
+    ровно как раньше, просто модель слабее.
+    """
+    settings = _settings(tmp_path, enabled=True)
+    settings.ensure_directories()
+
+    app = EfiApp(settings)
+
+    assert app._dev_desk.available is True
+    assert "work_on_repo" in _tool_names(app)
+
+    # Зарегистрирован — да, но показывается модели только когда в этом чате
+    # есть о чём говорить: реестр спрашивает is_available и при показе, и при
+    # исполнении (efi/tools/registry.py).
+    tool = next(item for item in app._build_tools() if item.name == "work_on_repo")
+    context = ToolContext(
+        notification=Notification(type=NotificationType.USER_MESSAGE, chat_id=1, message="привет")
+    )
+    assert tool.is_available(context) is False
+    app._dev_desk.consider_message(1, "глянь https://github.com/user/repo и почини импорт")
+    assert tool.is_available(context) is True
+
+
+def test_the_craft_can_write_projects_without_touching_foreign_repositories(tmp_path: Path) -> None:
+    """Одно без другого — рабочий режим: можно писать своё и не лезть в чужие репозитории."""
+    settings = _settings(tmp_path, enabled=True, swe_enabled=False)
+    settings.ensure_directories()
+
+    app = EfiApp(settings)
+
+    assert app._dev_worker is not None, "свои проекты по-прежнему пишутся"
+    assert app._dev_desk.available is False
+    assert "work_on_repo" not in _tool_names(app)
+
+
+def test_the_laptop_is_optional_and_read_from_plain_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, enabled=True)
+
+    monkeypatch.delenv("OMNIROUTE_URL", raising=False)
+    assert settings.resolve_laptop_endpoint() is None, "без ноутбука — работа через облачный кодер"
+
+    monkeypatch.setenv("OMNIROUTE_URL", "http://192.168.0.109:8080/v1")
+    monkeypatch.setenv("OMNIROUTE_MODEL", "claude-3-5-sonnet")
+    endpoint = settings.resolve_laptop_endpoint()
+    assert endpoint is not None
+    assert endpoint.model == "claude-3-5-sonnet"
 
 
 def test_coder_is_picked_up_from_the_groq_key_without_duplicating_it(tmp_path: Path) -> None:

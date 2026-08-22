@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
+from pathlib import Path
 from typing import Any
 
 from pyrogram import Client
@@ -30,6 +31,7 @@ from efi.behavior.busy_engine import AnyBusyState, BusyEngine
 from efi.behavior.collab_coding import CollabCodingDesk
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
+from efi.behavior.dev_dialogue import DevPartnerDesk
 from efi.behavior.initiative import InitiativeGate
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
@@ -54,9 +56,14 @@ from efi.dev.maintenance import ProjectMaintainer
 from efi.dev.qwen_client import QwenCoderClient
 from efi.dev.reporter import DevReporter
 from efi.dev.sandbox import CodeSandbox
+from efi.dev.schemas import DevTask
 from efi.dev.store import DevTaskStore
+from efi.dev.swe_engine import SweEngine
 from efi.dev.worker import DevWorker
+from efi.dev.workspace import WorkspaceManager
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.llm.network_router import LaptopLink, NetworkModelRouter
+from efi.llm.resilience import ConcurrencyGate
 from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
@@ -95,6 +102,7 @@ from efi.tools.chat_management.leave_chat import LeaveChatTool
 from efi.tools.chat_management.search_chats import SearchChatsTool
 from efi.tools.dev_tools.project_status import DevProjectStatusTool
 from efi.tools.dev_tools.start_project import StartDevProjectTool
+from efi.tools.dev_tools.work_on_repo import WorkOnRepoTool
 from efi.tools.memory_tools.ask_diary import AskDiaryTool
 from efi.tools.memory_tools.manage_belief import UpdateBeliefTool
 from efi.tools.memory_tools.manage_promises import CompletePromiseTool, RememberPromiseTool
@@ -209,6 +217,10 @@ class EfiApp:
         # позже (attach_pipeline), когда станет известно, есть ли кому
         # исполнять договорённость.
         self._collab_desk = CollabCodingDesk(self._dev_store, pipeline_available=False)
+        # То же самое, но про уже существующий код: «глянь репу», «тест
+        # падает». Отдельный стол, потому что правила другие — конкретную
+        # правку не обсуждают, её делают (см. efi/behavior/dev_dialogue.py).
+        self._dev_desk = DevPartnerDesk(self._dev_store, available=False)
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются
         # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
@@ -306,6 +318,7 @@ class EfiApp:
             # рассказывать.
             dev_store=self._dev_store,
             collab=self._collab_desk,
+            dev_desk=self._dev_desk,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -380,6 +393,13 @@ class EfiApp:
             available=self._dev_worker is not None,
             on_task_created=self._dev_worker.request_tick if self._dev_worker is not None else None,
         )
+        # Работа с чужим кодом идёт через тот же воркер и ту же очередь, но
+        # поднимается отдельным флагом: можно писать свои проекты и не лезть
+        # в чужие репозитории, и наоборот.
+        self._dev_desk.attach_engine(
+            available=self._dev_worker is not None and settings.dev.swe_enabled,
+            on_task_created=self._dev_worker.request_tick if self._dev_worker is not None else None,
+        )
 
         self._busy_engine = BusyEngine(
             self._working_memory,
@@ -447,6 +467,7 @@ class EfiApp:
             people_recorder=self._people,
             chat_recorder=self._chat_directory,
             collab_recorder=self._collab_desk,
+            dev_dialogue_recorder=self._dev_desk,
             stt=self._stt,
             orchestrator=self._orchestrator,
         )
@@ -574,6 +595,7 @@ class EfiApp:
             github,
             reporter,
             maintainer=maintainer,
+            swe=self._build_swe_engine(coder, reporter),
             interests=self._community_interests,
             # Своя затея рассказывается владельцу: чат для неё выбирается
             # здесь, а не воркером, — это единственное место, которое знает
@@ -582,6 +604,66 @@ class EfiApp:
             check_interval_seconds=dev_settings.check_interval_seconds,
             self_initiated_probability=dev_settings.self_initiated_probability,
         )
+
+    def _build_swe_engine(self, coder: QwenCoderClient, reporter: DevReporter) -> SweEngine | None:
+        """
+        Собирает движок работы с чужим кодом — или честно возвращает None.
+
+        Два яруса вычислений (efi/llm/network_router.py): ноутбук в домашней
+        сети, если он настроен и отвечает, и тот же самый облачный кодер, если
+        нет. Второй ярус обязателен, первый — нет: без ноутбука всё работает
+        ровно как раньше, просто модель слабее.
+
+        Живые реплики по ходу починки уходят в тот же репортёр, что и
+        рассказы о своих проектах: у неё один голос, а не отдельный «режим
+        разработчика».
+        """
+        dev_settings = self._settings.dev
+        if not dev_settings.swe_enabled:
+            return None
+
+        laptop_endpoint = self._settings.resolve_laptop_endpoint()
+        laptop = (
+            LaptopLink(
+                laptop_endpoint,
+                health_timeout_seconds=dev_settings.laptop.health_timeout_seconds,
+            )
+            if laptop_endpoint is not None
+            else None
+        )
+        if laptop is not None:
+            logger.info(
+                "app: ноутбук для тяжёлых задач — %s (%s)", laptop.base_url, laptop.model
+            )
+        else:
+            logger.info("app: ноутбук не настроен (OMNIROUTE_URL), тяжёлые задачи идут через кодер")
+
+        router = NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
+        workspaces = WorkspaceManager(Path(dev_settings.workspaces_dir))
+        return SweEngine(
+            router,
+            workspaces,
+            gate=ConcurrencyGate(limit=dev_settings.max_parallel_model_calls),
+            narrator=self._make_dev_narrator(reporter),
+            max_repair_rounds=dev_settings.max_repair_rounds,
+            keep_workspace=dev_settings.keep_workspaces,
+        )
+
+    def _make_dev_narrator(self, reporter: DevReporter) -> Callable[[str], Awaitable[None]]:
+        """
+        Короткая реплика в чат по ходу починки («линтер задушил на типах»).
+
+        Адресат — владелец: правка чаще всего затеяна в личке, а рассказывать
+        о ходе работы в чужой чат, где о ней не просили, — спам. Повод
+        формулирует конвейер, словами его делает Worker с личностью.
+        """
+        owner_id = self._settings.telegram.owner_id
+
+        async def narrate(note: str) -> None:
+            task = DevTask(id=0, chat_id=owner_id, idea="работа с кодом", is_collab=True)
+            await reporter.report_progress(task, note)
+
+        return narrate
 
     def _build_tools(self) -> list[Tool]:
         return [
@@ -617,6 +699,7 @@ class EfiApp:
             # которое некому выполнить. Статус проектов доступен всегда: он
             # честно отвечает «ничего не пишу».
             *([StartDevProjectTool(self._collab_desk)] if self._dev_worker is not None else []),
+            *([WorkOnRepoTool(self._dev_desk)] if self._dev_desk.available else []),
             DevProjectStatusTool(self._dev_store),
             self._web_search_tool,
             self._weather_tool,

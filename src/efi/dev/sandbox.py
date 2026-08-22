@@ -190,10 +190,11 @@ def _check_syntax(path: str, source: str) -> str | None:
     return None
 
 
-#: Какую долю файла должен сохранить обрезок, чтобы считаться спасённым.
-#: Ниже этого — уже не «файл без последней функции», а огрызок, который
-#: только выглядит рабочим: лучше честно признать, что файла нет.
-_MIN_SALVAGE_RATIO = 0.6
+#: Какую долю содержательных строк должен сохранить обрезок, чтобы считаться
+#: спасённым. Больше половины: это ещё «файл без последней функции». Меньше —
+#: уже огрызок, который только выглядит рабочим, и честнее признать, что файла
+#: нет, чем выложить обманку.
+_MIN_SALVAGE_RATIO = 0.5
 
 
 def salvage_python(source: str) -> str:
@@ -218,19 +219,29 @@ def salvage_python(source: str) -> str:
     lines = source.splitlines()
     if not lines:
         return ""
+    # Считаются содержательные строки, а не все подряд: пустые строки между
+    # функциями обрезка съедает, и по общему счёту любой спасённый файл
+    # выглядел бы вдвое меньше, чем он есть.
+    original = _content_lines(source)
+    if not original:
+        return ""
 
     for end in range(len(lines), 0, -1):
-        if end / len(lines) < _MIN_SALVAGE_RATIO:
-            return ""
         candidate = "\n".join(lines[:end]).rstrip() + "\n"
+        if _content_lines(candidate) / original < _MIN_SALVAGE_RATIO:
+            return ""
         if _check_syntax("<salvage>", candidate) is not None:
             continue
         trimmed = _drop_last_definition(candidate)
-        if not trimmed or len(trimmed.splitlines()) / len(lines) < _MIN_SALVAGE_RATIO:
+        if not trimmed or _content_lines(trimmed) / original < _MIN_SALVAGE_RATIO:
             return ""
         if _has_definitions(trimmed):
             return trimmed
     return ""
+
+
+def _content_lines(text: str) -> int:
+    return sum(1 for line in text.splitlines() if line.strip())
 
 
 def _drop_last_definition(source: str) -> str:

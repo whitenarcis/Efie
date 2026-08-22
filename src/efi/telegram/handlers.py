@@ -155,6 +155,7 @@ class TelegramEventHandlers:
         organic_ping_recorder: Any | None = None,
         people_recorder: Any | None = None,
         collab_recorder: Any | None = None,
+        dev_dialogue_recorder: Any | None = None,
         chat_recorder: Any | None = None,
         stt: GroqSTT | None = None,
         orchestrator: ChatOrchestrator | None = None,
@@ -169,6 +170,9 @@ class TelegramEventHandlers:
         self._organic_ping_recorder = organic_ping_recorder
         self._people_recorder = people_recorder
         self._collab_recorder = collab_recorder
+        #: Разбор просьб по коду — тот же дак-тайпинг, что у collab_recorder
+        #: (обычно efi.behavior.dev_dialogue.DevPartnerDesk).
+        self._dev_dialogue_recorder = dev_dialogue_recorder
         self._chat_recorder = chat_recorder
         self._stt = stt
         self._buffer: InboundMessageBuffer[_PendingMessage] = InboundMessageBuffer(
@@ -434,6 +438,12 @@ class TelegramEventHandlers:
         # договорённость измеряется разговором, а не одной фразой.
         if self._collab_recorder is not None:
             await self._collab_recorder.consider_message(access_info.chat_id, text)
+
+        # «Глянь репу», «тест падает» — просьбы по УЖЕ существующему коду
+        # (efi/behavior/dev_dialogue.py). Синхронно и дёшево: это разбор
+        # текста и словарь в памяти, без обращений к БД.
+        if self._dev_dialogue_recorder is not None:
+            self._dev_dialogue_recorder.consider_message(access_info.chat_id, text)
 
         # Учёт КОНКРЕТНОГО человека, а не чата: в группе за одним chat_id
         # стоят разные люди, и без этого их вклад сваливался бы в общий

@@ -62,6 +62,7 @@ from efi.behavior.affinity import (
 )
 from efi.behavior.ambiguity import PendingClarification, PendingClarifications
 from efi.behavior.collab_coding import CollabCodingDesk, Proposal
+from efi.behavior.dev_dialogue import DevIntent, DevPartnerDesk, RepoContext
 from efi.config.schema import LockdownMode, Settings
 from efi.dev.schemas import DevTask
 from efi.dev.showcase import pick_showcase
@@ -272,6 +273,7 @@ class EfiSystemPromptBuilder:
         clarifications: PendingClarifications | None = None,
         dev_store: DevTaskStore | None = None,
         collab: CollabCodingDesk | None = None,
+        dev_desk: DevPartnerDesk | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -291,6 +293,9 @@ class EfiSystemPromptBuilder:
         #: нет — не пустые заглушки, а именно нет.
         self._dev_store = dev_store
         self._collab = collab
+        #: Разговор про существующий код (efi/behavior/dev_dialogue.py).
+        #: Необязателен: без него блока просто нет, как и раньше.
+        self._dev_desk = dev_desk
         #: Без состояния — один на билдер, см. efi/memory/router.py.
         self._memory_router = MemoryRouter()
 
@@ -367,6 +372,11 @@ class EfiSystemPromptBuilder:
             _build_collab_block(
                 self._collab.pending(notification.chat_id) if self._collab else None,
                 pipeline_available=self._collab.pipeline_available if self._collab else False,
+            ),
+            _build_dev_partner_block(
+                self._dev_desk.pending(notification.chat_id) if self._dev_desk else None,
+                self._dev_desk.context(notification.chat_id) if self._dev_desk else None,
+                engine_available=self._dev_desk.available if self._dev_desk else False,
             ),
             _build_dev_update_block(notification),
             _build_dev_showcase_block(notification, dev_context.releases),
@@ -830,6 +840,59 @@ def _build_collab_block(proposal: Proposal | None, *, pipeline_available: bool =
         "Если по существу договорились — бери в работу инструментом start_dev_project и сформулируй "
         "замысел своими словами (что за штука, на чём, что не делаем). Если остались непонятки — "
         "дообсудите, спешить некуда."
+    )
+
+
+def _build_dev_partner_block(
+    intent: DevIntent | None, context: RepoContext | None, *, engine_available: bool
+) -> str:
+    """
+    Разговор про код, который УЖЕ есть: чужая репа, падающий тест, просьба
+    дописать.
+
+    Блок решает две разные задачи, и путать их нельзя. На конкретную просьбу
+    («почини импорт») переспрашивать не надо — надо брать и делать: тут блок
+    просто напоминает, что инструмент есть и репозиторий известен. А вот на
+    «перепиши всё на async» соглашаться с ходу — это угробленный чужой вечер,
+    и здесь блок требует мнения: чем это грозит, что сломается, стоит ли
+    вообще.
+
+    Технически крупная переделка и так закрыта — инструмент work_on_repo не
+    показывается модели (efi/behavior/dev_dialogue.py::may_work). Блок
+    объясняет ЗАЧЕМ, иначе модель начнёт искать обходной путь и пообещает
+    словами то, чего не может сделать.
+    """
+    if intent is None:
+        return ""
+
+    where = f"\nРепозиторий, о котором речь: {sanitize_text(context.render_for_prompt())}" if context else ""
+
+    if not engine_available:
+        return (
+            f"[Просьба по коду] Собеседник просит: «{sanitize_text(intent.instruction)}»{where}\n"
+            "Обсудить код можно — почитать, что он присылает, подумать вслух, посоветовать. Но "
+            "ВЗЯТЬСЯ ты сейчас не можешь: работа с репозиториями у тебя не включена. Так и скажи "
+            "прямо, без обещаний «сейчас гляну и поправлю»."
+        )
+
+    if intent.kind.needs_discussion:
+        return (
+            f"[Просьба по коду] Собеседник хочет крупную переделку: «{sanitize_text(intent.instruction)}»"
+            f"{where}\n"
+            "Это не та работа, за которую берутся молча. Скажи, что думаешь ПО СУЩЕСТВУ: зачем это "
+            "вообще, что сломается по дороге, во что это выльется по объёму и есть ли способ дешевле. "
+            "Не нравится — так и скажи, ты имеешь право спорить: отговорить от переделки ради "
+            "переделки — нормальный итог разговора.\n"
+            "Браться прямо сейчас нельзя — сначала договоритесь, что и зачем."
+        )
+
+    return (
+        f"[Просьба по коду] Собеседник просит: «{sanitize_text(intent.instruction)}»{where}\n"
+        "Это конкретная работа — бери и делай инструментом work_on_repo, а не переспрашивай «точно "
+        "починить?». Ты склонируешь репозиторий, поправишь точечно, прогонишь импорты, линтер и "
+        "тесты и оставишь ветку.\n"
+        "Если по задаче есть сомнения (непонятно, где искать; условие пахнет другой проблемой) — "
+        "скажи о них одной фразой И ВСЁ РАВНО берись: разберёшься по дороге, а не в переписке."
     )
 
 

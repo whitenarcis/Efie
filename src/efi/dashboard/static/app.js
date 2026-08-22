@@ -698,11 +698,13 @@
       cell('Выложено', num(stats.released), 'доведено до репозитория'),
       cell('Правок после релиза', num(stats.revisions), 'возвращалась и меняла'),
       cell('Не вышло', num(stats.failed), 'брошено на полпути'),
+      cell('Правок в чужом коде', num(stats.code_work), 'веток сдано по чужим репозиториям'),
     ].join('');
 
     const items = projects.map((project) => {
       const tags = [
         projectStatusTag(project.status),
+        project.kind === 'swe' ? '<span class="tag">чужой код</span>' : '',
         project.is_collab ? '<span class="tag">вместе</span>' : '<span class="tag">своя затея</span>',
         project.revisions ? `<span class="tag">правок ${esc(project.revisions)}</span>` : '',
       ].join('');
@@ -712,6 +714,8 @@
       const stack = (project.stack || []).join(' · ');
       const meta = [
         stack ? esc(stack) : '',
+        project.source ? esc(project.source) : '',
+        project.branch ? `ветка ${esc(project.branch)}` : '',
         project.reviewed_at ? `перечитывала ${esc(fmtAgo(project.reviewed_at))}` : 'ещё не перечитывала',
         `обновлён ${esc(fmtAgo(project.updated_at))}`,
       ].filter(Boolean).join(' · ');

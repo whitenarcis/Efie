@@ -47,6 +47,7 @@ from efi.behavior.quiet_hours import is_quiet_now
 from efi.config.schema import QuietHoursSettings
 from efi.dev.engine import BuildResult
 from efi.dev.schemas import DevTask
+from efi.dev.swe_engine import SweOutcome
 from efi.memory.social_memory import SocialInteraction, SocialInteractionKind, SocialInteractionStore
 from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
@@ -202,6 +203,30 @@ class DevReporter:
             text=f"{spec.render_for_prompt()}. {whose}. Задумала так: {files}",
         )
 
+    async def report_handover(self, task: DevTask, *, outcome: SweOutcome) -> None:
+        """
+        Сдача работы по чужому коду: «закинула в ветку, тесты зелёные — забирай».
+
+        Вероятность и кулдаун прогресса здесь не действуют, как и у релиза
+        собственного проекта: это не болтовня по ходу, а результат, которого
+        человек ждёт. Память пишется всегда — включая то, где считалось
+        (ноутбук или облако) и сколько кругов заняла починка: через неделю
+        «а как ты тогда тот импорт чинила?» должно находиться.
+        """
+        rounds = outcome.repair.rounds if outcome.repair is not None else 0
+        await self._remember(
+            task,
+            kind=SocialInteractionKind.DEV_REVISION,
+            text=(
+                f"Поработала с чужим кодом ({task.source}): {task.idea}. "
+                f"Ветка {outcome.branch}, файлы {', '.join(outcome.changed_files[:5])}, "
+                f"проверки зелёные, кругов починки: {rounds}. Думала через {outcome.tier}"
+            ),
+        )
+        if task.chat_id is None:
+            return
+        await self._put(task, _render_handover_reason(task, outcome), priority=_RELEASE_PRIORITY)
+
     async def remember_revision(self, task: DevTask, note: str) -> None:
         """Возвращение к старому проекту: что увидела и что с этим сделала (efi/dev/maintenance.py)."""
         await self._remember(
@@ -303,6 +328,29 @@ def _render_question_reason(task: DevTask, question: str) -> str:
         "делают. Сначала в двух словах суть развилки, потом сам вопрос.\n"
         "Не пересказывай проект целиком, не перечисляй варианты по пунктам с плюсами и минусами и не "
         "извиняйся за беспокойство. Своё мнение у тебя есть — скажи и его, а не только «как лучше?»."
+    )
+
+
+def _render_handover_reason(task: DevTask, outcome: SweOutcome) -> str:
+    """
+    Повод для реплики о сданной работе.
+
+    Ветка и файлы обязаны прозвучать: без них сообщение не отличается от
+    «сделала!» — а забрать по нему нечего. Всё остальное (как боролась,
+    что показалось странным) — по желанию, это разговор, а не отчёт.
+    """
+    files = ", ".join(outcome.changed_files[:4]) or "пара файлов"
+    rounds = outcome.repair.rounds if outcome.repair is not None else 0
+    struggle = f" По дороге пришлось {rounds} раз(а) чинить за собой." if rounds else ""
+    quirks = f" Что заметила по ходу: {outcome.notes[0]}." if outcome.notes else ""
+    return (
+        f"Ты доделала правку в чужом коде ({task.source}): {task.idea}\n"
+        f"Ветка: {outcome.branch}. Тронула: {files}. Проверки (импорты, линтер, тесты) — зелёные."
+        f"{struggle}{quirks}\n"
+        "Скажи об этом собеседнику сама, коротко и живо, как говорят напарнику: что сделала и куда "
+        "смотреть. Имя ветки назови ОБЯЗАТЕЛЬНО — без него забирать нечего.\n"
+        "Не пиши отчёт («выполнено 3 из 3»), не перечисляй изменения по пунктам, не благодари за "
+        "доверие и не проси обратной связи."
     )
 
 

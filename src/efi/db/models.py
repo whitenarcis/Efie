@@ -365,6 +365,26 @@ async def _migration_019_dev_revivals(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE dev_tasks ADD COLUMN revivals INTEGER NOT NULL DEFAULT 0")
 
 
+async def _migration_020_dev_swe(conn: aiosqlite.Connection) -> None:
+    """
+    Работа с чужим кодом в той же очереди, что и свои проекты
+    (см. efi/dev/swe_engine.py).
+
+    Очередь одна намеренно: и то и другое — её работа, у неё общий счётчик
+    заходов, общая занятость и общее место в дашборде. А вот конвейеры разные,
+    и `kind` — то, что не даёт SWE-задаче случайно уехать в конвейер
+    собственных проектов, где её попытались бы спроектировать с нуля.
+
+    По умолчанию 'project': всё, что уже лежит в таблице, — это проекты.
+    """
+    if not await _has_column(conn, "dev_tasks", "kind"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'")
+    if not await _has_column(conn, "dev_tasks", "source"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+    if not await _has_column(conn, "dev_tasks", "branch"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -386,6 +406,7 @@ MIGRATIONS = [
     _migration_017_dev_attempts,
     _migration_018_dev_artifacts,
     _migration_019_dev_revivals,
+    _migration_020_dev_swe,
 ]
 
 __all__ = ["MIGRATIONS"]

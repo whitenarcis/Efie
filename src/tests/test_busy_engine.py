@@ -121,7 +121,12 @@ async def test_compute_ignore_delay_uses_working_memory_energy(tmp_path: Path) -
     engine = BusyEngine(working_memory, affinity, _FakeLifeEngine(False), _SETTINGS)
 
     delays = [await engine.compute_ignore_delay(1) for _ in range(20)]
-    assert min(delays) >= _SETTINGS.base_delay_min_seconds
+    # Именно общий пол, а не base_delay_min_seconds: к базовой задержке ещё
+    # применяется скидка за близость, и на дефолтной близости 0.5 итог
+    # законно опускается ниже базового минимума. Сравнение с базой давало
+    # тест, падающий по погоде — в зависимости от того, лёг ли хоть один из
+    # двадцати случайных отсчётов близко к нижней границе.
+    assert min(delays) >= _SETTINGS.min_delay_seconds
 
 
 # -- регрессия: раньше полная ignore_delay считалась на КАЖДОЕ сообщение, -----
@@ -200,4 +205,9 @@ async def test_compute_ignore_delay_full_delay_for_first_message_after_a_gap(tmp
     )
 
     delays = [await engine.compute_ignore_delay(1) for _ in range(20)]
-    assert min(delays) >= _SETTINGS.base_delay_min_seconds
+    # Именно общий пол, а не base_delay_min_seconds: к базовой задержке ещё
+    # применяется скидка за близость, и на дефолтной близости 0.5 итог
+    # законно опускается ниже базового минимума. Сравнение с базой давало
+    # тест, падающий по погоде — в зависимости от того, лёг ли хоть один из
+    # двадцати случайных отсчётов близко к нижней границе.
+    assert min(delays) >= _SETTINGS.min_delay_seconds

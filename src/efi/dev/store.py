@@ -26,7 +26,7 @@ import aiosqlite
 from pydantic import ValidationError
 
 from efi.db.core import Database
-from efi.dev.schemas import DevTask, DevTaskStatus, ProjectSpec
+from efi.dev.schemas import DevTask, DevTaskKind, DevTaskStatus, ProjectSpec
 from efi.utils.json_utils import compact_json_dumps, safe_json_loads
 
 logger = logging.getLogger(__name__)
@@ -56,8 +56,23 @@ class DevTaskStore:
     def __init__(self, database: Database) -> None:
         self._database = database
 
-    async def create(self, idea: str, *, chat_id: int | None = None, is_collab: bool = False) -> DevTask:
-        """Заводит новую задачу в статусе PENDING — её подхватит ближайший тик DevWorker."""
+    async def create(
+        self,
+        idea: str,
+        *,
+        chat_id: int | None = None,
+        is_collab: bool = False,
+        kind: DevTaskKind = DevTaskKind.PROJECT,
+        source: str = "",
+    ) -> DevTask:
+        """
+        Заводит новую задачу в статусе PENDING — её подхватит ближайший тик
+        DevWorker.
+
+        `kind` определяет, КАКОЙ конвейер её возьмёт: свой проект с нуля или
+        работа с существующим кодом (см. DevTaskKind). `source` осмыслен
+        только для второго — это ссылка на репозиторий или путь к нему.
+        """
         now = datetime.now(UTC)
         normalized = idea.strip()
         # Через connection(), а не execute(): нужен lastrowid, иначе задачу
@@ -67,14 +82,17 @@ class DevTaskStore:
             cursor = await conn.execute(
                 """
                 INSERT INTO dev_tasks
-                    (chat_id, idea, is_collab, status, spec, repo_url, error, created_at, updated_at)
-                VALUES (?, ?, ?, ?, '', '', '', ?, ?)
+                    (chat_id, idea, is_collab, status, spec, repo_url, error, kind, source,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, '', '', '', ?, ?, ?, ?)
                 """,
                 (
                     chat_id,
                     normalized,
                     int(is_collab),
                     DevTaskStatus.PENDING.value,
+                    kind.value,
+                    source,
                     now.isoformat(),
                     now.isoformat(),
                 ),
@@ -83,30 +101,36 @@ class DevTaskStore:
             task_id = cursor.lastrowid or 0
 
         logger.info(
-            "dev_store: задача #%d — %s (%s)",
-            task_id, normalized[:80], "совместная" if is_collab else "своя затея",
+            "dev_store: задача #%d (%s) — %s (%s)",
+            task_id, kind.value, normalized[:80], "совместная" if is_collab else "своя затея",
         )
         return DevTask(
             id=task_id,
             chat_id=chat_id,
             idea=normalized,
             is_collab=is_collab,
+            kind=kind,
+            source=source,
             status=DevTaskStatus.PENDING,
             created_at=now,
             updated_at=now,
         )
 
-    async def next_pending(self) -> DevTask | None:
+    async def next_pending(self, *, kind: DevTaskKind = DevTaskKind.PROJECT) -> DevTask | None:
         """
-        Самая старая задача, к которой конвейер ещё не подходил.
+        Самая старая задача НУЖНОГО РОДА, к которой конвейер ещё не подходил.
 
         Именно старая, а не новая: очередь идей — это очередь, и замысел,
         о котором договорились час назад, не должен вечно уступать место
         свежим.
+
+        Род обязателен и по умолчанию «свой проект»: SWE-задача, попавшая в
+        конвейер собственных проектов, была бы спроектирована с нуля вместо
+        того, чтобы починить чужой импорт.
         """
         row = await self._database.fetch_one(
-            "SELECT * FROM dev_tasks WHERE status = ? ORDER BY created_at ASC, id ASC LIMIT 1",
-            (DevTaskStatus.PENDING.value,),
+            "SELECT * FROM dev_tasks WHERE status = ? AND kind = ? ORDER BY created_at ASC, id ASC LIMIT 1",
+            (DevTaskStatus.PENDING.value, kind.value),
         )
         return _row_to_task(row) if row is not None else None
 
@@ -287,6 +311,20 @@ class DevTaskStore:
             logger.info("dev_store: убрала %d пустых провал(ов) — в них не было ни замысла, ни кода", removed)
         return removed
 
+    async def recent_code_work(self, *, limit: int = 5) -> list[DevTask]:
+        """
+        Законченная работа с чужим кодом: ветки, которые она сдала.
+
+        Отдельно от `recent_releases`: там её собственные репозитории со
+        ссылками, которыми можно хвастаться, а здесь — правки в чужих
+        проектах. Смешивать их значило бы показывать чужую репу как свою.
+        """
+        rows = await self._database.fetch_all(
+            "SELECT * FROM dev_tasks WHERE status = ? AND kind = ? ORDER BY updated_at DESC LIMIT ?",
+            (DevTaskStatus.DONE.value, DevTaskKind.SWE.value, limit),
+        )
+        return [_row_to_task(row) for row in rows]
+
     async def recent_failures(self, *, limit: int = 5) -> list[DevTask]:
         """Недавно провалившиеся задачи — только для дашборда: в промпт неудачи не идут, ей о них напоминать незачем."""
         rows = await self._database.fetch_all(
@@ -312,6 +350,7 @@ class DevTaskStore:
         spec: ProjectSpec | None = None,
         repo_url: str | None = None,
         error: str | None = None,
+        branch: str | None = None,
         attempts: int | None = None,
         artifacts: dict[str, str] | None = None,
         revivals: int | None = None,
@@ -323,6 +362,7 @@ class DevTaskStore:
                 "spec": spec if spec is not None else task.spec,
                 "repo_url": repo_url if repo_url is not None else task.repo_url,
                 "error": error if error is not None else task.error,
+                "branch": branch if branch is not None else task.branch,
                 "attempts": attempts if attempts is not None else task.attempts,
                 "artifacts": artifacts if artifacts is not None else task.artifacts,
                 "revivals": revivals if revivals is not None else task.revivals,
@@ -332,8 +372,8 @@ class DevTaskStore:
         await self._database.execute(
             """
             UPDATE dev_tasks
-               SET status = ?, spec = ?, repo_url = ?, error = ?, attempts = ?, artifacts = ?,
-                   revivals = ?, updated_at = ?
+               SET status = ?, spec = ?, repo_url = ?, error = ?, branch = ?, attempts = ?,
+                   artifacts = ?, revivals = ?, updated_at = ?
              WHERE id = ?
             """,
             (
@@ -341,6 +381,7 @@ class DevTaskStore:
                 compact_json_dumps(updated.spec.model_dump(mode="json")) if updated.spec is not None else "",
                 updated.repo_url,
                 updated.error,
+                updated.branch,
                 updated.attempts,
                 compact_json_dumps(updated.artifacts) if updated.artifacts else "",
                 updated.revivals,
@@ -372,6 +413,9 @@ def _row_to_task(row: aiosqlite.Row) -> DevTask:
         chat_id=row["chat_id"],
         idea=str(row["idea"] or ""),
         is_collab=bool(row["is_collab"]),
+        kind=DevTaskKind(str(row["kind"] or DevTaskKind.PROJECT.value)),
+        source=str(row["source"] or ""),
+        branch=str(row["branch"] or ""),
         status=DevTaskStatus(str(row["status"])),
         spec=spec,
         repo_url=str(row["repo_url"] or ""),

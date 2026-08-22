@@ -717,8 +717,9 @@ async def build_projects(context: DashboardContext, *, limit: int = 50) -> dict[
         context.dev_store.active(), context.dev_store.recent_releases(limit=limit)
     )
     failed = await context.dev_store.recent_failures(limit=limit)
+    code_work = await context.dev_store.recent_code_work(limit=limit)
 
-    projects = [_project_row(task) for task in [*active, *releases, *failed]]
+    projects = [_project_row(task) for task in [*active, *releases, *code_work, *failed]]
     return {
         "enabled": context.settings.dev.enabled,
         "projects": projects,
@@ -727,6 +728,7 @@ async def build_projects(context: DashboardContext, *, limit: int = 50) -> dict[
             "released": len(releases),
             "failed": len(failed),
             "revisions": sum(task.revisions for task in releases),
+            "code_work": len(code_work),
         },
     }
 
@@ -742,6 +744,11 @@ def _project_row(task: DevTask) -> dict[str, Any]:
         "files": [{"path": item.path, "purpose": item.purpose} for item in spec.files] if spec else [],
         "status": task.status.value,
         "status_label": task.status_label,
+        # Работа с чужим кодом показывается тут же, но своей строкой: ветка
+        # в чужом репозитории — не то же самое, что свой выложенный проект.
+        "kind": task.kind.value,
+        "source": task.source,
+        "branch": task.branch,
         "is_collab": task.is_collab,
         "chat_id": task.chat_id,
         "repo_url": task.repo_url,

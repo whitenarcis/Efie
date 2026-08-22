@@ -40,8 +40,9 @@ from efi.dev.engine import BuildResult, DevEngine
 from efi.dev.github_sync import GitHubSync, GitHubSyncError
 from efi.dev.maintenance import ProjectMaintainer
 from efi.dev.reporter import DevReporter
-from efi.dev.schemas import DevTask, DevTaskStatus, ProjectSpec
+from efi.dev.schemas import DevTask, DevTaskKind, DevTaskStatus, ProjectSpec
 from efi.dev.store import DevTaskStore
+from efi.dev.swe_engine import SweEngine, SweRequest
 from efi.utils.loops import run_periodically
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,7 @@ class DevWorker:
         reporter: DevReporter,
         *,
         maintainer: ProjectMaintainer | None = None,
+        swe: SweEngine | None = None,
         interests: InterestSource | None = None,
         owner_chat_id: int | None = None,
         check_interval_seconds: float = 3600.0,
@@ -114,6 +116,10 @@ class DevWorker:
         #: Необязательно: без него Эфи просто пишет новое и не перечитывает
         #: старое — то есть ведёт себя как генератор репозиториев.
         self._maintainer = maintainer
+        #: Работа с чужим кодом (efi/dev/swe_engine.py). Необязательна: без
+        #: неё Эфи остаётся автором собственных проектов и не берётся за
+        #: чужие репозитории — ровно то поведение, что было до этого модуля.
+        self._swe = swe
         self._interests = interests
         self._owner_chat_id = owner_chat_id
         self._check_interval_seconds = check_interval_seconds
@@ -170,6 +176,11 @@ class DevWorker:
         # рассказывает про проект, к которому никто не подходил.
         await self._store.reclaim_stalled(older_than=_STALLED_AFTER)
 
+        # Просьбы по коду идут первыми: их ждёт живой человек в чате, а свой
+        # проект подождёт следующего тика — он никого не держит.
+        if await self._take_swe_task():
+            return
+
         task = await self._store.next_pending()
         if task is None:
             # Довести до конца начатое важнее, чем затеять новое: человек, у
@@ -197,6 +208,55 @@ class DevWorker:
             await self._process(task)
         finally:
             self._is_coding = False
+
+    async def _take_swe_task(self) -> bool:
+        """
+        Разбирает очередь просьб по коду. True — задача взята и обработана.
+
+        Отдельная очередь и отдельный конвейер: у собственного проекта нет
+        исходного кода, а у чужой правки нет замысла — общего между ними
+        только то, что и там и там работает она.
+        """
+        if self._swe is None:
+            return False
+        task = await self._store.next_pending(kind=DevTaskKind.SWE)
+        if task is None:
+            return False
+
+        self._is_coding = True
+        try:
+            await self._process_swe(task)
+        finally:
+            self._is_coding = False
+        return True
+
+    async def _process_swe(self, task: DevTask) -> None:
+        """Один проход по чужому репозиторию — от просьбы до ветки."""
+        assert self._swe is not None  # проверено вызывающей стороной
+
+        if task.attempts >= _MAX_ATTEMPTS:
+            await self._fail(task, f"не пережила {task.attempts} заходов конвейера", retriable=False)
+            return
+        task = await self._store.update(task, attempts=task.attempts + 1, status=DevTaskStatus.CODING)
+        await self._reporter.remember_start(task)
+
+        outcome = await self._swe.work_on(
+            SweRequest(
+                source=task.source,
+                instruction=task.idea,
+                session_id=f"task-{task.id}",
+                chat_id=task.chat_id,
+            )
+        )
+        if not outcome.ok:
+            await self._fail(task, outcome.failure_reason or "не справилась с этой правкой")
+            return
+
+        task = await self._store.update(task, status=DevTaskStatus.DONE, branch=outcome.branch)
+        logger.info(
+            "dev_worker: правка по %s готова: ветка %s (%s)", task.source, outcome.branch, outcome.tier
+        )
+        await self._reporter.report_handover(task, outcome=outcome)
 
     async def _revive_abandoned(self) -> DevTask | None:
         """

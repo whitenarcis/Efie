@@ -162,6 +162,28 @@ class QwenCoderClient:
             return f"модель {self._endpoint.model!r} недоступна: {error}"
         return ""
 
+    async def chat(self, params: LLMParams, session: Session) -> Response:
+        """
+        Произвольный запрос к кодеру — сырой, без промптов конвейера.
+
+        Нужен как ВТОРОЙ ярус для efi/llm/network_router.py: когда ноутбука
+        нет, тяжёлую работу с чужим кодом делает тот же самый кодер, который
+        и раньше писал проекты. Метод намеренно тонкий и ничего не меняет в
+        существующем поведении: те же повторы при 429, та же модель, тот же
+        провайдер.
+
+        В отличие от остальных методов, ошибку он ПОДНИМАЕТ: сетевой роутер
+        должен отличить «не смог» от «ответил пусто», чтобы решить, стоит ли
+        переключаться на другой ярус.
+        """
+        response = await self._chat_with_retries(
+            params.model_copy(update={"model": self._endpoint.model}), session, what="swe-запрос"
+        )
+        if response is None:
+            error = self._last_error
+            raise error if error is not None else LLMServerError("кодер не ответил", provider="coder")
+        return response
+
     async def write_file(
         self,
         spec: ProjectSpec,

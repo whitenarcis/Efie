@@ -170,7 +170,9 @@ async def test_projects_section_shows_work_links_and_revisions(harness: _Harness
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["stats"] == {"in_work": 1, "released": 1, "failed": 0, "revisions": 1}
+    assert payload["stats"] == {
+        "in_work": 1, "released": 1, "failed": 0, "revisions": 1, "code_work": 0
+    }
 
     by_slug = {project["slug"]: project for project in payload["projects"]}
     assert by_slug["log-digest"]["repo_url"] == "https://github.com/efi/log-digest"
