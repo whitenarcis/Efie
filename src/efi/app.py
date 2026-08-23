@@ -55,6 +55,7 @@ from efi.dev.github_sync import GitHubSync
 from efi.dev.maintenance import ProjectMaintainer
 from efi.dev.qwen_client import QwenCoderClient
 from efi.dev.reporter import DevReporter
+from efi.dev.research_topics import DevResearchTopics
 from efi.dev.sandbox import CodeSandbox
 from efi.dev.schemas import DevTask
 from efi.dev.store import DevTaskStore
@@ -344,7 +345,15 @@ class EfiApp:
         self._reminder_scheduler = ReminderScheduler(self._notification_manager, self._reminders)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
         self._researcher = BackgroundResearcher(
-            templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
+            templates_dir / "worldview.json",
+            self._web_search_tool,
+            self._rag,
+            self._llm_router,
+            self._facts,
+            # Вопросы из её собственной работы идут первыми: у запроса «почему
+            # у меня падает вот это» есть адресат и сегодняшняя польза, а у
+            # случайного факта из worldview.json — нет.
+            work_topics=DevResearchTopics(self._dev_store),
         )
         # С чем именно она приходит, когда пишет первой. Без повода служба
         # молчит — раньше на его месте стояло «просто напомнить о себе», и из
@@ -575,6 +584,7 @@ class EfiApp:
                 as_fixer(network),
                 max_rounds=dev_settings.max_repair_rounds,
                 narrator=narrator,
+                lookup=self._look_up_error,
             ),
         )
         github = GitHubSync(
@@ -644,6 +654,7 @@ class EfiApp:
             workspaces,
             gate=ConcurrencyGate(limit=dev_settings.max_parallel_model_calls),
             narrator=narrator,
+            lookup=self._look_up_error,
             max_repair_rounds=dev_settings.max_repair_rounds,
             keep_workspace=dev_settings.keep_workspaces,
         )
@@ -673,6 +684,17 @@ class EfiApp:
             logger.info("app: ноутбук не настроен (OMNIROUTE_URL), тяжёлые задачи идут через кодер")
 
         return NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
+
+    async def _look_up_error(self, query: str) -> str:
+        """
+        Ищет в вебе ответ на ошибку, которая пережила первую правку.
+
+        Именно здесь поиск наконец приносит пользу: у запроса есть адресат
+        (падающий код), и найденное применяется в ту же минуту, а не оседает
+        фактом в дневнике.
+        """
+        outcome = await self._web_search_tool.search(query)
+        return "" if outcome.failed else outcome.digest()
 
     def _make_dev_narrator(self, reporter: DevReporter) -> Callable[[str], Awaitable[None]]:
         """

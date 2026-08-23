@@ -35,7 +35,7 @@ import ast
 import logging
 from dataclasses import dataclass, field
 
-from efi.dev.auto_fix import FixerCall, Narrator, RepairLoop, RepairReport
+from efi.dev.auto_fix import FixerCall, Lookup, Narrator, RepairLoop, RepairReport
 from efi.dev.imports import project_modules
 from efi.dev.readme import README_PATH
 from efi.dev.sandbox import write_project_files
@@ -88,12 +88,16 @@ class ProjectVerifier:
         *,
         max_rounds: int = DEFAULT_VERIFY_ROUNDS,
         narrator: Narrator | None = None,
+        lookup: Lookup | None = None,
         allow_pruning: bool = True,
     ) -> None:
         self._workspaces = workspaces
         self._fixer = fixer
         self._max_rounds = max_rounds
         self._narrator = narrator
+        #: Поиск по тексту ошибки, когда она пережила первую правку
+        #: (см. efi/dev/auto_fix.py).
+        self._lookup = lookup
         #: Разрешено ли выкладывать проект без файла, который так и не
         #: заработал. Да — потому что альтернатива не «идеальный проект», а
         #: отсутствующий: см. докстринг модуля.
@@ -181,7 +185,9 @@ class ProjectVerifier:
         )
 
     async def _repair(self, workspace: Workspace, paths: list[str], entrypoint: str) -> RepairReport:
-        loop = RepairLoop(self._fixer, max_rounds=self._max_rounds, narrator=self._narrator)
+        loop = RepairLoop(
+            self._fixer, max_rounds=self._max_rounds, narrator=self._narrator, lookup=self._lookup
+        )
         checkable = [path for path in paths if path.endswith(".py")]
         return await loop.run(workspace, checkable, entrypoint=entrypoint)
 

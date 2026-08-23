@@ -36,7 +36,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from efi.dev.auto_fix import RepairLoop, RepairReport
+from efi.dev.auto_fix import Lookup, RepairLoop, RepairReport
 from efi.dev.edits import EDIT_FORMAT_INSTRUCTIONS, apply_edits, parse_edits
 from efi.dev.repo_map import DEFAULT_MAP_BUDGET_BYTES, build_repo_map
 from efi.dev.workspace import Workspace, WorkspaceError, WorkspaceManager
@@ -159,6 +159,7 @@ class SweEngine:
         *,
         gate: ConcurrencyGate | None = None,
         narrator: Narrator | None = None,
+        lookup: Lookup | None = None,
         max_repair_rounds: int = 4,
         map_budget_bytes: int = DEFAULT_MAP_BUDGET_BYTES,
         keep_workspace: bool = False,
@@ -167,6 +168,9 @@ class SweEngine:
         self._workspaces = workspaces
         self._gate = gate or ConcurrencyGate(limit=2)
         self._narrator = narrator
+        #: Поиск ответа на ошибку, пережившую первую правку — то же, что у
+        #: проверки собственных проектов (efi/dev/auto_fix.py).
+        self._lookup = lookup
         self._max_repair_rounds = max_repair_rounds
         self._map_budget_bytes = map_budget_bytes
         #: Оставлять ли рабочую копию после задачи. По умолчанию нет: это
@@ -228,7 +232,10 @@ class SweEngine:
         outcome.changed_files = list(changed)
 
         repair = RepairLoop(
-            self._fixer(), max_rounds=self._max_repair_rounds, narrator=self._narrator
+            self._fixer(),
+            max_rounds=self._max_repair_rounds,
+            narrator=self._narrator,
+            lookup=self._lookup,
         )
         report = await repair.run(workspace, list(changed))
         outcome.repair = report

@@ -21,6 +21,7 @@ from efi.dev.schemas import DevTask, DevTaskStatus, ProjectSpec
 from efi.dev.store import DevTaskStore
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.builder import (
+    _build_collab_block,
     _build_dev_showcase_block,
     _build_dev_status_block,
     _build_dev_update_block,
@@ -255,6 +256,34 @@ def test_promise_detection_knows_the_difference() -> None:
     assert promises_work("берусь, к утру будет") is True
     assert promises_work("а зачем нам это вообще?") is False
     assert promises_work("не возьмусь, это неподъёмно") is False
+
+
+def test_the_way_she_actually_promises_counts_too() -> None:
+    """Формы из живой переписки: без них обещание так и оставалось словами."""
+    assert promises_work("ладно, давай так: я сейчас заседу за основной модуль") is True
+    assert promises_work("щас попытаюсь собрать хоть какой-то скелет") is True
+    assert promises_work("окей, накидаю черновик и покажу") is True
+
+
+async def test_endless_clarifying_questions_are_cut_short(tmp_path: Path) -> None:
+    """
+    Уточняющие вопросы — правильное начало и худшее продолжение. После
+    нескольких обменов следующая порция вопросов это уже не выяснение, а
+    способ не начинать: человек ждёт работу, а получает анкету.
+    """
+    store = DevTaskStore(_database(tmp_path))
+    desk = CollabCodingDesk(store, pipeline_available=True)
+    await desk.consider_message(5, "давай напишем утилиту для поиска lossless")
+    for _ in range(3):
+        await desk.consider_message(5, "ну там по обстоятельствам, сам решай")
+
+    proposal = desk.pending(5)
+    assert proposal is not None and proposal.is_overdiscussed is True
+
+    block = _build_collab_block(proposal, pipeline_available=True)
+    assert "ХВАТИТ УТОЧНЯТЬ" in block
+    assert "разумные допущения" in block
+    assert "start_dev_project" in block
 
 
 # -- блоки промпта ------------------------------------------------------------

@@ -42,6 +42,7 @@ from enum import StrEnum
 from pathlib import Path
 
 from efi.dev.edits import EDIT_FORMAT_INSTRUCTIONS, apply_edits, parse_edits
+from efi.dev.research_topics import normalize_error_query
 from efi.dev.workspace import CommandResult, Workspace
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,10 @@ _SMOKE_TIMEOUT = 20.0
 #: Сколько вывода отдавать модели. Трейсбэк целиком обычно короче, а вот
 #: вывод упавшего pytest на сто тестов вытеснит из контекста сам код.
 _MAX_FAILURE_CHARS = 6000
+
+#: Сколько найденного в вебе отдавать модели. Достаточно, чтобы уместился
+#: ответ со stackoverflow, и мало, чтобы он не вытеснил из контекста сам код.
+_MAX_LOOKUP_CHARS = 2000
 
 _FIX_SYSTEM_PROMPT = (
     "Ты чинишь СВОЙ код по реальному выводу проверки: трейсбэку, ошибке импорта, замечанию линтера "
@@ -140,6 +145,10 @@ FixerCall = Callable[[str, str], Awaitable[str | None]]
 #: молчит и чинит.
 Narrator = Callable[[str], Awaitable[None]]
 
+#: Поиск по тексту ошибки. Необязателен: без него цикл чинит как раньше — на
+#: одном знании модели.
+Lookup = Callable[[str], Awaitable[str]]
+
 
 class RepairLoop:
     """
@@ -156,11 +165,19 @@ class RepairLoop:
         *,
         max_rounds: int = DEFAULT_MAX_ROUNDS,
         narrator: Narrator | None = None,
+        lookup: Lookup | None = None,
         ruff_executable: str = "ruff",
     ) -> None:
         self._fixer = fixer
         self._max_rounds = max_rounds
         self._narrator = narrator
+        #: Поиск ответа в вебе по тексту ошибки. Включается НЕ сразу: первый
+        #: круг модель почти всегда чинит сама, и лезть в сеть на каждую
+        #: опечатку — это трата времени и запросов. А вот когда ошибка
+        #: пережила первую правку, знания модели по ней кончились: дальше
+        #: помогает не ещё один заход по кругу, а чужой ответ на ту же
+        #: строчку. Это и есть тот поиск, у которого наконец есть адресат.
+        self._lookup = lookup
         self._ruff = ruff_executable
 
     async def run(
@@ -196,7 +213,9 @@ class RepairLoop:
                 return report
 
             await self._say(outcome, round_number, report)
-            fixed = await self._repair(workspace, outcome, touched, report)
+            fixed = await self._repair(
+                workspace, outcome, touched, report, stuck=round_number > 0
+            )
             if not fixed:
                 logger.info("auto_fix: правка не пришла или не легла — дальше чинить нечем")
                 return report
@@ -311,9 +330,19 @@ class RepairLoop:
         return CheckOutcome(kind=CheckKind.TESTS, ok=result.ok, output=_trim(result))
 
     async def _repair(
-        self, workspace: Workspace, failure: CheckOutcome, touched: list[str], report: RepairReport
+        self,
+        workspace: Workspace,
+        failure: CheckOutcome,
+        touched: list[str],
+        report: RepairReport,
+        *,
+        stuck: bool = False,
     ) -> bool:
         request = _render_request(workspace, failure, touched)
+        if stuck:
+            found = await self._look_up(failure)
+            if found:
+                request = f"{request}\n\nЧто нашлось по этой ошибке в вебе:\n{found}"
         answer = await self._fixer(_FIX_SYSTEM_PROMPT, request)
         if not answer:
             return False
@@ -332,6 +361,25 @@ class RepairLoop:
         if problems:
             logger.info("auto_fix: часть правок отклонена: %s", "; ".join(problems)[:200])
         return bool(changed)
+
+    async def _look_up(self, failure: CheckOutcome) -> str:
+        """
+        Ищет чужой ответ на ту же ошибку.
+
+        Запрос — не весь трейсбэк, а строчка, которая называет ошибку: она у
+        всех одинаковая, и именно поэтому ответ уже кем-то написан. Полный
+        вывод уникален для этой машины и не находит ничего.
+        """
+        if self._lookup is None:
+            return ""
+        query = normalize_error_query(failure.output)
+        if not query:
+            return ""
+        try:
+            return (await self._lookup(query))[:_MAX_LOOKUP_CHARS]
+        except Exception:
+            logger.warning("auto_fix: поиск по ошибке не удался", exc_info=True)
+            return ""
 
     async def _say(self, failure: CheckOutcome, round_number: int, report: RepairReport) -> None:
         """

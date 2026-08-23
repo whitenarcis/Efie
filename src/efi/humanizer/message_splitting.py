@@ -24,9 +24,17 @@ import random
 import re
 
 from efi.config.schema import HumanizerSettings
+from efi.utils.text import trim_to_last_sentence
 
 _EXPLICIT_DELIMITER_RE = re.compile(r"\s*///\s*")
 _PARAGRAPH_DELIMITER_RE = re.compile(r"\n\s*\n")
+
+#: Одиночный перевод строки. В мессенджере это ровно то место, где человек
+#: отпускает Enter и отправляет реплику: строка = мысль. Пока разбивались
+#: только пустые строки, ответ, где модель писала мысль на строку, уходил
+#: одной простынёй на пятнадцать строк — то есть ровно тем, чего разбивка
+#: должна не допускать.
+_LINE_DELIMITER_RE = re.compile(r"\n+")
 
 #: Порог длины (символов), начиная с которого пробуем мягкую разбивку по
 #: абзацам, если модель не расставила явные "///" — примерно 2-3 обычных
@@ -80,6 +88,8 @@ def split_into_messages(
         parts = _EXPLICIT_DELIMITER_RE.split(stripped)
     elif len(stripped) > long_message_threshold and _PARAGRAPH_DELIMITER_RE.search(stripped):
         parts = _PARAGRAPH_DELIMITER_RE.split(stripped)
+    elif len(stripped) > long_message_threshold and _LINE_DELIMITER_RE.search(stripped):
+        parts = _LINE_DELIMITER_RE.split(stripped)
     else:
         parts = [stripped]
 
@@ -87,7 +97,8 @@ def split_into_messages(
     if not cleaned_parts:
         return []
 
-    return _cap_message_count(cleaned_parts, settings.max_messages_per_burst)
+    capped = _cap_message_count(cleaned_parts, settings.max_messages_per_burst)
+    return _fit_into_budget(capped, settings.max_reply_chars_per_turn)
 
 
 def _cap_message_count(parts: list[str], max_count: int) -> list[str]:
@@ -96,6 +107,38 @@ def _cap_message_count(parts: list[str], max_count: int) -> list[str]:
     head = parts[: max_count - 1]
     tail = "\n\n".join(parts[max_count - 1 :])
     return [*head, tail]
+
+
+def _fit_into_budget(parts: list[str], budget: int) -> list[str]:
+    """
+    Оставляет столько реплик, сколько помещается в бюджет одного хода.
+
+    Лишние отбрасываются ЦЕЛИКОМ, а не режутся: оборванная на полуслове
+    мысль читается как сбой, а недосказанная — как нормальная человеческая
+    реплика, к которой можно вернуться следующим сообщением. Первая реплика
+    отбрасыванию не подлежит никогда (иначе ответа не будет вовсе) — если она
+    одна длиннее бюджета, у неё отрезается хвост по последнему законченному
+    предложению.
+
+    Смысл всего этого в одной строчке: человек в переписке не выдаёт полторы
+    тысячи символов подряд. Тот, кто выдаёт, — не собеседник, а лектор.
+    """
+    if budget < 1 or not parts:
+        return parts
+
+    kept: list[str] = []
+    used = 0
+    for part in parts:
+        if kept and used + len(part) > budget:
+            break
+        kept.append(part)
+        used += len(part)
+
+    head = kept[0]
+    if len(head) > budget:
+        trimmed = trim_to_last_sentence(head[:budget])
+        kept[0] = trimmed or head[:budget].rstrip()
+    return kept
 
 
 def is_short_bubble(text: str, *, max_words: int = _SHORT_BUBBLE_MAX_WORDS) -> bool:
