@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.db.core import Database
@@ -141,3 +142,49 @@ async def test_thread_read_is_recorded_even_without_a_peer(tmp_path: Path) -> No
     )
     assert len(await store.recent()) == 1
     assert "Читала обсуждение" in rag.remembered[0]
+
+
+# -- журнал не растёт бесконечно -----------------------------------------------
+
+
+async def test_ancient_records_are_pruned(tmp_path: Path) -> None:
+    """
+    Журнал пополнялся каждым комментарием и прочитанным тредом и не убывал
+    никогда. В промпт он не раздувается — все запросы к нему с LIMIT, — но
+    файл базы лежит на телефоне, где место кончается.
+    """
+    store, _rag = _store(tmp_path)
+    long_ago = datetime.now(UTC) - timedelta(days=400)
+    for index in range(60):
+        await store.record(_comment(text=f"древнее {index}", created_at=long_ago))
+
+    removed = await store.prune_old(keep_last_per_peer=10)
+
+    assert removed == 50
+    assert len(await store.recent(limit=100)) == 10
+
+
+async def test_a_recent_record_is_never_pruned(tmp_path: Path) -> None:
+    store, _rag = _store(tmp_path)
+    await store.record(_comment(text="вчерашнее"))
+
+    assert await store.prune_old(keep_last_per_peer=0) == 0
+    assert len(await store.recent()) == 1
+
+
+async def test_a_rare_acquaintance_is_not_crowded_out(tmp_path: Path) -> None:
+    """
+    Ради этого порог и двойной. Один разговорчивый канал иначе вытеснил бы
+    всю память о человеке, с которым Эфи пересеклась дважды за год, — а
+    именно такая память здесь и ценна.
+    """
+    store, _rag = _store(tmp_path)
+    long_ago = datetime.now(UTC) - timedelta(days=400)
+    for index in range(60):
+        await store.record(_comment(peer_user_id=777, text=f"болтун {index}", created_at=long_ago))
+    await store.record(_comment(peer_user_id=999, text="редкий знакомый", created_at=long_ago))
+
+    await store.prune_old(keep_last_per_peer=5)
+
+    theirs = await store.recent_with_peer(999)
+    assert [item.text for item in theirs] == ["редкий знакомый"]

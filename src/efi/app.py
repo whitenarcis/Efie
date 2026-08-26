@@ -969,37 +969,82 @@ class EfiApp:
         try:
             while True:
                 await asyncio.sleep(seconds_until_next(_CONSOLIDATION_TRIGGER_AT))
-
-                # Новеллизация — ПЕРВОЙ: она создаёт новые записи из дня, а
-                # dedup ниже заодно подчистит и их, если что-то похожее уже
-                # было записано вручную через remember_diary_entry за день.
-                # Под общим локом с пульсом: оба пути двигают одну и ту же
-                # отметку last_novelized_at, и без взаимного исключения могли
-                # бы прочитать её одновременно и разобрать одно окно дважды.
-                async with self._memory_pulse.novelization_lock:
-                    novelized = await self._consolidator.novelize_recent_history(
-                        history=self._history,
-                        facts=self._facts,
-                        lookback=timedelta(days=self._settings.memory.novelization_lookback_days),
-                        min_messages=self._settings.memory.novelization_min_messages,
-                        experience=self._social_memory,
-                    )
-                logger.info("app: nightly novelization saved %d new diary entries", novelized)
-
-                removed = await self._consolidator.deduplicate(
-                    plagiarism_threshold=self._settings.memory.plagiarism_threshold
-                )
-                logger.info("app: nightly dedup removed %d duplicate diary entries", removed)
-
-                merged = await self._consolidator.summarize_stale_entries()
-                if merged is not None:
-                    logger.info("app: nightly consolidation created memoir entry %s", merged.id)
-
-                pruned_messages = await self._history.prune_old_messages()
-                logger.info("app: nightly cleanup pruned %d old history messages", pruned_messages)
+                await self._run_nightly_maintenance()
         except asyncio.CancelledError:
             logger.info("app: diary consolidation loop stopped")
             raise
+
+    async def _run_nightly_maintenance(self) -> None:
+        """
+        Одна ночь обслуживания: новеллизация, dedup, мемуары, чистка таблиц.
+
+        Каждый этап обёрнут отдельно и намеренно. Раньше их связывал один
+        общий try, и первый же сбой уносил всю ночь целиком — а первым идёт
+        новеллизация, то есть единственный этап, который ходит в LLM. Таймаут
+        на бесплатном тире — обычное дело (ровно он и рвал дневники), и из-за
+        него не проходили ни dedup, ни чистка таблиц, которым модель вообще
+        не нужна: одна недоступная сеть оставляла базу неубранной на сутки.
+
+        Порядок сохранён: новеллизация ПЕРВОЙ, потому что она создаёт записи
+        из прожитого дня, а dedup следом подчистит в том числе и их.
+        """
+        # Под общим локом с пульсом: оба пути двигают одну и ту же отметку
+        # last_novelized_at, и без взаимного исключения могли бы прочитать её
+        # одновременно и разобрать одно окно дважды.
+        async with self._memory_pulse.novelization_lock:
+            await self._nightly_step(
+                "novelization",
+                self._consolidator.novelize_recent_history(
+                    history=self._history,
+                    facts=self._facts,
+                    lookback=timedelta(days=self._settings.memory.novelization_lookback_days),
+                    min_messages=self._settings.memory.novelization_min_messages,
+                    experience=self._social_memory,
+                ),
+                "saved %s new diary entries",
+            )
+
+        await self._nightly_step(
+            "dedup",
+            self._consolidator.deduplicate(
+                plagiarism_threshold=self._settings.memory.plagiarism_threshold
+            ),
+            "removed %s duplicate diary entries",
+        )
+        await self._nightly_step(
+            "memoir",
+            self._consolidator.summarize_stale_entries(),
+            "created memoir entry %s",
+        )
+        await self._nightly_step(
+            "history cleanup",
+            self._history.prune_old_messages(),
+            "pruned %s old history messages",
+        )
+        # Журнал внешних пересечений рос вместе с каждым комментарием и
+        # прочитанным тредом и не убывал никогда. В промпт он не раздувается
+        # (все запросы к нему с LIMIT), но файл базы лежит на телефоне.
+        await self._nightly_step(
+            "social cleanup",
+            self._social_memory.prune_old(),
+            "pruned %s old social interactions",
+        )
+
+    async def _nightly_step(self, name: str, work: Awaitable[Any], outcome: str) -> None:
+        """
+        Один этап ночного обслуживания. Сбой одного не отменяет остальные.
+
+        Отмена (остановка приложения) проходит насквозь: её здесь глушить
+        нельзя, иначе выключение будет ждать всю ночную работу до конца.
+        """
+        try:
+            result = await work
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("app: nightly %s не прошло, продолжаю остальное", name, exc_info=True)
+            return
+        logger.info("app: nightly %s — %s", name, outcome % (result,))
 
     async def wait_until_stopped(self) -> None:
         """Блокируется, пока не будет вызван request_stop() (обычно — из обработчика сигнала ОС в scripts/run.py)."""

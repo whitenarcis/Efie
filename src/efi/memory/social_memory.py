@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from efi.db.core import Database
@@ -314,6 +314,43 @@ class SocialInteractionStore:
             (peer_user_id, limit),
         )
         return [_row_to_interaction(row) for row in rows]
+
+    async def prune_old(self, *, older_than_days: int = 180, keep_last_per_peer: int = 50) -> int:
+        """
+        Удаляет старые записи журнала и возвращает их число.
+
+        Журнал растёт с каждым комментарием, реплаем и прочитанным тредом и
+        не убывал никогда. В контекст он не раздувается — все запросы к нему
+        идут с LIMIT, — но файл базы лежит на телефоне, и через полгода
+        активной жизни это уже заметный объём.
+
+        Порог двойной, как и у истории сообщений: запись удаляется, только
+        если ОНА СТАРШЕ полугода И вне последних `keep_last_per_peer` записей
+        по СВОЕМУ собеседнику. Иначе один разговорчивый канал вытеснил бы всю
+        память о человеке, с которым Эфи пересеклась дважды за год, — а именно
+        такая память здесь и ценна.
+
+        Полгода, а не девяносто дней как у сообщений: это не переписка, а
+        память о том, с кем она вообще имела дело, и она должна пережить
+        долгую паузу.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        removed = await self._database.execute_and_count_changes(
+            """
+            DELETE FROM social_interactions
+            WHERE created_at < ?
+              AND id NOT IN (
+                  SELECT id FROM social_interactions AS recent
+                  WHERE recent.peer_user_id IS social_interactions.peer_user_id
+                  ORDER BY recent.created_at DESC, recent.id DESC
+                  LIMIT ?
+              )
+            """,
+            (cutoff, keep_last_per_peer),
+        )
+        if removed:
+            logger.info("social_memory: убрала %d записей старше %d дней", removed, older_than_days)
+        return removed
 
     async def count_public_comments(self, chat_id: int) -> int:
         """Сколько раз Эфи уже комментировала в этом канале — вход для «не частить» в RandomCommentEngager."""

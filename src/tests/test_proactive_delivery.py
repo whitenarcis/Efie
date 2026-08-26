@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.behavior.busy_engine import BusyDecision
@@ -357,3 +358,65 @@ async def test_undelivered_follow_up_keeps_the_promise_open(tmp_path: Path) -> N
 
     assert send_tool.sent == []
     assert (await working_memory.load()).items[0].done is False
+
+
+# -- протухший повод ---------------------------------------------------------
+
+
+async def test_a_stale_proactive_reason_is_dropped(tmp_path: Path) -> None:
+    """
+    Телефон спал без сети — в метро, ночью, по воле Android, — а фоновые
+    службы всё это время складывали поводы в очередь. Без этой проверки
+    человек, вернувшись в сеть, получал пачку сообщений подряд: «шесть часов
+    тишины», «доброе утро» и «ты обещала скинуть ссылку» — всё разом и всё
+    про вчера.
+    """
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.SPONTANEOUS_PING,
+            chat_id=_OWNER_ID,
+            message="напиши первой",
+            created_at=datetime.now(UTC) - timedelta(hours=6),
+        )
+    )
+
+    assert send_tool.sent == []
+
+
+async def test_a_fresh_proactive_reason_still_goes_through(tmp_path: Path) -> None:
+    """Порог не должен съедать обычную задержку в пару минут."""
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.SPONTANEOUS_PING,
+            chat_id=_OWNER_ID,
+            message="напиши первой",
+            created_at=datetime.now(UTC) - timedelta(minutes=2),
+        )
+    )
+
+    assert send_tool.sent == [(_OWNER_ID, "слушай, а я тут подумала")]
+
+
+async def test_a_late_message_from_a_person_is_never_dropped(tmp_path: Path) -> None:
+    """
+    Главная граница правила. На сообщение человека отвечают и с опозданием —
+    молча выбросить его нельзя ни при каких обстоятельствах, сколько бы оно
+    ни пролежало в очереди.
+    """
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.USER_MESSAGE,
+            chat_id=_OWNER_ID,
+            message="ты тут?",
+            payload={"sender_id": _OWNER_ID},
+            created_at=datetime.now(UTC) - timedelta(hours=6),
+        )
+    )
+
+    assert send_tool.sent == [(_OWNER_ID, "слушай, а я тут подумала")]

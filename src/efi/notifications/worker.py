@@ -102,7 +102,7 @@ import asyncio
 import contextlib
 import logging
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from efi.behavior.ambiguity import PendingClarifications
@@ -174,6 +174,25 @@ _PROACTIVE_NOTIFICATION_TYPES = frozenset(
 #: Публичные выступления — их результат идёт в социальную память как
 #: #public_comment (см. Worker._record_social_interaction).
 _PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
+
+#: Через сколько инициативный повод протухает и выбрасывается, не доехав до
+#: чата.
+#:
+#: Проблема, которую это решает, видна только на телефоне. Пока Termux спал
+#: без сети (метро, ночь, экономия батареи), фоновые службы продолжали
+#: складывать поводы в очередь: «шесть часов тишины», «ты обещала скинуть
+#: ссылку», «доброе утро». Сеть возвращается — и человек получает пачку
+#: сообщений подряд, половина из которых про вчера. Выглядит это как сбой,
+#: а не как живой человек.
+#:
+#: Полчаса: повод написать первой — это состояние «мне сейчас хочется», и
+#: через полчаса оно уже неправда. Ответ человеку сюда не входит: на
+#: сообщение отвечают и с опозданием, и молчаливо выбросить его нельзя.
+#:
+#: `Notification.created_at` при повторной постановке в очередь намеренно не
+#: обновляется (см. NotificationManager.retry_later) — иначе повод, который
+#: не удалось доставить, молодел бы с каждой попыткой и не протухал никогда.
+_PROACTIVE_REASON_TTL = timedelta(minutes=30)
 
 #: Уведомления, на которые распространяется правило «одно неотвеченное
 #: сообщение» (см. efi/behavior/initiative.py). FOLLOW_UP сюда НЕ входит:
@@ -762,6 +781,9 @@ class Worker:
         if self._is_unprompted_ping_into_shared_chat(notification, chat_kind):
             return True
 
+        if self._reason_has_gone_stale(notification):
+            return True
+
         if self._lifecycle is None:
             return False
 
@@ -786,6 +808,30 @@ class Worker:
 
         decision = await self._lifecycle.evaluate(sender_id, notification.chat_id, notification.message)
         return decision.should_disengage
+
+    def _reason_has_gone_stale(self, notification: Notification) -> bool:
+        """
+        Инициативный повод, пролежавший в очереди полчаса, выбрасывается.
+
+        Телефон засыпает без сети — в метро, ночью, просто по воле Android, —
+        а фоновые службы всё это время складывают поводы в очередь. Без этой
+        проверки человек, вернувшись в сеть, получал пачку сообщений подряд:
+        «шесть часов тишины», «доброе утро» и «ты обещала скинуть ссылку» —
+        всё разом и всё про вчера.
+
+        Ответ человеку сюда не входит намеренно: на сообщение отвечают и с
+        опозданием, а молча выбросить его нельзя ни при каких обстоятельствах.
+        """
+        if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
+            return False
+        age = datetime.now(UTC) - notification.created_at
+        if age < _PROACTIVE_REASON_TTL:
+            return False
+        logger.info(
+            "worker[%d]: повод %s для chat_id=%s протух (%.0f мин в очереди), не пишу",
+            self._worker_index, notification.type.value, notification.chat_id, age.total_seconds() / 60,
+        )
+        return True
 
     def _is_unprompted_ping_into_shared_chat(self, notification: Notification, chat_kind: ChatKind) -> bool:
         """
