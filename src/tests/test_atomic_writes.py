@@ -14,13 +14,15 @@ Android убивает фоновые процессы, батарея сади�
 from __future__ import annotations
 
 import os
+import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from efi.memory.diary import Diary
 from efi.memory.working_memory import WorkingMemory
-from efi.utils.atomic import write_text_atomic
+from efi.utils.atomic import sweep_stale_files, write_text_atomic
 
 
 async def test_the_file_is_replaced_whole(tmp_path: Path) -> None:
@@ -90,3 +92,50 @@ async def test_a_diary_entry_lands_whole(tmp_path: Path) -> None:
     entries = await Diary(tmp_path / "diary").all_entries()
 
     assert [entry.body for entry in entries] == ["Прожитый вечер."]
+
+
+# -- обратная сторона той же медали: мусор от оборванной работы ------------------
+
+
+def _aged(path: Path, hours: float) -> None:
+    when = time.time() - hours * 3600
+    os.utime(path, (when, when))
+
+
+def test_a_forgotten_download_is_swept_away(tmp_path: Path) -> None:
+    """
+    Голосовое, скачанное за секунду до того, как Android убил Termux, не
+    удалит уже никто: обычный путь удаляет файл сразу после распознавания, но
+    обычный путь — не единственный. На телефоне такие остатки копятся
+    месяцами и незаметны, пока не кончится место.
+    """
+    forgotten = tmp_path / "voice_note.ogg"
+    forgotten.write_bytes(b"\x00" * 64)
+    _aged(forgotten, hours=5)
+
+    assert sweep_stale_files(tmp_path, older_than=timedelta(hours=1)) == 1
+    assert not forgotten.exists()
+
+
+def test_a_file_being_processed_right_now_is_left_alone(tmp_path: Path) -> None:
+    """Уборка не имеет права утащить файл из-под обработчика, который его читает."""
+    in_flight = tmp_path / "photo.jpg"
+    in_flight.write_bytes(b"\x00")
+
+    assert sweep_stale_files(tmp_path, older_than=timedelta(hours=1)) == 0
+    assert in_flight.exists()
+
+
+def test_sweeping_a_missing_directory_is_not_an_error(tmp_path: Path) -> None:
+    """Первый запуск: каталога ещё нет, и это нормальный ход событий."""
+    assert sweep_stale_files(tmp_path / "no-such-dir", older_than=timedelta(hours=1)) == 0
+
+
+def test_the_sweep_does_not_descend_into_directories(tmp_path: Path) -> None:
+    """Кэш плоский; рекурсия здесь могла бы утащить что-то чужое."""
+    nested = tmp_path / "keep-me"
+    nested.mkdir()
+    _aged(nested, hours=99)
+
+    assert sweep_stale_files(tmp_path, older_than=timedelta(hours=1)) == 0
+    assert nested.is_dir()

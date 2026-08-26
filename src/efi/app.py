@@ -122,6 +122,7 @@ from efi.tools.telegram_actions.send_message import SendMessageTool
 from efi.tools.telegram_actions.stickers import SendStickerTool
 from efi.tools.web_tools.get_weather import GetWeatherTool
 from efi.tools.web_tools.web_search import WebSearchTool
+from efi.utils.atomic import sweep_stale_files
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,12 @@ _MAX_SERVICE_RESTARTS = 6
 _SERVICE_RESTART_BASE_DELAY = 5.0
 _SERVICE_RESTART_MAX_DELAY = 300.0
 _CONSOLIDATION_TRIGGER_AT = dt_time(hour=3, minute=30)
+
+#: Сколько может пролежать скачанный медиафайл, прежде чем считать его
+#: забытым. Час: обычный путь удаляет файл через секунды после распознавания,
+#: так что часовой давности файл — это заведомо остаток от запуска, который
+#: убили посреди работы (на телефоне — рядовое событие).
+_MEDIA_CACHE_TTL = timedelta(hours=1)
 #: "С начала времён" — для get_active_chat_ids(since=...) в _active_chat_candidates,
 #: где нужны ВСЕ чаты с известной историей, а не только недавние.
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -832,6 +839,16 @@ class EfiApp:
         # должен при запуске, а не когда ему пришлют картинку.
         for note in self._settings.llm_roles.describe_fallbacks():
             logger.warning("app: %s", note)
+
+        # Остатки скачанных фото и голосовых от прошлого запуска. По ходу
+        # дела они удаляются сразу после распознавания, но обычный путь —
+        # не единственный: Android убивает Termux в произвольный момент, и
+        # файл, скачанный за секунду до этого, не удалит уже никто.
+        stale_media = sweep_stale_files(
+            self._settings.paths.cache_dir, older_than=_MEDIA_CACHE_TTL
+        )
+        if stale_media:
+            logger.info("app: убрала %d недоудалённых медиафайлов от прошлого запуска", stale_media)
 
         self._telegram_handlers.register(self._pyrogram_client)
         self._channel_post_watcher.register(self._pyrogram_client)
