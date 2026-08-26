@@ -214,6 +214,9 @@ class EfiApp:
         # нужны промпту с инструментами, чтобы Эфи знала, что у неё есть и
         # чего нет. Сам конвейер собирается ниже и только при dev.enabled.
         self._dev_store = DevTaskStore(self._database)
+        #: Всё в подсистеме разработки, что держит собственный HTTP-клиент и
+        #: должно быть закрыто на остановке (см. stop()).
+        self._dev_clients: list[Any] = []
         # Стол переговоров нужен промпту и инструментам, которые собираются
         # раньше фонового воркера, поэтому конвейер привязывается к нему
         # позже (attach_pipeline), когда станет известно, есть ли кому
@@ -364,6 +367,7 @@ class EfiApp:
             diary=self._diary,
             working_memory=self._working_memory,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
+            timezone=settings.timezone,
         )
         self._silence_monitor.set_reasons(self._ping_reasons)
         self._spontaneous_ping = SpontaneousPingScheduler(
@@ -552,6 +556,10 @@ class EfiApp:
 
         coder = QwenCoderClient(coder_endpoint)
         sandbox = CodeSandbox(enable_linter=dev_settings.lint_generated_code)
+        # Свои httpx-клиенты (кодер и ноутбук) роутер не закрывает — он о них
+        # не знает. Незакрытые они переживают остановку открытым соединением
+        # и жалобой в лог, поэтому запоминаются здесь и гасятся в stop().
+        self._dev_clients.append(coder)
         reporter = DevReporter(
             self._notification_manager,
             social_memory=self._social_memory,
@@ -623,6 +631,7 @@ class EfiApp:
             reporter,
             maintainer=maintainer,
             swe=self._build_swe_engine(network, workspaces, narrator),
+            workspaces=workspaces,
             interests=self._community_interests,
             # Своя затея рассказывается владельцу: чат для неё выбирается
             # здесь, а не воркером, — это единственное место, которое знает
@@ -683,7 +692,9 @@ class EfiApp:
         else:
             logger.info("app: ноутбук не настроен (OMNIROUTE_URL), тяжёлые задачи идут через кодер")
 
-        return NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
+        router = NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
+        self._dev_clients.append(router)
+        return router
 
     async def _look_up_error(self, query: str) -> str:
         """
@@ -1055,6 +1066,11 @@ class EfiApp:
 
         await self._telegram_client.stop()
         await self._llm_router.aclose()
+        for client in self._dev_clients:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.warning("app: не удалось закрыть клиент разработки", exc_info=True)
         await self._web_search_tool.aclose()
         await self._weather_tool.aclose()
         if self._stt is not None:

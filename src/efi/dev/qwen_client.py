@@ -130,6 +130,17 @@ class QwenCoderClient:
     def model(self) -> str:
         return self._endpoint.model
 
+    async def aclose(self) -> None:
+        """
+        Закрывает httpx-клиент кодера.
+
+        Своего клиента он держит собственного, а не роутерного (см. докстринг
+        модуля), поэтому и закрывать его должен кто-то отдельно: при
+        остановке приложения незакрытый клиент остаётся висеть открытым
+        соединением и жалобой в лог.
+        """
+        await self._provider.aclose()
+
     @property
     def last_answer_truncated(self) -> bool:
         """Оборвался ли последний ответ по лимиту вывода."""

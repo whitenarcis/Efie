@@ -118,6 +118,10 @@ class LaptopLink:
         """Что мы думали о ноутбуке в прошлый раз — без похода в сеть. None = ещё не проверяли."""
         return self._alive
 
+    async def aclose(self) -> None:
+        """Закрывает клиент ноутбука — он тоже свой собственный, а не роутерный."""
+        await self._provider.aclose()
+
     def forget(self) -> None:
         """Сбросить кэш живости — например, после обрыва прямо посреди запроса."""
         self._alive = None
@@ -197,6 +201,11 @@ class NetworkModelRouter:
     def has_laptop(self) -> bool:
         """Настроен ли ноутбук вообще (а не доступен ли он сейчас)."""
         return self._laptop is not None
+
+    async def aclose(self) -> None:
+        """Закрывает то, чем владеет сам роутер. Резервный бэкенд закрывает тот, кто его создал."""
+        if self._laptop is not None:
+            await self._laptop.aclose()
 
     async def tier(self) -> str:
         """Кто будет думать в ближайшую минуту — для лога, дашборда и живой реплики."""

@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from efi.dev.engine import BuildResult, DevEngine
@@ -43,6 +43,7 @@ from efi.dev.reporter import DevReporter
 from efi.dev.schemas import DevTask, DevTaskKind, DevTaskStatus, ProjectSpec
 from efi.dev.store import DevTaskStore
 from efi.dev.swe_engine import SweEngine, SweRequest
+from efi.dev.workspace import WorkspaceManager
 from efi.utils.loops import run_periodically
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,16 @@ _REVIVE_AFTER = timedelta(hours=12)
 #: квоты, за которую пишется что-то новое.
 _MAX_REVIVALS = 2
 
+#: Сколько живёт рабочая копия удачной задачи. Три дня: ветку, которую не
+#: забрали за это время, уже не заберут, а место на телефоне кончается.
+_WORKSPACE_TTL = timedelta(days=3)
+
+#: Как часто перебирать рабочие копии. Уборка только на старте не годится:
+#: телефон с Termux живёт неделями без перезапуска, и за это время в
+#: `/tmp/workspaces` оседают гигабайты клонов. Раз в час — заведомо дешевле
+#: одного клонирования и незаметно на фоне тика конвейера.
+_WORKSPACE_SWEEP_EVERY = timedelta(hours=1)
+
 
 class InterestSource(Protocol):
     """
@@ -103,6 +114,7 @@ class DevWorker:
         *,
         maintainer: ProjectMaintainer | None = None,
         swe: SweEngine | None = None,
+        workspaces: WorkspaceManager | None = None,
         interests: InterestSource | None = None,
         owner_chat_id: int | None = None,
         check_interval_seconds: float = 3600.0,
@@ -120,6 +132,10 @@ class DevWorker:
         #: неё Эфи остаётся автором собственных проектов и не берётся за
         #: чужие репозитории — ровно то поведение, что было до этого модуля.
         self._swe = swe
+        #: Уборщик рабочих копий. Копия удачной задачи не удаляется сразу —
+        #: в ней лежит ветка, которую человек может захотеть забрать, — но и
+        #: не живёт вечно: на телефоне это гигабайты в /tmp.
+        self._workspaces = workspaces
         self._interests = interests
         self._owner_chat_id = owner_chat_id
         self._check_interval_seconds = check_interval_seconds
@@ -132,6 +148,9 @@ class DevWorker:
         self._wake = asyncio.Event()
         #: Разовая чистка пустых провалов при первом тике (см. _tick).
         self._purged_stubs = False
+        #: Когда в последний раз перебирали рабочие копии. None — ни разу,
+        #: то есть уборка случится на первом же тике.
+        self._workspaces_swept_at: datetime | None = None
 
     @property
     def is_coding(self) -> bool:
@@ -169,6 +188,8 @@ class DevWorker:
         if not self._purged_stubs:
             self._purged_stubs = True
             await self._store.purge_empty_failures()
+
+        self._sweep_workspaces()
 
         # Задачи, брошенные посреди работы (процесс упал, телефон убил
         # фоновую задачу), возвращаются в очередь ПЕРЕД выбором следующей:
@@ -208,6 +229,31 @@ class DevWorker:
             await self._process(task)
         finally:
             self._is_coding = False
+
+    def _sweep_workspaces(self) -> None:
+        """
+        Прибирает старые рабочие копии — но не чаще, чем раз в час.
+
+        Уборка только на старте не годилась: Termux на телефоне живёт
+        неделями без перезапуска, и за это время клоны в /tmp съедают место,
+        которого там и так немного. Обход каталога синхронный, поэтому он
+        и разрежен по времени: держать на нём цикл каждую минуту незачем.
+        """
+        if self._workspaces is None:
+            return
+        now = datetime.now(UTC)
+        if (
+            self._workspaces_swept_at is not None
+            and now - self._workspaces_swept_at < _WORKSPACE_SWEEP_EVERY
+        ):
+            return
+        self._workspaces_swept_at = now
+        try:
+            self._workspaces.prune_older_than(_WORKSPACE_TTL)
+        except OSError:
+            # Не убралось — не повод ронять конвейер: место кончится позже,
+            # а работа встанет прямо сейчас.
+            logger.warning("dev: не удалось прибрать рабочие копии", exc_info=True)
 
     async def _take_swe_task(self) -> bool:
         """

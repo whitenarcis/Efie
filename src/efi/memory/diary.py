@@ -42,6 +42,7 @@ from efi.llm.schemas import (
     DiaryQueryResult,
     EmbeddingVector,
 )
+from efi.utils.atomic import write_text_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -166,11 +167,11 @@ class Diary:
         Не проверяет на дубли сама — эта проверка (`is_duplicate_of`) требует
         эмбеддинга запроса и явно вызывается на уровне memory/rag.py ДО save().
         """
-        await aiofiles.os.makedirs(self._diary_dir, exist_ok=True)
         path = self._diary_dir / entry.filename
-        content = _serialize_entry(entry)
-        async with aiofiles.open(path, mode="w", encoding="utf-8") as f:
-            await f.write(content)
+        # Атомарно: запись дневника — это прожитый вечер, и терять его из-за
+        # того, что телефон выключился посреди сохранения, нельзя
+        # (см. efi/utils/atomic.py).
+        await write_text_atomic(path, _serialize_entry(entry))
         cache = await self._ensure_loaded()
         cache[entry.id] = entry
 

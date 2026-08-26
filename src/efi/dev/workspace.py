@@ -41,6 +41,7 @@ import resource
 import shutil
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -277,6 +278,34 @@ class WorkspaceManager:
     ) -> None:
         self._root = root
         self._git = git_executable
+
+    def prune_older_than(self, max_age: timedelta) -> int:
+        """
+        Убирает старые рабочие копии и возвращает их число.
+
+        Копия удачной задачи не удаляется сразу: в ней лежит ветка, которую
+        человек, возможно, ещё захочет забрать. Но «не сразу» не значит
+        «никогда»: на телефоне десяток чужих репозиториев в /tmp — это
+        гигабайты, которые никто не хватится, пока не кончится место.
+
+        Синхронно и без исключений: это уборка, а не работа. Не получилось
+        удалить — значит, попробуем в следующий раз.
+        """
+        if not self._root.is_dir():
+            return 0
+        cutoff = (datetime.now(UTC) - max_age).timestamp()
+        removed = 0
+        for path in self._root.iterdir():
+            try:
+                if not path.is_dir() or path.stat().st_mtime >= cutoff:
+                    continue
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+            except OSError:  # pragma: no cover — гонка с чужим удалением
+                continue
+        if removed:
+            logger.info("workspace: убрала %d старых рабочих копий из %s", removed, self._root)
+        return removed
 
     async def prepare_empty(self, *, session_id: str) -> Workspace:
         """
