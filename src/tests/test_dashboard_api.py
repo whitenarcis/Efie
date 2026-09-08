@@ -33,6 +33,8 @@ from efi.dashboard.snapshot import DashboardContext
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
+from efi.dev.schemas import DevTaskStatus, ProjectSpec
+from efi.dev.store import DevTaskStore
 from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata, Message, Role
 from efi.memory.beliefs import BeliefStore
 from efi.memory.diary import Diary
@@ -89,6 +91,7 @@ async def _harness(tmp_path: Path, **dashboard: object) -> _Harness:
         beliefs=BeliefStore(database),
         notifications=NotificationManager(worker_count=2),
         tools=ToolRegistry(),
+        dev_store=DevTaskStore(database),
     )
     server = DashboardServer(context, settings.dashboard)
     await server.start()
@@ -133,6 +136,65 @@ async def test_static_path_traversal_is_refused(harness: _Harness) -> None:
         for path in ("/static/../server.py", "/static/..%2Fserver.py", "/static/sub/dir.css"):
             response = await client.get(path)
             assert response.status_code == 404, path
+
+
+# -- проекты -----------------------------------------------------------------
+
+
+async def test_projects_section_shows_work_links_and_revisions(harness: _Harness) -> None:
+    """
+    Раздел отвечает на вопрос, который иначе проверяется руками через GitHub:
+    делает ли она что-то на самом деле. Значит, в нём обязаны быть статус,
+    ссылка и след возвращений к коду.
+    """
+    assert harness.context.dev_store is not None
+    store = harness.context.dev_store
+    spec = ProjectSpec.model_validate(
+        {
+            "slug": "log-digest",
+            "title": "Log Digest",
+            "problem": "Разбирает логи nginx и показывает топ ошибок за период",
+            "stack": ["python 3.11"],
+            "files": [{"path": "src/main.py", "purpose": "точка входа"}],
+        }
+    )
+    released = await store.create("утилита для логов", chat_id=-100, is_collab=True)
+    released = await store.update(
+        released, status=DevTaskStatus.DONE, spec=spec, repo_url="https://github.com/efi/log-digest"
+    )
+    await store.mark_reviewed(released, revised=True)
+    await store.create("следующая идея", chat_id=-100)
+
+    async with harness.client() as client:
+        response = await client.get("/api/projects")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["stats"] == {
+        "in_work": 1, "released": 1, "failed": 0, "revisions": 1, "code_work": 0
+    }
+
+    by_slug = {project["slug"]: project for project in payload["projects"]}
+    assert by_slug["log-digest"]["repo_url"] == "https://github.com/efi/log-digest"
+    assert by_slug["log-digest"]["status_label"] == "готово и запушено"
+    assert by_slug["log-digest"]["revisions"] == 1
+    assert by_slug["log-digest"]["reviewed_at"] is not None
+    assert by_slug["log-digest"]["files"] == [{"path": "src/main.py", "purpose": "точка входа"}]
+    assert by_slug[""]["status"] == "pending", "замысел без спеки тоже виден"
+
+
+async def test_projects_section_survives_a_switched_off_craft(tmp_path: Path) -> None:
+    """Без подсистемы разработки раздел обязан отдавать пустоту, а не 500."""
+    started = await _harness(tmp_path)
+    started.context.dev_store = None
+    try:
+        async with started.client() as client:
+            response = await client.get("/api/projects")
+    finally:
+        await started.server.stop()
+
+    assert response.status_code == 200
+    assert response.json() == {"enabled": False, "projects": [], "stats": {}}
 
 
 # -- только чтение -----------------------------------------------------------

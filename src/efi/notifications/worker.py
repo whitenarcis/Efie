@@ -9,6 +9,12 @@ Worker — обрабатывает уведомления, закреплённ
 очереди — никакой другой Worker его в это время не подхватит.
 
 На каждое уведомление Worker (порядок ВАЖЕН — см. efi/behavior/busy_engine.py):
+    0. Восстанавливает контекст чата (`_fill_chat_context`): что это за чат —
+       личка, группа или канал. Входящее сообщение приносит это с собой, а
+       событие от таймера — нет, и раньше проактивный путь шёл вообще без
+       знания о чате: Эфи писала «первой» в группу с админкой ровно теми же
+       словами, какими пишет человеку в личку. Отсюда же следует, кому вообще
+       позволено писать первой — см. _is_unprompted_ping_into_shared_chat.
     1. Спрашивает у BusyEngine решение (`decide`): сколько ждать и идёт ли
        уже активный разговор в этом чате.
        - Разговор УЖЕ идёт: сообщение отмечается прочитанным СРАЗУ, до
@@ -95,14 +101,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from datetime import datetime
-from typing import Protocol
+from collections.abc import Sequence
+from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol
 
 from efi.behavior.ambiguity import PendingClarifications
 from efi.behavior.busy_engine import BusyEngine
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.initiative import InitiativeGate
 from efi.config.schema import TaskRole
+from efi.db.chat_directory import ChatDirectory
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Response, Role, Session
@@ -112,6 +120,7 @@ from efi.notifications.manager import NotificationManager
 from efi.notifications.schemas import Notification, NotificationType
 from efi.security.sanitize import sanitize_text
 from efi.telegram.chat_orchestrator import ChatOrchestrator
+from efi.telegram.chat_scope import ChatKind, resolve_chat_kind
 from efi.tools.base import ToolContext
 from efi.tools.registry import ToolRegistry
 
@@ -145,19 +154,61 @@ _RETRY_DELAYS_SECONDS = (60.0, 180.0)
 
 #: Уведомления, где Эфи пишет ПЕРВОЙ. Разрешены только владельцу —
 #: см. ConversationLifecycle.allows_proactive_ping и Worker._should_disengage.
+#:
+#: DEV_UPDATE (ход работы над проектом, efi/dev/reporter.py) входит сюда на
+#: тех же правах, что FOLLOW_UP: повод у неё конкретный и не выдуманный, но
+#: сообщение всё равно приходит в чат, где никто ничего не спрашивал, — а
+#: значит, действует общее правило «первой пишем только туда, куда владелец
+#: разрешил». В отличие от спонтанного пинга, общий чат тут не запрещён
+#: (см. _UNPROMPTED_NOTIFICATION_TYPES): проект, о котором договорились в
+#: группе, там же и показывают.
 _PROACTIVE_NOTIFICATION_TYPES = frozenset(
-    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING, NotificationType.FOLLOW_UP}
+    {
+        NotificationType.SPONTANEOUS_PING,
+        NotificationType.SILENCE_PING,
+        NotificationType.FOLLOW_UP,
+        NotificationType.DEV_UPDATE,
+    }
 )
 
 #: Публичные выступления — их результат идёт в социальную память как
 #: #public_comment (см. Worker._record_social_interaction).
 _PUBLIC_COMMENT_TYPES = frozenset({NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY})
 
+#: Через сколько инициативный повод протухает и выбрасывается, не доехав до
+#: чата.
+#:
+#: Проблема, которую это решает, видна только на телефоне. Пока Termux спал
+#: без сети (метро, ночь, экономия батареи), фоновые службы продолжали
+#: складывать поводы в очередь: «шесть часов тишины», «ты обещала скинуть
+#: ссылку», «доброе утро». Сеть возвращается — и человек получает пачку
+#: сообщений подряд, половина из которых про вчера. Выглядит это как сбой,
+#: а не как живой человек.
+#:
+#: Полчаса: повод написать первой — это состояние «мне сейчас хочется», и
+#: через полчаса оно уже неправда. Ответ человеку сюда не входит: на
+#: сообщение отвечают и с опозданием, и молчаливо выбросить его нельзя.
+#:
+#: `Notification.created_at` при повторной постановке в очередь намеренно не
+#: обновляется (см. NotificationManager.retry_later) — иначе повод, который
+#: не удалось доставить, молодел бы с каждой попыткой и не протухал никогда.
+_PROACTIVE_REASON_TTL = timedelta(minutes=30)
+
 #: Уведомления, на которые распространяется правило «одно неотвеченное
 #: сообщение» (см. efi/behavior/initiative.py). FOLLOW_UP сюда НЕ входит:
 #: напоминание — это прямая просьба человека, а не её инициатива, и молчание
 #: в ответ на прошлый пинг эту просьбу не отменяет.
 _INITIATIVE_NOTIFICATION_TYPES = frozenset(
+    {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING}
+)
+
+#: Уведомления, которых НИКТО не просил: они рождаются из таймера, а не из
+#: чужой реплики и не из просьбы человека. Только им запрещён общий чат —
+#: см. Worker._is_unprompted_ping_into_shared_chat. Набор совпадает с
+#: _INITIATIVE_NOTIFICATION_TYPES по составу, но не по смыслу: там правило
+#: «одно неотвеченное сообщение», здесь — «куда вообще можно писать первой»,
+#: и при появлении новых типов уведомлений они разойдутся.
+_UNPROMPTED_NOTIFICATION_TYPES = frozenset(
     {NotificationType.SPONTANEOUS_PING, NotificationType.SILENCE_PING}
 )
 
@@ -236,6 +287,8 @@ class Worker:
         working_memory: WorkingMemoryPort | None = None,
         clarifications: PendingClarifications | None = None,
         initiative: InitiativeGate | None = None,
+        chat_directory: ChatDirectory | None = None,
+        commitment_recorders: Sequence[Any] = (),
     ) -> None:
         self._worker_index = worker_index
         self._manager = manager
@@ -261,6 +314,17 @@ class Worker:
         #: что собеседник реально ответил; сами инициативные службы этого не
         #: видят.
         self._initiative = initiative
+        #: Что за чат стоит за chat_id — личка, группа или канал (см.
+        #: efi/db/chat_directory.py). Воркер — единственная точка, через
+        #: которую проходят ВСЕ уведомления, поэтому контекст чата
+        #: восстанавливается здесь, а не в каждой инициативной службе.
+        self._chat_directory = chat_directory
+        #: Столы переговоров о работе (efi/behavior/collab_coding.py,
+        #: efi/behavior/dev_dialogue.py). Воркер — единственное место, где
+        #: известно, ЧТО она на самом деле сказала собеседнику, и потому
+        #: единственное, где можно поймать обещание, данное словами вместо
+        #: вызова инструмента.
+        self._commitment_recorders = list(commitment_recorders)
 
     async def run(self) -> None:
         """
@@ -335,7 +399,8 @@ class Worker:
             )
 
     async def _handle_inner(self, notification: Notification, tool_context: ToolContext) -> None:
-        if await self._should_disengage(notification):
+        chat_kind = await self._fill_chat_context(notification)
+        if await self._should_disengage(notification, chat_kind):
             return
 
         decision = await self._busy_engine.decide(notification.chat_id)
@@ -455,9 +520,36 @@ class Worker:
             await self._history.append(notification.chat_id, _message_to_persist(response, tool_context))
 
         await self._close_delivered_promise(notification, tool_context)
+        await self._record_commitments(notification, tool_context)
         await self._record_social_interaction(notification, tool_context)
         await self._spend_energy(tool_context)
         await self._record_initiative(notification, tool_context)
+
+    async def _record_commitments(self, notification: Notification, tool_context: ToolContext) -> None:
+        """
+        «Набросаю за ночь» — это обещание, а не реплика.
+
+        Самый неприятный исход обсуждения выглядит так: договорились, она
+        написала, что берётся, и не вызвала инструмент. Для человека это
+        неотличимо от согласия — он ложится спать, ожидая проект, которого
+        никто не начинал. Поэтому её собственный текст проверяется на
+        обещание, и обещание становится задачей.
+
+        Смотрим на то, что РЕАЛЬНО ушло собеседнику (`sent_texts`): обещание,
+        не дошедшее до человека, никого ни к чему не обязывает.
+        """
+        sent_texts = tool_context.extra.get("sent_texts")
+        if not sent_texts or notification.chat_id is None or not self._commitment_recorders:
+            return
+        said = "\n".join(sent_texts)
+        for recorder in self._commitment_recorders:
+            try:
+                await recorder.consider_reply(notification.chat_id, said)
+            except Exception:
+                logger.warning(
+                    "worker[%d]: не удалось проверить обещание в chat_id=%s",
+                    self._worker_index, notification.chat_id, exc_info=True,
+                )
 
     async def _spend_energy(self, tool_context: ToolContext) -> None:
         """
@@ -649,7 +741,31 @@ class Worker:
                 self._worker_index, notification.id, exc_info=True,
             )
 
-    async def _should_disengage(self, notification: Notification) -> bool:
+    async def _fill_chat_context(self, notification: Notification) -> ChatKind:
+        """
+        Дописывает в payload тип и название чата, если их там нет, и
+        возвращает род чата.
+
+        Нужно ровно проактивному пути. Входящее сообщение приносит `chat_type`
+        с собой (efi.telegram.handlers._build_chat_context), а спонтанный
+        пинг, пинг по затишью и follow-up рождаются из таймера: у них
+        payload пустой, и системный промпт собирался БЕЗ блока «[О чате]» —
+        то есть модель не знала, что пишет в группу, а не человеку.
+
+        Справочник чатов не обязателен: если его нет (или чата в нём ещё
+        нет), род чата выводится из самого chat_id — этого достаточно, чтобы
+        не спутать группу с личкой (см. efi/telegram/chat_scope.py).
+        """
+        payload = notification.payload
+        if self._chat_directory is not None and notification.chat_id is not None:
+            descriptor = await self._chat_directory.describe(notification.chat_id)
+            if not payload.get("chat_type") and descriptor.chat_type:
+                payload["chat_type"] = descriptor.chat_type
+            if not payload.get("chat_title") and descriptor.title:
+                payload["chat_title"] = descriptor.title
+        return resolve_chat_kind(payload.get("chat_type"), notification.chat_id)
+
+    async def _should_disengage(self, notification: Notification, chat_kind: ChatKind) -> bool:
         """
         Молчаливый выход из разговора с посторонним — см.
         efi.behavior.conversation_lifecycle.ConversationLifecycle.
@@ -662,6 +778,12 @@ class Worker:
         Инициативные пинги посторонним отсекаются здесь же: писать первой
         тому, кто об этом не просил, — навязчивость по определению.
         """
+        if self._is_unprompted_ping_into_shared_chat(notification, chat_kind):
+            return True
+
+        if self._reason_has_gone_stale(notification):
+            return True
+
         if self._lifecycle is None:
             return False
 
@@ -686,6 +808,54 @@ class Worker:
 
         decision = await self._lifecycle.evaluate(sender_id, notification.chat_id, notification.message)
         return decision.should_disengage
+
+    def _reason_has_gone_stale(self, notification: Notification) -> bool:
+        """
+        Инициативный повод, пролежавший в очереди полчаса, выбрасывается.
+
+        Телефон засыпает без сети — в метро, ночью, просто по воле Android, —
+        а фоновые службы всё это время складывают поводы в очередь. Без этой
+        проверки человек, вернувшись в сеть, получал пачку сообщений подряд:
+        «шесть часов тишины», «доброе утро» и «ты обещала скинуть ссылку» —
+        всё разом и всё про вчера.
+
+        Ответ человеку сюда не входит намеренно: на сообщение отвечают и с
+        опозданием, а молча выбросить его нельзя ни при каких обстоятельствах.
+        """
+        if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
+            return False
+        age = datetime.now(UTC) - notification.created_at
+        if age < _PROACTIVE_REASON_TTL:
+            return False
+        logger.info(
+            "worker[%d]: повод %s для chat_id=%s протух (%.0f мин в очереди), не пишу",
+            self._worker_index, notification.type.value, notification.chat_id, age.total_seconds() / 60,
+        )
+        return True
+
+    def _is_unprompted_ping_into_shared_chat(self, notification: Notification, chat_kind: ChatKind) -> bool:
+        """
+        «Написать первой» — только в личку. В группе и канале это не
+        инициатива, а объявление на весь чат.
+
+        Разговор в общем чате начинается с чужой реплики: там есть, кому
+        ответить. Спонтанный пинг и пинг по затишью — это разговор ни с кем
+        конкретно, и в группе он выглядит именно так, как выглядел: Эфи
+        писала в чат, где у неё админка, «как дела» так, будто пишет
+        одному человеку.
+
+        FOLLOW_UP под правило НЕ подпадает: напоминание — прямая просьба
+        человека («напомни через 10 минут»), и если он попросил об этом в
+        группе, то и напоминание уместно там же.
+        """
+        if notification.type not in _UNPROMPTED_NOTIFICATION_TYPES or chat_kind.is_one_on_one:
+            return False
+        logger.info(
+            "worker[%d]: skipping proactive %s for chat_id=%s — это %s, а не личка: "
+            "первой Эфи пишет только один на один",
+            self._worker_index, notification.type.value, notification.chat_id, chat_kind.value,
+        )
+        return True
 
     async def _ensure_reply_was_sent(
         self, params: LLMParams, session: Session, tool_context: ToolContext, response: Response

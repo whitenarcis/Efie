@@ -265,6 +265,11 @@ class LLMParams(BaseModel):
     system_prompt: str = ""
     model: str
     max_output_tokens: int = Field(default=8192, gt=0)
+    #: Таймаут ИМЕННО этого запроса, если он отличается от таймаута эндпоинта.
+    #: Нужен потому, что один и тот же эндпоинт отвечает и репликой в чат, и
+    #: дневником на четыре тысячи токенов: общий таймаут для этих задач —
+    #: гарантированный обрыв одной из них (см. efi/llm/timeouts.py).
+    timeout_seconds: float | None = Field(default=None, gt=0.0)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     top_k: float | None = None

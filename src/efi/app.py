@@ -17,18 +17,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
+from pathlib import Path
 from typing import Any
 
 from pyrogram import Client
 
 from efi.behavior.affinity import AffinityTracker
 from efi.behavior.ambiguity import PendingClarifications
-from efi.behavior.busy_engine import BusyEngine
+from efi.behavior.busy_engine import AnyBusyState, BusyEngine
+from efi.behavior.collab_coding import CollabCodingDesk
 from efi.behavior.conversation_lifecycle import ConversationLifecycle
 from efi.behavior.curiosity import CuriosityTracker
+from efi.behavior.dev_dialogue import DevPartnerDesk
 from efi.behavior.initiative import InitiativeGate
 from efi.behavior.life_engine import BackgroundLifeWorker
 from efi.behavior.organic_ping import OrganicPingGenerator
@@ -43,10 +46,26 @@ from efi.dashboard.logbus import LogBuffer
 from efi.dashboard.metrics import LLMMetricsCollector
 from efi.dashboard.server import DashboardServer
 from efi.dashboard.snapshot import DashboardContext
+from efi.db.chat_directory import ChatDirectory
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
+from efi.dev.engine import DevEngine
+from efi.dev.github_sync import GitHubSync
+from efi.dev.maintenance import ProjectMaintainer
+from efi.dev.qwen_client import QwenCoderClient
+from efi.dev.reporter import DevReporter
+from efi.dev.research_topics import DevResearchTopics
+from efi.dev.sandbox import CodeSandbox
+from efi.dev.schemas import DevTask
+from efi.dev.store import DevTaskStore
+from efi.dev.swe_engine import SweEngine
+from efi.dev.verify import ProjectVerifier
+from efi.dev.worker import DevWorker
+from efi.dev.workspace import WorkspaceManager
 from efi.humanizer.anti_repeat import AntiRepeatTracker
+from efi.llm.network_router import LaptopLink, NetworkModelRouter, as_fixer
+from efi.llm.resilience import ConcurrencyGate
 from efi.media.stt_groq import GroqSTT
 from efi.memory.beliefs import BeliefStore
 from efi.memory.consolidation import DiaryConsolidator
@@ -83,6 +102,9 @@ from efi.tools.base import Tool
 from efi.tools.chat_management.join_chat import JoinChatTool
 from efi.tools.chat_management.leave_chat import LeaveChatTool
 from efi.tools.chat_management.search_chats import SearchChatsTool
+from efi.tools.dev_tools.project_status import DevProjectStatusTool
+from efi.tools.dev_tools.start_project import StartDevProjectTool
+from efi.tools.dev_tools.work_on_repo import WorkOnRepoTool
 from efi.tools.memory_tools.ask_diary import AskDiaryTool
 from efi.tools.memory_tools.manage_belief import UpdateBeliefTool
 from efi.tools.memory_tools.manage_promises import CompletePromiseTool, RememberPromiseTool
@@ -100,6 +122,7 @@ from efi.tools.telegram_actions.send_message import SendMessageTool
 from efi.tools.telegram_actions.stickers import SendStickerTool
 from efi.tools.web_tools.get_weather import GetWeatherTool
 from efi.tools.web_tools.web_search import WebSearchTool
+from efi.utils.atomic import sweep_stale_files
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +137,12 @@ _MAX_SERVICE_RESTARTS = 6
 _SERVICE_RESTART_BASE_DELAY = 5.0
 _SERVICE_RESTART_MAX_DELAY = 300.0
 _CONSOLIDATION_TRIGGER_AT = dt_time(hour=3, minute=30)
+
+#: Сколько может пролежать скачанный медиафайл, прежде чем считать его
+#: забытым. Час: обычный путь удаляет файл через секунды после распознавания,
+#: так что часовой давности файл — это заведомо остаток от запуска, который
+#: убили посреди работы (на телефоне — рядовое событие).
+_MEDIA_CACHE_TTL = timedelta(hours=1)
 #: "С начала времён" — для get_active_chat_ids(since=...) в _active_chat_candidates,
 #: где нужны ВСЕ чаты с известной историей, а не только недавние.
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
@@ -182,6 +211,28 @@ class EfiApp:
             pending=self._pending_clarifications,
         )
         self._history = SqliteHistoryRepository(self._database)
+        # Справочник чатов: личка это, группа или канал. Заполняется из
+        # входящих сообщений, читается проактивным путём — единственным, у
+        # которого своего Pyrogram-объекта чата нет (см. efi/db/chat_directory.py).
+        self._chat_directory = ChatDirectory(self._database)
+        # -- ремесло: свои проекты, код, GitHub ------------------------------
+        # Хранилище задач и стол переговоров поднимаются ВСЕГДА, даже при
+        # выключенной подсистеме: они дёшевы (таблица и словарь в памяти) и
+        # нужны промпту с инструментами, чтобы Эфи знала, что у неё есть и
+        # чего нет. Сам конвейер собирается ниже и только при dev.enabled.
+        self._dev_store = DevTaskStore(self._database)
+        #: Всё в подсистеме разработки, что держит собственный HTTP-клиент и
+        #: должно быть закрыто на остановке (см. stop()).
+        self._dev_clients: list[Any] = []
+        # Стол переговоров нужен промпту и инструментам, которые собираются
+        # раньше фонового воркера, поэтому конвейер привязывается к нему
+        # позже (attach_pipeline), когда станет известно, есть ли кому
+        # исполнять договорённость.
+        self._collab_desk = CollabCodingDesk(self._dev_store, pipeline_available=False)
+        # То же самое, но про уже существующий код: «глянь репу», «тест
+        # падает». Отдельный стол, потому что правила другие — конкретную
+        # правку не обсуждают, её делают (см. efi/behavior/dev_dialogue.py).
+        self._dev_desk = DevPartnerDesk(self._dev_store, available=False)
         # -- субъектность (граф убеждений + близость/уважение + любопытство) ----
         # Все три — только Database как зависимость, поэтому конструируются
         # здесь, ДО EfiSystemPromptBuilder (которому нужны beliefs/affinity) и
@@ -258,6 +309,11 @@ class EfiApp:
         # -- промпты -----------------------------------------------------
         templates_dir = settings.paths.base_dir / "efi" / "prompts" / "templates"
         self._prompt_loader = PromptLoader(templates_dir)
+        # Чем Эфи интересуется — worldview.json плюс семена любопытства из
+        # разговоров. Нужны и участию в сообществе (efi/telegram/comments.py),
+        # и замыслам собственных проектов (efi/dev/worker.py), поэтому
+        # конструируются здесь, до обоих потребителей.
+        self._community_interests = build_community_interests(self._database, templates_dir / "worldview.json")
         self._prompt_builder = EfiSystemPromptBuilder(
             self._prompt_loader,
             settings,
@@ -268,6 +324,13 @@ class EfiApp:
             self._people,
             knowledge=self._knowledge,
             clarifications=self._pending_clarifications,
+            # Своё ремесло в промпте: чем занята в коде и что уже выложила
+            # (см. efi/prompts/builder.py, блоки «Твоё ремесло» и «Предложение
+            # проекта»). Передаются всегда — блоки просто пусты, пока нечего
+            # рассказывать.
+            dev_store=self._dev_store,
+            collab=self._collab_desk,
+            dev_desk=self._dev_desk,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -292,7 +355,15 @@ class EfiApp:
         self._reminder_scheduler = ReminderScheduler(self._notification_manager, self._reminders)
         self._scheduler = Scheduler(self._notification_manager, _build_scheduled_jobs())
         self._researcher = BackgroundResearcher(
-            templates_dir / "worldview.json", self._web_search_tool, self._rag, self._llm_router, self._facts
+            templates_dir / "worldview.json",
+            self._web_search_tool,
+            self._rag,
+            self._llm_router,
+            self._facts,
+            # Вопросы из её собственной работы идут первыми: у запроса «почему
+            # у меня падает вот это» есть адресат и сегодняшняя польза, а у
+            # случайного факта из worldview.json — нет.
+            work_topics=DevResearchTopics(self._dev_store),
         )
         # С чем именно она приходит, когда пишет первой. Без повода служба
         # молчит — раньше на его месте стояло «просто напомнить о себе», и из
@@ -303,6 +374,7 @@ class EfiApp:
             diary=self._diary,
             working_memory=self._working_memory,
             incubated_thought_provider=self._researcher.consume_incubated_thought,
+            timezone=settings.timezone,
         )
         self._silence_monitor.set_reasons(self._ping_reasons)
         self._spontaneous_ping = SpontaneousPingScheduler(
@@ -329,10 +401,36 @@ class EfiApp:
             self._organic_ping,
             check_interval_seconds=settings.life_engine.check_interval_seconds,
         )
+        # Конвейер разработки: кодер, песочница, GitHub и фоновый воркер.
+        # Собирается только при dev.enabled и настроенном кодере, поэтому
+        # может быть None — см. _build_dev_worker.
+        self._dev_worker = self._build_dev_worker()
+        # Теперь известно, есть ли кому исполнять договорённость: без
+        # конвейера обсуждать замысел можно, а браться — нет, иначе задача
+        # легла бы в очередь, которую никто не разбирает. И тот же вызов
+        # даёт столу переговоров способ разбудить воркер сразу: ждать час
+        # после «беру» — то же самое, что не взяться.
+        self._collab_desk.attach_pipeline(
+            available=self._dev_worker is not None,
+            on_task_created=self._dev_worker.request_tick if self._dev_worker is not None else None,
+        )
+        # Работа с чужим кодом идёт через тот же воркер и ту же очередь, но
+        # поднимается отдельным флагом: можно писать свои проекты и не лезть
+        # в чужие репозитории, и наоборот.
+        self._dev_desk.attach_engine(
+            available=self._dev_worker is not None and settings.dev.swe_enabled,
+            on_task_created=self._dev_worker.request_tick if self._dev_worker is not None else None,
+        )
+
         self._busy_engine = BusyEngine(
             self._working_memory,
             self._affinity,
-            self._life_engine,
+            # Занята она не только исследованием: пока пишется проект, «не
+            # сразу увидела сообщение» — правда, а не симуляция.
+            AnyBusyState(
+                lambda: self._life_engine.is_researching,
+                lambda: self._dev_worker is not None and self._dev_worker.is_coding,
+            ),
             settings.busy_engine,
             last_message_source=self._history,
         )
@@ -358,7 +456,6 @@ class EfiApp:
         self._typing_tracker = TypingTracker(ttl_seconds=settings.humanizer.debounce_typing_ttl_seconds)
         # -- участие в сообществе (комментарии/треды) ------------------------
         self._thread_state = ThreadStateStore(self._database)
-        self._community_interests = build_community_interests(self._database, templates_dir / "worldview.json")
         self._channel_post_watcher = ChannelPostWatcher(
             self._notification_manager,
             settings.telegram,
@@ -389,6 +486,9 @@ class EfiApp:
             curiosity_recorder=self._curiosity,
             organic_ping_recorder=self._organic_ping,
             people_recorder=self._people,
+            chat_recorder=self._chat_directory,
+            collab_recorder=self._collab_desk,
+            dev_dialogue_recorder=self._dev_desk,
             stt=self._stt,
             orchestrator=self._orchestrator,
         )
@@ -425,11 +525,210 @@ class EfiApp:
                     tools=self._tool_registry,
                     llm_router=self._llm_router,
                     prompt_loader=self._prompt_loader,
+                    dev_store=self._dev_store,
                     background_tasks=lambda: self._background_tasks,
                     worker_tasks=lambda: self._worker_tasks,
                 ),
                 settings.dashboard,
             )
+
+    def _build_dev_worker(self) -> DevWorker | None:
+        """
+        Собирает конвейер разработки — или честно возвращает None.
+
+        Две причины не собирать, и обе не ошибки: подсистема выключена
+        (`dev.enabled = false`, дефолт) или не настроен кодер — ключа Groq
+        нет ни явно, ни в llm_roles. Во втором случае об этом говорится в
+        логе: конфиг с `enabled = true` и без ключа — это намерение, которое
+        молча не сработало бы, а такое всегда должно быть слышно.
+
+        GitHub-токена может не быть и при рабочей подсистеме: тогда проекты
+        пишутся и коммитятся локально (см. efi/dev/github_sync.py).
+        """
+        dev_settings = self._settings.dev
+        if not dev_settings.enabled:
+            return None
+
+        coder_endpoint = self._settings.resolve_coder_endpoint()
+        if coder_endpoint is None:
+            logger.warning(
+                "app: dev.enabled = true, но кодер не настроен — нет ни dev.coder, ни ключа Groq "
+                "в llm_roles. Разработка не поднимется"
+            )
+            return None
+
+        workspace = dev_settings.workspace_dir(self._settings.paths)
+        workspace.mkdir(parents=True, exist_ok=True)
+        token = dev_settings.github_token.get_secret_value() if dev_settings.github_token else ""
+
+        coder = QwenCoderClient(coder_endpoint)
+        sandbox = CodeSandbox(enable_linter=dev_settings.lint_generated_code)
+        # Свои httpx-клиенты (кодер и ноутбук) роутер не закрывает — он о них
+        # не знает. Незакрытые они переживают остановку открытым соединением
+        # и жалобой в лог, поэтому запоминаются здесь и гасятся в stop().
+        self._dev_clients.append(coder)
+        reporter = DevReporter(
+            self._notification_manager,
+            social_memory=self._social_memory,
+            quiet_hours=self._settings.quiet_hours,
+            timezone=self._settings.timezone,
+            initiative=self._initiative,
+            progress_probability=dev_settings.progress_probability,
+        )
+        # Один сетевой роутер на всю разработку: и правки в чужом коде, и
+        # проверка своих проектов думают там, где сейчас лучше, — на ноутбуке
+        # или облачным кодером (см. efi/llm/network_router.py).
+        network = self._build_network_router(coder)
+        workspaces = WorkspaceManager(Path(dev_settings.workspaces_dir))
+        narrator = self._make_dev_narrator(reporter)
+        engine = DevEngine(
+            self._llm_router,
+            coder,
+            sandbox,
+            # Замысел придумывает фоновая роль, а не MAIN: никто не ждёт
+            # этого ответа в чате, и занимать им канал живого диалога нельзя
+            # (регламент ролей — см. efi.config.schema.TaskRole).
+            design_role=TaskRole.BACKGROUND,
+            max_fix_iterations=dev_settings.max_fix_iterations,
+            # Проверка запуском: пока её не было, проект мог месяцами
+            # «дописываться» и не выходить в свет. Теперь он либо
+            # запускается, либо выкладывается без того куска, который так и
+            # не завёлся (efi/dev/verify.py).
+            verifier=ProjectVerifier(
+                workspaces,
+                as_fixer(network),
+                max_rounds=dev_settings.max_repair_rounds,
+                narrator=narrator,
+                lookup=self._look_up_error,
+            ),
+        )
+        github = GitHubSync(
+            workspace,
+            token=token,
+            owner=dev_settings.github_owner,
+            ssh_key_path=dev_settings.github_ssh_key_path,
+            private=dev_settings.repo_private,
+            push_enabled=dev_settings.push_enabled,
+        )
+        # Возвращение к своим проектам: перечитать, поправить, изредка
+        # спросить. Отдельный объект, а не метод воркера, потому что это
+        # другая работа: там «сделать новое», здесь «пересмотреть сделанное».
+        maintainer = ProjectMaintainer(
+            self._dev_store,
+            self._llm_router,
+            coder,
+            sandbox,
+            github,
+            reporter,
+            workspace,
+            review_interval=timedelta(days=dev_settings.review_interval_days),
+            patch_threshold=dev_settings.patch_importance_threshold,
+            discuss_threshold=dev_settings.discuss_importance_threshold,
+            review_probability=dev_settings.review_probability,
+        )
+        logger.info(
+            "app: разработка включена (кодер %s, %s)",
+            coder_endpoint.model,
+            "с пушем на GitHub" if github.can_publish else "локально, без пуша",
+        )
+        return DevWorker(
+            self._dev_store,
+            engine,
+            github,
+            reporter,
+            maintainer=maintainer,
+            swe=self._build_swe_engine(network, workspaces, narrator),
+            workspaces=workspaces,
+            interests=self._community_interests,
+            # Своя затея рассказывается владельцу: чат для неё выбирается
+            # здесь, а не воркером, — это единственное место, которое знает
+            # про owner_id.
+            owner_chat_id=self._settings.telegram.owner_id,
+            check_interval_seconds=dev_settings.check_interval_seconds,
+            self_initiated_probability=dev_settings.self_initiated_probability,
+        )
+
+    def _build_swe_engine(
+        self,
+        network: NetworkModelRouter,
+        workspaces: WorkspaceManager,
+        narrator: Callable[[str], Awaitable[None]],
+    ) -> SweEngine | None:
+        """
+        Собирает движок работы с чужим кодом — или честно возвращает None,
+        если работа с репозиториями выключена (`dev.swe_enabled`).
+
+        Роутер и рабочие копии общие с проверкой собственных проектов: это
+        одна и та же работа с кодом, и разводить под неё два набора
+        одинаковых объектов незачем.
+        """
+        dev_settings = self._settings.dev
+        if not dev_settings.swe_enabled:
+            return None
+        return SweEngine(
+            network,
+            workspaces,
+            gate=ConcurrencyGate(limit=dev_settings.max_parallel_model_calls),
+            narrator=narrator,
+            lookup=self._look_up_error,
+            max_repair_rounds=dev_settings.max_repair_rounds,
+            keep_workspace=dev_settings.keep_workspaces,
+        )
+
+    def _build_network_router(self, coder: QwenCoderClient) -> NetworkModelRouter:
+        """
+        Два яруса вычислений (efi/llm/network_router.py): ноутбук в домашней
+        сети, если он настроен и отвечает, и тот же самый облачный кодер, если
+        нет. Второй ярус обязателен, первый — нет: без ноутбука всё работает
+        ровно как раньше, просто модель слабее.
+        """
+        dev_settings = self._settings.dev
+        laptop_endpoint = self._settings.resolve_laptop_endpoint()
+        laptop = (
+            LaptopLink(
+                laptop_endpoint,
+                health_timeout_seconds=dev_settings.laptop.health_timeout_seconds,
+            )
+            if laptop_endpoint is not None
+            else None
+        )
+        if laptop is not None:
+            logger.info(
+                "app: ноутбук для тяжёлых задач — %s (%s)", laptop.base_url, laptop.model
+            )
+        else:
+            logger.info("app: ноутбук не настроен (OMNIROUTE_URL), тяжёлые задачи идут через кодер")
+
+        router = NetworkModelRouter(laptop, coder.chat, fallback_name=f"кодер {coder.model}")
+        self._dev_clients.append(router)
+        return router
+
+    async def _look_up_error(self, query: str) -> str:
+        """
+        Ищет в вебе ответ на ошибку, которая пережила первую правку.
+
+        Именно здесь поиск наконец приносит пользу: у запроса есть адресат
+        (падающий код), и найденное применяется в ту же минуту, а не оседает
+        фактом в дневнике.
+        """
+        outcome = await self._web_search_tool.search(query)
+        return "" if outcome.failed else outcome.digest()
+
+    def _make_dev_narrator(self, reporter: DevReporter) -> Callable[[str], Awaitable[None]]:
+        """
+        Короткая реплика в чат по ходу починки («линтер задушил на типах»).
+
+        Адресат — владелец: правка чаще всего затеяна в личке, а рассказывать
+        о ходе работы в чужой чат, где о ней не просили, — спам. Повод
+        формулирует конвейер, словами его делает Worker с личностью.
+        """
+        owner_id = self._settings.telegram.owner_id
+
+        async def narrate(note: str) -> None:
+            task = DevTask(id=0, chat_id=owner_id, idea="работа с кодом", is_collab=True)
+            await reporter.report_progress(task, note)
+
+        return narrate
 
     def _build_tools(self) -> list[Tool]:
         return [
@@ -460,6 +759,13 @@ class EfiApp:
             JoinChatTool(self._telegram_client, enabled=self._settings.telegram.can_join_chats),
             LeaveChatTool(self._telegram_client, enabled=self._settings.telegram.can_leave_chats),
             SearchChatsTool(self._telegram_client),
+            # Инструмент запуска показывается модели, только когда работу
+            # реально кому делать: «взяла в работу» без конвейера — обещание,
+            # которое некому выполнить. Статус проектов доступен всегда: он
+            # честно отвечает «ничего не пишу».
+            *([StartDevProjectTool(self._collab_desk)] if self._dev_worker is not None else []),
+            *([WorkOnRepoTool(self._dev_desk)] if self._dev_desk.available else []),
+            DevProjectStatusTool(self._dev_store),
             self._web_search_tool,
             self._weather_tool,
             GetBatteryStatusTool(),
@@ -474,10 +780,19 @@ class EfiApp:
 
     async def _active_chat_candidates(self) -> list[int]:
         """
-        Список чатов-кандидатов для спонтанного пинга: allowed_chats из
-        конфига, пересечённые с чатами, где реально было хоть одно
+        Список чатов-кандидатов для спонтанного пинга: личные переписки из
+        allowed_chats, пересечённые с чатами, где реально было хоть одно
         сообщение (efi.db.history_repository.SqliteHistoryRepository.
         get_active_chat_ids).
+
+        Группы и каналы отсекаются, даже если владелец перечислил их в
+        allowed_chats: этот список отвечает на вопрос «где Эфи вправе
+        говорить», а не «кому уместно написать первой». Написать первой
+        можно человеку; в общем чате то же самое сообщение — объявление на
+        весь чат, и выглядело оно ровно так: спонтанный пинг ушёл в группу,
+        где у Эфи админка, обычным «как дела» (см. efi/telegram/chat_scope.py
+        и дублирующую проверку в efi.notifications.worker.Worker —
+        кандидатов эта служба отбирает не одна).
 
         Раньше отдавался «сырой» allowed_chats целиком. chat_id, который
         туда попал (например, руками в behavior.toml), но с которым этот
@@ -488,9 +803,21 @@ class EfiApp:
         попытке пинга, без единого шанса на успех. Пересечение с историей —
         дешёвая гарантия, что peer уже засветился хотя бы раз и кэш есть.
         """
-        allowed = set(self._settings.telegram.allowed_chats)
+        # Личка владельца — кандидат всегда, как и в гейте воркера
+        # (ConversationLifecycle._proactive_chats): в Telegram её chat_id
+        # равен owner_id, и требовать от владельца вписать самого себя в
+        # allowed_chats ради того, чтобы Эфи ему писала, незачем.
+        allowed = {self._settings.telegram.owner_id, *self._settings.telegram.allowed_chats}
         active = await self._history.get_active_chat_ids(since=_EPOCH)
-        return [chat_id for chat_id in active if chat_id in allowed]
+        candidates: list[int] = []
+        for chat_id in active:
+            if chat_id not in allowed:
+                continue
+            if not (await self._chat_directory.kind_of(chat_id)).is_one_on_one:
+                logger.debug("app: chat_id=%s пропущен для спонтанного пинга — это не личка", chat_id)
+                continue
+            candidates.append(chat_id)
+        return candidates
 
     async def start(self) -> None:
         """Поднимает все подсистемы: Telegram-клиент, обработчики, воркеры, проактивные сервисы."""
@@ -512,6 +839,16 @@ class EfiApp:
         # должен при запуске, а не когда ему пришлют картинку.
         for note in self._settings.llm_roles.describe_fallbacks():
             logger.warning("app: %s", note)
+
+        # Остатки скачанных фото и голосовых от прошлого запуска. По ходу
+        # дела они удаляются сразу после распознавания, но обычный путь —
+        # не единственный: Android убивает Termux в произвольный момент, и
+        # файл, скачанный за секунду до этого, не удалит уже никто.
+        stale_media = sweep_stale_files(
+            self._settings.paths.cache_dir, older_than=_MEDIA_CACHE_TTL
+        )
+        if stale_media:
+            logger.info("app: убрала %d недоудалённых медиафайлов от прошлого запуска", stale_media)
 
         self._telegram_handlers.register(self._pyrogram_client)
         self._channel_post_watcher.register(self._pyrogram_client)
@@ -536,6 +873,10 @@ class EfiApp:
                 working_memory=self._working_memory,
                 clarifications=self._pending_clarifications,
                 initiative=self._initiative,
+                chat_directory=self._chat_directory,
+                # Кто ловит её обещания, данные словами вместо вызова
+                # инструмента: «набросаю за ночь», «сейчас гляну».
+                commitment_recorders=(self._collab_desk, self._dev_desk),
             )
             self._worker_tasks.append(asyncio.create_task(worker.run(), name=f"worker-{worker_index}"))
 
@@ -552,6 +893,12 @@ class EfiApp:
                 self._spawn_supervised(lambda: self._reminder_scheduler.run(), name="reminders"),
             ]
         )
+
+        if self._dev_worker is not None:
+            dev_worker = self._dev_worker
+            self._background_tasks.append(
+                self._spawn_supervised(lambda: dev_worker.run(), name="dev_worker")
+            )
 
         if self._settings.memory_pulse.enabled:
             self._background_tasks.append(self._spawn_supervised(lambda: self._memory_pulse.run(), name="memory_pulse"))
@@ -639,37 +986,82 @@ class EfiApp:
         try:
             while True:
                 await asyncio.sleep(seconds_until_next(_CONSOLIDATION_TRIGGER_AT))
-
-                # Новеллизация — ПЕРВОЙ: она создаёт новые записи из дня, а
-                # dedup ниже заодно подчистит и их, если что-то похожее уже
-                # было записано вручную через remember_diary_entry за день.
-                # Под общим локом с пульсом: оба пути двигают одну и ту же
-                # отметку last_novelized_at, и без взаимного исключения могли
-                # бы прочитать её одновременно и разобрать одно окно дважды.
-                async with self._memory_pulse.novelization_lock:
-                    novelized = await self._consolidator.novelize_recent_history(
-                        history=self._history,
-                        facts=self._facts,
-                        lookback=timedelta(days=self._settings.memory.novelization_lookback_days),
-                        min_messages=self._settings.memory.novelization_min_messages,
-                        experience=self._social_memory,
-                    )
-                logger.info("app: nightly novelization saved %d new diary entries", novelized)
-
-                removed = await self._consolidator.deduplicate(
-                    plagiarism_threshold=self._settings.memory.plagiarism_threshold
-                )
-                logger.info("app: nightly dedup removed %d duplicate diary entries", removed)
-
-                merged = await self._consolidator.summarize_stale_entries()
-                if merged is not None:
-                    logger.info("app: nightly consolidation created memoir entry %s", merged.id)
-
-                pruned_messages = await self._history.prune_old_messages()
-                logger.info("app: nightly cleanup pruned %d old history messages", pruned_messages)
+                await self._run_nightly_maintenance()
         except asyncio.CancelledError:
             logger.info("app: diary consolidation loop stopped")
             raise
+
+    async def _run_nightly_maintenance(self) -> None:
+        """
+        Одна ночь обслуживания: новеллизация, dedup, мемуары, чистка таблиц.
+
+        Каждый этап обёрнут отдельно и намеренно. Раньше их связывал один
+        общий try, и первый же сбой уносил всю ночь целиком — а первым идёт
+        новеллизация, то есть единственный этап, который ходит в LLM. Таймаут
+        на бесплатном тире — обычное дело (ровно он и рвал дневники), и из-за
+        него не проходили ни dedup, ни чистка таблиц, которым модель вообще
+        не нужна: одна недоступная сеть оставляла базу неубранной на сутки.
+
+        Порядок сохранён: новеллизация ПЕРВОЙ, потому что она создаёт записи
+        из прожитого дня, а dedup следом подчистит в том числе и их.
+        """
+        # Под общим локом с пульсом: оба пути двигают одну и ту же отметку
+        # last_novelized_at, и без взаимного исключения могли бы прочитать её
+        # одновременно и разобрать одно окно дважды.
+        async with self._memory_pulse.novelization_lock:
+            await self._nightly_step(
+                "novelization",
+                self._consolidator.novelize_recent_history(
+                    history=self._history,
+                    facts=self._facts,
+                    lookback=timedelta(days=self._settings.memory.novelization_lookback_days),
+                    min_messages=self._settings.memory.novelization_min_messages,
+                    experience=self._social_memory,
+                ),
+                "saved %s new diary entries",
+            )
+
+        await self._nightly_step(
+            "dedup",
+            self._consolidator.deduplicate(
+                plagiarism_threshold=self._settings.memory.plagiarism_threshold
+            ),
+            "removed %s duplicate diary entries",
+        )
+        await self._nightly_step(
+            "memoir",
+            self._consolidator.summarize_stale_entries(),
+            "created memoir entry %s",
+        )
+        await self._nightly_step(
+            "history cleanup",
+            self._history.prune_old_messages(),
+            "pruned %s old history messages",
+        )
+        # Журнал внешних пересечений рос вместе с каждым комментарием и
+        # прочитанным тредом и не убывал никогда. В промпт он не раздувается
+        # (все запросы к нему с LIMIT), но файл базы лежит на телефоне.
+        await self._nightly_step(
+            "social cleanup",
+            self._social_memory.prune_old(),
+            "pruned %s old social interactions",
+        )
+
+    async def _nightly_step(self, name: str, work: Awaitable[Any], outcome: str) -> None:
+        """
+        Один этап ночного обслуживания. Сбой одного не отменяет остальные.
+
+        Отмена (остановка приложения) проходит насквозь: её здесь глушить
+        нельзя, иначе выключение будет ждать всю ночную работу до конца.
+        """
+        try:
+            result = await work
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("app: nightly %s не прошло, продолжаю остальное", name, exc_info=True)
+            return
+        logger.info("app: nightly %s — %s", name, outcome % (result,))
 
     async def wait_until_stopped(self) -> None:
         """Блокируется, пока не будет вызван request_stop() (обычно — из обработчика сигнала ОС в scripts/run.py)."""
@@ -736,6 +1128,11 @@ class EfiApp:
 
         await self._telegram_client.stop()
         await self._llm_router.aclose()
+        for client in self._dev_clients:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.warning("app: не удалось закрыть клиент разработки", exc_info=True)
         await self._web_search_tool.aclose()
         await self._weather_tool.aclose()
         if self._stt is not None:

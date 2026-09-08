@@ -183,11 +183,17 @@ async def test_a_remembered_fact_becomes_a_question(tmp_path: Path) -> None:
         )
     )
 
-    reason = await PingReasonBuilder(knowledge=knowledge, people=people).reason_for(_CHAT_ID)
+    # Повод теперь разыгрывается по весам среди всех найденных, поэтому
+    # проверяется не «выпал именно этот», а «этот вообще участвует»: строгая
+    # лестница давала предсказуемое однообразие, ради которого всё и меняли.
+    builder = PingReasonBuilder(knowledge=knowledge, people=people)
+    reasons = [await builder.reason_for(_CHAT_ID) for _ in range(40)]
 
-    assert reason is not None
-    assert "монтажёр на телевидении" in reason
-    assert "Спроси про это" in reason
+    assert all(reason is not None for reason in reasons)
+    assert any("монтажёр на телевидении" in (reason or "") for reason in reasons)
+    assert any("как он там" in (reason or "") for reason in reasons), "и обычное «как ты» тоже"
+    fact_reason = next(reason for reason in reasons if "монтажёр на телевидении" in (reason or ""))
+    assert "Спроси про это" in (fact_reason or "")
 
 
 async def test_facts_about_people_from_other_chats_are_not_a_reason(tmp_path: Path) -> None:
@@ -291,7 +297,12 @@ async def test_the_silence_ping_never_asks_whether_he_is_alive() -> None:
 # -- одна реплика вместо «эй» + вопрос ---------------------------------------------
 
 
-def test_a_proactive_message_is_collapsed_into_one_bubble() -> None:
+def test_a_proactive_message_stays_short_but_stays_alive() -> None:
+    """
+    Не «ровно одна реплика»: склейка бабблов давала одно длинное складное
+    предложение, которым в мессенджере не пишет никто. Правило — мало и
+    коротко, а не одной фразой.
+    """
     from efi.notifications.schemas import Notification, NotificationType
     from efi.tools.base import ToolContext
     from efi.tools.telegram_actions.send_message import _collapse_bubbles_if_proactive
@@ -300,7 +311,24 @@ def test_a_proactive_message_is_collapsed_into_one_bubble() -> None:
         notification=Notification(type=NotificationType.SILENCE_PING, chat_id=_CHAT_ID, message="повод")
     )
 
-    assert _collapse_bubbles_if_proactive("эй /// ты там живой?", context) == "эй ты там живой?"
+    assert _collapse_bubbles_if_proactive("привет /// как ты там", context) == "привет /// как ты там"
+
+
+def test_a_proactive_flood_is_cut_down() -> None:
+    """Человек, которому ещё не ответили, не присылает пять реплик подряд."""
+    from efi.notifications.schemas import Notification, NotificationType
+    from efi.tools.base import ToolContext
+    from efi.tools.telegram_actions.send_message import _collapse_bubbles_if_proactive
+
+    context = ToolContext(
+        notification=Notification(type=NotificationType.SPONTANEOUS_PING, chat_id=_CHAT_ID, message="повод")
+    )
+    text = " /// ".join(["привет", "как ты", "я тут думала про одну штуку", "и вообще", "ну ладно"])
+
+    result = _collapse_bubbles_if_proactive(text, context)
+
+    assert result.count("///") <= 2
+    assert len(result) <= 240
 
 
 def test_a_normal_reply_keeps_its_bubbles() -> None:
@@ -409,3 +437,149 @@ async def test_a_promise_from_another_chat_is_not_a_reason(tmp_path: Path) -> No
     await memory.add_item("это обещание из другого чата", chat_id=-999)
 
     assert await PingReasonBuilder(working_memory=memory).reason_for(_CHAT_ID) is None
+
+
+# -- бытовые поводы: то, с чем люди пишут в восьмидесяти процентах случаев -------
+
+
+async def _people_who_talked_here(tmp_path: Path, *, chat_id: int = _CHAT_ID) -> object:
+    """Чат, в котором разговор уже был: без этого бытовые поводы не включаются."""
+    from efi.memory.people import PeopleStore
+
+    database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
+    people = PeopleStore(database)
+    await people.record_message(555, "привет", display_name="Рома", chat_id=chat_id)
+    return people
+
+
+async def test_an_empty_chat_gets_no_small_talk(tmp_path: Path) -> None:
+    """
+    «Как дела» в чат, где никто ни разу не писал, — это не болтовня, а
+    сообщение от незнакомого номера. Там по-прежнему действует правило
+    «нет содержательного повода — нет сообщения».
+    """
+    from efi.memory.people import PeopleStore
+
+    database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
+    people = PeopleStore(database)
+    await people.record_message(555, "привет", display_name="Рома", chat_id=-777)
+
+    assert await PingReasonBuilder(people=people).reason_for(_CHAT_ID) is None
+
+
+async def test_a_chat_where_they_talked_is_reason_enough(tmp_path: Path) -> None:
+    """
+    И это главное изменение: раньше без факта и без дневника Эфи молчала,
+    хотя живому человеку, чтобы написать «чем занят», не нужно вообще ничего.
+    """
+    people = await _people_who_talked_here(tmp_path)
+
+    reason = await PingReasonBuilder(people=people).reason_for(_CHAT_ID)  # type: ignore[arg-type]
+
+    assert reason is not None
+
+
+async def test_the_everyday_reasons_do_not_repeat_themselves(tmp_path: Path) -> None:
+    """
+    Ради этого весь модуль и переписывался: строгая лестница поводов давала
+    одно и то же сообщение раз за разом. Проверяется не конкретный повод, а
+    то, что их несколько.
+    """
+    people = await _people_who_talked_here(tmp_path)
+    builder = PingReasonBuilder(people=people)  # type: ignore[arg-type]
+
+    drawn = {await builder.reason_for(_CHAT_ID) for _ in range(60)}
+
+    assert len(drawn) > 1, "повод всегда один и тот же — это и была исходная беда"
+    assert all(reason is not None for reason in drawn)
+
+
+async def test_her_own_state_is_a_reason_to_write(tmp_path: Path) -> None:
+    """«Я сегодня никакая» — нормальный повод написать первой, а не жалоба."""
+    from efi.memory.working_memory import WorkingMemory
+
+    memory = WorkingMemory(tmp_path / "wm.json")
+    snapshot = await memory.load()
+    snapshot.emotional_state = "вымотанная и довольная"
+    await memory.save(snapshot)
+
+    builder = PingReasonBuilder(working_memory=memory)
+    reasons = [await builder.reason_for(_CHAT_ID) for _ in range(20)]
+
+    assert any("вымотанная и довольная" in (reason or "") for reason in reasons)
+
+
+async def test_a_long_silence_is_noticed(tmp_path: Path) -> None:
+    """«Мы сто лет не разговаривали» замечает человек, а не календарь."""
+    people = await _people_who_talked_here(tmp_path)
+    builder = PingReasonBuilder(people=people)  # type: ignore[arg-type]
+
+    later = datetime.now(UTC) + timedelta(days=5)
+    reasons = [await builder.reason_for(_CHAT_ID, now=later) for _ in range(40)]
+
+    assert any("не разговаривали" in (reason or "") for reason in reasons)
+
+
+async def test_a_fresh_chat_is_not_accused_of_silence(tmp_path: Path) -> None:
+    """Написать «ты пропал» человеку, с которым говорили час назад, — уже претензия."""
+    people = await _people_who_talked_here(tmp_path)
+    builder = PingReasonBuilder(people=people)  # type: ignore[arg-type]
+
+    reasons = [await builder.reason_for(_CHAT_ID) for _ in range(40)]
+
+    assert not any("не разговаривали" in (reason or "") for reason in reasons)
+
+
+def test_the_time_of_day_only_speaks_in_its_own_hours() -> None:
+    """«Доброе утро» в час дня — это не повод, а неловкость."""
+    from zoneinfo import ZoneInfo
+
+    from efi.behavior.ping_reason import _render_time_reason
+
+    local = ZoneInfo("Europe/Moscow")
+    morning = datetime(2026, 8, 26, 8, 0, tzinfo=local)
+    midday = datetime(2026, 8, 26, 13, 0, tzinfo=local)
+    night = datetime(2026, 8, 26, 2, 0, tzinfo=local)
+
+    assert "утренн" in _render_time_reason(morning)
+    assert _render_time_reason(midday) == ""
+    assert "ночн" in _render_time_reason(night)
+
+
+async def test_good_morning_is_counted_in_her_timezone_not_the_servers(tmp_path: Path) -> None:
+    """
+    Под proot и в cron переменная TZ пуста, процесс живёт по UTC — и Эфи
+    желает доброго утра в час ночи. Час считается по её поясу из настроек,
+    ровно как тихие часы и блок [Время] (см. efi/utils/clock.py).
+    """
+    people = await _people_who_talked_here(tmp_path)
+    builder = PingReasonBuilder(people=people, timezone="Asia/Vladivostok")  # type: ignore[arg-type]
+
+    # 22:00 UTC — это уже восемь утра во Владивостоке.
+    morning_there = datetime(2026, 8, 26, 22, 0, tzinfo=UTC)
+    reasons = [await builder.reason_for(_CHAT_ID, now=morning_there) for _ in range(40)]
+
+    assert any("утренн" in (reason or "") for reason in reasons)
+
+
+def test_every_everyday_reason_asks_for_a_short_message() -> None:
+    """
+    Живой человек не пишет «как дела» одним складным предложением с
+    придаточными. Поэтому краткость требуется в самом поводе, а не только в
+    общих правилах промпта: повод модель читает последним и слушает лучше.
+    """
+    from efi.behavior.ping_reason import (
+        _render_check_in_reason,
+        _render_mood_reason,
+        _render_silence_reason,
+        _render_trifle_reason,
+    )
+
+    rendered = [
+        _render_check_in_reason(),
+        _render_trifle_reason(),
+        _render_mood_reason("сонная"),
+        _render_silence_reason(timedelta(days=4)),
+    ]
+
+    assert all("коротк" in reason.lower() for reason in rendered)

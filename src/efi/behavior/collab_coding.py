@@ -1,0 +1,342 @@
+"""
+efi/behavior/collab_coding.py
+
+Совместное проектирование: от «давай напишем X» до задачи в конвейере.
+
+Модуль существует ради одного правила: НЕ СОГЛАШАТЬСЯ СРАЗУ. Согласиться на
+предложение в ту же реплику — самое естественное поведение для языковой
+модели («Отличная идея! Уже приступаю!») и самое бесполезное для дела: до
+кода никто не обсудил ни стек, ни структуру, ни то, зачем эта штука нужна.
+Живой человек, которому предложили вместе что-то писать, сперва задаёт
+вопросы — и половина затей на этом честно заканчивается, что тоже результат.
+
+Поэтому запрет здесь механический, а не воспитательный. Инструмент запуска
+задачи (efi.tools.dev_tools.start_project.StartDevProjectTool) физически
+недоступен модели, пока предложение не обсудили: `may_start()` требует, чтобы
+после исходной реплики прошёл хотя бы один обмен. Промпт-блок при этом прямо
+говорит, О ЧЁМ спорить (стек, структура, подводные камни) — одного запрета
+без указания темы мало, модель начнёт спорить о смысле жизни.
+
+Состояние — в памяти процесса, не в БД, и это осознанно: «мы сейчас обсуждаем
+проект» живёт внутри одного разговора. Если процесс перезапустился, человек
+повторит идею одной строчкой — а вот воскресшее через сутки «так что там с
+нашим проектом?» было бы не памятью, а неловкостью. Сама задача, в отличие
+от обсуждения, персистентна с первой секунды (efi/dev/store.py).
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+
+from efi.dev.schemas import DevTask
+from efi.dev.store import DevTaskStore
+from efi.utils.bounded import BoundedDict
+
+logger = logging.getLogger(__name__)
+
+#: Сколько чатов помним одновременно и как долго живёт необсуждённое
+#: предложение. Час: разговор, вернувшийся к идее позже, начнётся заново — и
+#: это правильно, за час контекст успевает смениться.
+_MAX_TRACKED_CHATS = 64
+_PROPOSAL_TTL_SECONDS = 3600.0
+
+#: Сколько обменов репликами должно пройти ПОСЛЕ предложения, прежде чем
+#: можно браться за работу. Один: этого хватает, чтобы Эфи задала свои
+#: вопросы, а человек ответил, — и не превращает договорённость в допрос.
+REQUIRED_DISCUSSION_TURNS = 1
+
+#: После скольких обменов обсуждение считается затянувшимся. Три: за три
+#: реплики человек успевает сказать всё существенное, а дальше начинается
+#: анкета вместо работы.
+ENOUGH_DISCUSSION_TURNS = 3
+
+#: «Давай напишем» и родня. Само по себе ничего не значит («давай сделаем
+#: паузу»), поэтому требуется ещё и техническое существительное рядом.
+_PROPOSAL_MARKERS = (
+    "давай напишем", "давай сделаем", "давай запилим", "давай замутим", "давай соберём",
+    "давай сделаю", "давай наваяем", "может напишем", "может сделаем", "может запилим",
+    "а давай напишем", "не хочешь написать", "хочешь напишем", "напиши мне",
+    "давай накидаем", "давай попробуем написать", "let's write", "let's build",
+)
+
+#: О чём именно предлагают. Без этого списка предложением считалось бы любое
+#: «давай сделаем перерыв».
+_ARTIFACT_MARKERS = (
+    "бот", "скрипт", "парсер", "утилит", "тулз", "тулу", "тул ", "инструмент", "библиотек",
+    "cli", "tui", "клиент", "приложени", "прогу", "программу", "сервис", "демон", "конвертер",
+    "трекер", "мониторинг", "автоматиз", "плагин", "расширени", "api", "проект",
+)
+
+_MARKER_RE = re.compile("|".join(re.escape(marker) for marker in _PROPOSAL_MARKERS))
+_ARTIFACT_RE = re.compile("|".join(re.escape(marker) for marker in _ARTIFACT_MARKERS))
+
+#: Сколько символов реплики сохраняем как формулировку идеи.
+_MAX_IDEA_LENGTH = 400
+
+
+@dataclass(slots=True)
+class Proposal:
+    """Предложение, которое сейчас обсуждается в конкретном чате."""
+
+    chat_id: int
+    idea: str
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    #: Сколько реплик человек написал в этот чат ПОСЛЕ предложения. Именно
+    #: обмены, а не время: договорённость измеряется разговором.
+    turns_since: int = 0
+    #: Уточнения, добавленные по ходу обсуждения (стек, ограничения) — они
+    #: уезжают в задачу вместе с идеей.
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def is_discussed(self) -> bool:
+        return self.turns_since >= REQUIRED_DISCUSSION_TURNS
+
+    @property
+    def is_overdiscussed(self) -> bool:
+        """
+        Обсуждение затянулось: пора брать и делать.
+
+        Уточняющие вопросы — правильное начало и худшее продолжение. После
+        нескольких обменов человек уже сказал всё, что собирался, а следующая
+        порция вопросов («на каких сайтах ищем? какие форматы? а список
+        целевых сайтов есть?») — это не выяснение, а способ не начинать.
+        Нормальный разработчик в этот момент берёт разумные допущения и
+        садится за первую версию.
+        """
+        return self.turns_since >= ENOUGH_DISCUSSION_TURNS
+
+    def render_idea(self) -> str:
+        """Идея с учётом всего, до чего договорились — то, что уйдёт в спеку."""
+        if not self.notes:
+            return self.idea
+        return f"{self.idea}. Договорились: {'; '.join(self.notes)}"
+
+
+class CollabCodingDesk:
+    """
+    Стол переговоров: помнит, что в этом чате обсуждают проект, и решает,
+    можно ли уже браться за работу.
+
+    Ничего не отправляет и ничего не генерирует — только состояние и
+    решение. Говорит об этом промпт (efi/prompts/builder.py), запускает
+    работу инструмент (efi/tools/dev_tools/), делает работу конвейер
+    (efi/dev/).
+    """
+
+    def __init__(
+        self,
+        store: DevTaskStore,
+        *,
+        pipeline_available: bool = True,
+        on_task_created: Callable[[], None] | None = None,
+    ) -> None:
+        self._store = store
+        #: Поднят ли конвейер разработки (dev.enabled и настроенный кодер).
+        #: Обсуждать замысел можно и без него — это разговор, а не работа, —
+        #: но БРАТЬСЯ нельзя: задача легла бы в очередь, которую никто не
+        #: разбирает, а Эфи сказала бы «взялась». Обещание, которое некому
+        #: выполнить, хуже честного «не могу»: человек ждёт результата.
+        self._pipeline_available = pipeline_available
+        #: Чем разбудить фоновый цикл, когда задача появилась. Без него между
+        #: «договорились» и первым запросом к кодеру проходит до часа, и по
+        #: чату невозможно понять, взялась она или поддакнула.
+        self._on_task_created = on_task_created
+        self._proposals: BoundedDict[int, Proposal] = BoundedDict(
+            max_entries=_MAX_TRACKED_CHATS, ttl=_PROPOSAL_TTL_SECONDS
+        )
+
+    @property
+    def pipeline_available(self) -> bool:
+        return self._pipeline_available
+
+    def attach_pipeline(self, *, available: bool, on_task_created: Callable[[], None] | None = None) -> None:
+        """
+        Поздняя привязка конвейера — как `SilenceMonitor.set_reasons`, и по
+        той же причине: стол переговоров нужен промпту и инструментам раньше,
+        чем в сборке появляется фоновый воркер (efi/app.py), а тащить
+        половину сборки вверх ради одного флага значило бы перетасовать
+        порядок конструирования всего приложения.
+        """
+        self._pipeline_available = available
+        self._on_task_created = on_task_created
+
+    async def consider_message(self, chat_id: int | None, text: str) -> None:
+        """
+        Вызывается на КАЖДУЮ входящую реплику (efi.telegram.handlers).
+
+        Две работы разом: заметить новое предложение и досчитать обмены по
+        уже идущему обсуждению. Второе не менее важно первого — именно
+        счётчик обменов и отличает «договорились» от «поддакнула».
+        """
+        if chat_id is None:
+            return
+
+        existing = self._proposals.get(chat_id)
+        if existing is not None:
+            existing.turns_since += 1
+            note = _extract_note(text)
+            if note and note not in existing.notes:
+                existing.notes.append(note)
+            return
+
+        idea = detect_proposal(text)
+        if idea is None:
+            return
+        if await self._store.has_open_task_for(chat_id):
+            # В этом чате уже что-то пишется. Взять вторую задачу параллельно
+            # — верный способ не доделать обе.
+            logger.info("collab: в chat_id=%s уже есть начатый проект, новое предложение не беру", chat_id)
+            return
+
+        self._proposals[chat_id] = Proposal(chat_id=chat_id, idea=idea)
+        logger.info("collab: в chat_id=%s предложили проект: %s", chat_id, idea[:80])
+
+    def pending(self, chat_id: int | None) -> Proposal | None:
+        """Обсуждаемое сейчас предложение этого чата, если оно есть."""
+        return self._proposals.get(chat_id) if chat_id is not None else None
+
+    def may_start(self, chat_id: int | None) -> bool:
+        """
+        Можно ли уже браться за работу. Ровно это и запрещает соглашаться
+        слепо: пока обсуждение не состоялось, ответ — нет.
+        """
+        if not self._pipeline_available:
+            return False
+        proposal = self.pending(chat_id)
+        return proposal is not None and proposal.is_discussed
+
+    async def start(self, chat_id: int, *, idea: str = "") -> DevTask | None:
+        """
+        Переводит договорённость в задачу конвейера и закрывает обсуждение.
+
+        `idea` — как её сформулировала сама Эфи по итогам разговора (это
+        точнее исходной реплики человека: там уже учтён стек и всё, о чём
+        договорились). Пусто — берём накопленное обсуждением.
+        """
+        if not self.may_start(chat_id):
+            return None
+        proposal = self.pending(chat_id)
+        if proposal is None:  # pragma: no cover — may_start уже это проверил
+            return None
+
+        final_idea = idea.strip() or proposal.render_idea()
+        task = await self._store.create(final_idea, chat_id=chat_id, is_collab=True)
+        self._proposals.pop(chat_id, None)
+        logger.info("collab: задача #%s из обсуждения в chat_id=%s", task.id, chat_id)
+        if self._on_task_created is not None:
+            self._on_task_created()
+        return task
+
+    async def consider_reply(self, chat_id: int | None, text: str) -> DevTask | None:
+        """
+        Её собственная реплика: пообещала — значит, работа началась.
+
+        Это лечит самый неприятный исход обсуждения: они договорились, Эфи
+        написала «набросаю за ночь» — и не вызвала инструмент. Снаружи это
+        неотличимо от согласия: человек ложится спать, ожидая проект, а
+        задачи не существует. Слово, сказанное вслух, должно становиться
+        задачей — иначе оно ничем не отличается от поддакивания.
+
+        Обещание засчитывается и за обсуждение: если она уже говорит «берусь»,
+        значит, для неё разговор состоялся, и требовать ещё один обмен
+        репликами поздно.
+        """
+        if not self._pipeline_available or chat_id is None:
+            return None
+        proposal = self.pending(chat_id)
+        if proposal is None or not promises_work(text):
+            return None
+
+        proposal.turns_since = max(proposal.turns_since, REQUIRED_DISCUSSION_TURNS)
+        task = await self.start(chat_id)
+        if task is not None:
+            logger.info(
+                "collab: обещание в chat_id=%s превращено в задачу #%s без вызова инструмента",
+                chat_id, task.id,
+            )
+        return task
+
+    def drop(self, chat_id: int) -> None:
+        """Забыть предложение — например, когда человек передумал."""
+        self._proposals.pop(chat_id, None)
+
+
+def detect_proposal(text: str) -> str | None:
+    """
+    Похоже ли на предложение вместе что-то написать. Чистая функция: цена
+    ложного срабатывания — блок в промпте про несуществующий проект, поэтому
+    условие двойное (маркер предложения И технический предмет).
+    """
+    normalized = (text or "").strip()
+    if not normalized:
+        return None
+    lowered = normalized.lower()
+    if not _MARKER_RE.search(lowered) or not _ARTIFACT_RE.search(lowered):
+        return None
+    return normalized[:_MAX_IDEA_LENGTH]
+
+
+#: Слова, которыми берутся за работу. Проверяются только в её СОБСТВЕННОЙ
+#: реплике и только когда в этом чате обсуждается проект, — поэтому список
+#: может быть широким: «сделаю» в разговоре про кофе сюда не попадёт.
+_PROMISE_MARKERS = (
+    "набросаю", "накидаю", "напишу", "сделаю", "запилю", "соберу", "берусь", "возьмусь",
+    "займусь", "приступаю", "начинаю", "сяду", "сделаю к утру", "будет к утру", "за ночь",
+    "сегодня ночью", "к утру", "погнали", "поехали", "давай сделаю", "уже делаю",
+    # Формы, которыми она обещает на самом деле — из живой переписки:
+    # «сейчас заседу за основной модуль», «щас попытаюсь собрать хоть какой-то
+    # скелет», «сейчас накидаю». Без них обещание оставалось словами.
+    "заседу", "засяду", "сажусь", "попытаюсь", "попробую собрать", "попробую написать",
+    "попробую накидать", "скелет", "первую версию", "черновик", "сейчас сделаю", "щас сделаю",
+    "иду писать", "пошла писать", "пилю",
+)
+_PROMISE_RE = re.compile("|".join(re.escape(marker) for marker in _PROMISE_MARKERS))
+
+#: Отказ выглядит похоже («не буду делать», «не возьмусь») — и обещанием не
+#: является. Проверяется отдельно, потому что отрицание может стоять далеко
+#: от глагола.
+_REFUSAL_MARKERS = ("не буду", "не возьмусь", "не стану", "не хочу", "не вижу смысла", "не сейчас")
+_REFUSAL_RE = re.compile("|".join(re.escape(marker) for marker in _REFUSAL_MARKERS))
+
+
+def promises_work(text: str) -> bool:
+    """
+    Похоже ли на «беру и делаю» в её собственной реплике. Чистая функция —
+    проверяется без чатов и без БД.
+    """
+    lowered = (text or "").strip().lower()
+    if not lowered or _REFUSAL_RE.search(lowered):
+        return False
+    return bool(_PROMISE_RE.search(lowered))
+
+
+#: Уточнения по ходу обсуждения: на чём писать и чего не делать. Ищем ровно
+#: те реплики, где человек называет технологию или ставит ограничение, —
+#: остальное это разговор, а не спецификация.
+_NOTE_MARKERS = (
+    "на python", "на питоне", "через", "без ", "используй", "лучше ", "не надо", "не нужно",
+    "должен уметь", "должна уметь", "чтобы он", "чтобы она", "главное",
+)
+_NOTE_RE = re.compile("|".join(re.escape(marker) for marker in _NOTE_MARKERS))
+_MAX_NOTE_LENGTH = 200
+
+
+def _extract_note(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized or not _NOTE_RE.search(normalized.lower()):
+        return ""
+    return normalized[:_MAX_NOTE_LENGTH]
+
+
+__all__ = [
+    "REQUIRED_DISCUSSION_TURNS",
+    "CollabCodingDesk",
+    "Proposal",
+    "detect_proposal",
+    "promises_work",
+]

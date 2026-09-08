@@ -28,6 +28,7 @@ import aiofiles.os
 from pydantic import BaseModel, Field, ValidationError
 
 from efi.behavior import energy as energy_model
+from efi.utils.atomic import write_text_atomic
 from efi.utils.clock import local_now
 
 logger = logging.getLogger(__name__)
@@ -208,9 +209,10 @@ class WorkingMemory:
             snapshot = self._cache if self._cache is not None else await self.load()
         async with self._lock:
             snapshot.updated_at = datetime.now(UTC)
-            await aiofiles.os.makedirs(self._path.parent, exist_ok=True)
-            async with aiofiles.open(self._path, mode="w", encoding="utf-8") as f:
-                await f.write(snapshot.model_dump_json(indent=2))
+            # Атомарно: здесь лежат её состояние и НЕЗАКРЫТЫЕ ОБЕЩАНИЯ, а
+            # телефон выключается посреди записи чаще, чем хотелось бы
+            # (см. efi/utils/atomic.py).
+            await write_text_atomic(self._path, snapshot.model_dump_json(indent=2))
             self._cache = snapshot
         return snapshot
 

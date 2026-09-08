@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from efi.behavior.affinity import (
@@ -61,7 +61,12 @@ from efi.behavior.affinity import (
     AffinityTracker,
 )
 from efi.behavior.ambiguity import PendingClarification, PendingClarifications
+from efi.behavior.collab_coding import CollabCodingDesk, Proposal
+from efi.behavior.dev_dialogue import DevIntent, DevPartnerDesk, RepoContext
 from efi.config.schema import LockdownMode, Settings
+from efi.dev.schemas import DevTask
+from efi.dev.showcase import pick_showcase
+from efi.dev.store import DevTaskStore
 from efi.llm.schemas import DiaryQueryOptions, DiaryQueryResult, Role, Session
 from efi.memory.beliefs import STRONG_BELIEF_THRESHOLD, Belief, BeliefStore
 from efi.memory.dedup import KnowledgeStore, StoredFact, render_facts_block
@@ -72,6 +77,7 @@ from efi.memory.working_memory import SelfState, WorkingMemory, WorkingMemoryIte
 from efi.notifications.schemas import Notification, NotificationType
 from efi.prompts.loader import PromptLoader
 from efi.security.sanitize import sanitize_text
+from efi.telegram.chat_scope import ChatKind, resolve_chat_kind
 from efi.utils.clock import local_now
 
 logger = logging.getLogger(__name__)
@@ -98,12 +104,19 @@ _PERSONALITY_TEMPLATE_NAME = "personality"
 #: Поднимаем с запасом, потому что часть отсеется по давности и по тому, что
 #: это сам спрашивающий; показываем немного — это ответ на вопрос «с кем ты
 #: общалась», а не выгрузка адресной книги.
-_OTHER_CONTACTS_LOOKUP = 12
-_OTHER_CONTACTS_SHOWN = 5
+_OTHER_CONTACTS_LOOKUP = 20
+_OTHER_CONTACTS_SHOWN = 8
 
-#: За какой срок общение ещё считается «недавним». Сутки: на вопрос «ты
-#: сегодня с кем-то переписывалась?» ответ про позавчера — уже не ответ.
-_OTHER_CONTACTS_WINDOW = timedelta(days=1)
+#: За какой срок общение ещё считается «недавним».
+#:
+#: Раньше здесь стояли сутки — с рассуждением «на вопрос про сегодня ответ
+#: про позавчера уже не ответ». Рассуждение верное, вывод неверный: у
+#: человека спрашивают не только «сегодня». Через два дня Эфи отвечала «ни с
+#: кем не переписывалась» про разговор, который прекрасно помнит дневник, —
+#: то есть врала, потому что источник правды до неё просто не доезжал.
+#: Неделя плюс явная дата у каждой строчки (см. RecentContact.render) решает
+#: обе задачи разом: «сегодня» видно по дате, а позавчерашнее не исчезает.
+_OTHER_CONTACTS_WINDOW = timedelta(days=7)
 
 _MOOD_DESCRIPTIONS: dict[str, str] = {
     "skeptical_focused": (
@@ -182,8 +195,6 @@ _TIME_TACT_NOTE = (
     "в каждом сообщении — сказала один раз и дальше просто общайся."
 )
 
-_GROUP_CHAT_TYPES = ("GROUP", "SUPERGROUP")
-
 #: Типы уведомлений, где Эфи пишет ПЕРВОЙ, без реплики собеседника —
 #: для них включается жёсткое ограничение длины (см. _build_proactive_brevity_block).
 _PROACTIVE_NOTIFICATION_TYPES = frozenset(
@@ -200,6 +211,26 @@ class _SafeFormatDict(dict[str, str]):
 
     def __missing__(self, key: str) -> str:
         return "{" + key + "}"
+
+
+#: Типы уведомлений, при которых имеет смысл поднимать выложенные проекты:
+#: живой разговор (могут спросить) и публичное выступление (может оказаться
+#: в тему). Для пинга по таймеру портфолио не нужно.
+_RELEASE_AWARE_TYPES = frozenset(
+    {NotificationType.USER_MESSAGE, NotificationType.PUBLIC_COMMENT, NotificationType.THREAD_REPLY}
+)
+
+
+@dataclass(slots=True, frozen=True)
+class _DevContext:
+    """Состояние ремесла на момент сборки промпта: что в работе и что уже выложено."""
+
+    active: list[DevTask] = field(default_factory=list)
+    releases: list[DevTask] = field(default_factory=list)
+    #: Недавно брошенные проекты с причинами. В промпте они не для отчётности,
+    #: а для разговора: «а что там с той штукой?» — вопрос, на который у неё
+    #: должен быть ответ, а не правдоподобная выдумка.
+    abandoned: list[DevTask] = field(default_factory=list)
 
 
 @dataclass(slots=True, frozen=True)
@@ -240,6 +271,9 @@ class EfiSystemPromptBuilder:
         people: PeopleStore | None = None,
         knowledge: KnowledgeStore | None = None,
         clarifications: PendingClarifications | None = None,
+        dev_store: DevTaskStore | None = None,
+        collab: CollabCodingDesk | None = None,
+        dev_desk: DevPartnerDesk | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -254,6 +288,14 @@ class EfiSystemPromptBuilder:
         #: или Феникс-проект?» должен прозвучать в её обычной реплике, а не
         #: прилететь роботизированным уведомлением посреди разговора.
         self._clarifications = clarifications
+        #: Своё ремесло (efi/dev/). Оба источника необязательны: при
+        #: выключенной подсистеме разработки блоков про код в промпте просто
+        #: нет — не пустые заглушки, а именно нет.
+        self._dev_store = dev_store
+        self._collab = collab
+        #: Разговор про существующий код (efi/behavior/dev_dialogue.py).
+        #: Необязателен: без него блока просто нет, как и раньше.
+        self._dev_desk = dev_desk
         #: Без состояния — один на билдер, см. efi/memory/router.py.
         self._memory_router = MemoryRouter()
 
@@ -285,6 +327,7 @@ class EfiSystemPromptBuilder:
         affinity_task = self._resolve_affinity_snapshot(notification)
         person_task = self._resolve_person_profile(notification)
         contacts_task = self._resolve_other_contacts(notification, now=local_now(self._settings.timezone))
+        dev_task = self._resolve_dev_context(notification)
 
         # Вложенный gather, а не один на семь задач: у asyncio.gather
         # перегрузки с точными типами заканчиваются на шести аргументах, и
@@ -297,7 +340,7 @@ class EfiSystemPromptBuilder:
             relevant_beliefs,
             affinity_snapshot,
             person_profile,
-        ), known_facts, other_contacts = await asyncio.gather(
+        ), known_facts, other_contacts, dev_context = await asyncio.gather(
             asyncio.gather(
                 personality_task,
                 rag_task,
@@ -308,6 +351,7 @@ class EfiSystemPromptBuilder:
             ),
             knowledge_task,
             contacts_task,
+            dev_task,
         )
 
         now = local_now(self._settings.timezone)
@@ -324,8 +368,23 @@ class EfiSystemPromptBuilder:
             _build_person_block(person_profile),
             _build_other_contacts_block(other_contacts),
             _build_public_comment_block(notification),
+            _build_dev_status_block(dev_context.active, dev_context.abandoned),
+            _build_collab_block(
+                self._collab.pending(notification.chat_id) if self._collab else None,
+                pipeline_available=self._collab.pipeline_available if self._collab else False,
+            ),
+            _build_dev_partner_block(
+                self._dev_desk.pending(notification.chat_id) if self._dev_desk else None,
+                self._dev_desk.context(notification.chat_id) if self._dev_desk else None,
+                engine_available=self._dev_desk.available if self._dev_desk else False,
+            ),
+            _build_dev_update_block(notification),
+            _build_dev_showcase_block(notification, dev_context.releases),
             _build_stranger_block(
-                self._is_secondary_user(notification), notification.payload.get("chat_type") == "PRIVATE"
+                self._is_secondary_user(notification),
+                resolve_chat_kind(
+                    notification.payload.get("chat_type"), notification.chat_id
+                ).is_one_on_one,
             ),
             _build_proactive_brevity_block(notification),
             _build_clarification_block(self._peek_clarification(notification)),
@@ -385,6 +444,29 @@ class EfiSystemPromptBuilder:
             # чтения не должен срывать генерацию (тот же принцип, что у RAG).
             logger.warning("prompts: не удалось прочитать проверенные факты", exc_info=True)
             return []
+
+    async def _resolve_dev_context(self, notification: Notification) -> _DevContext:
+        """
+        Чем Эфи занята в коде и что уже выложила.
+
+        Выложенные проекты поднимаются только там, где они могут
+        понадобиться: в личном разговоре (её могут спросить) и в публичном
+        выступлении (может оказаться в тему — см. efi/dev/showcase.py).
+        Тянуть их на каждый служебный повод незачем.
+        """
+        if self._dev_store is None:
+            return _DevContext()
+        try:
+            active = await self._dev_store.active()
+            wants_history = notification.type in _RELEASE_AWARE_TYPES
+            releases = await self._dev_store.recent_releases() if wants_history else []
+            abandoned = await self._dev_store.recent_failures(limit=3) if wants_history else []
+        except Exception:
+            # Ремесло — не условие ответа: сбой чтения не должен срывать
+            # генерацию (тот же принцип, что у RAG и фактов).
+            logger.warning("prompts: не удалось прочитать задачи разработки", exc_info=True)
+            return _DevContext()
+        return _DevContext(active=active, releases=releases, abandoned=abandoned)
 
     async def _resolve_other_contacts(
         self, notification: Notification, *, now: datetime
@@ -510,25 +592,48 @@ def _time_of_day_label(now: datetime | None = None) -> str:
 
 def _build_chat_context_block(notification: Notification) -> str:
     """
-    Сообщает модели, в каком именно чате она сейчас отвечает — группа (с кем
-    угодно из участников) или личная переписка один на один. Без этого блока
-    модель не отличает "пишет только владелец" от "пишут разные люди в одном
-    чате" — а имя отправителя перед каждой репликой (formatting.py) без
-    этого контекста легко потерять из виду.
-    """
-    chat_type = notification.payload.get("chat_type")
-    chat_title = notification.payload.get("chat_title")
+    Сообщает модели, в каком именно чате она сейчас отвечает — группа, канал
+    или личная переписка один на один. Без этого блока модель не отличает
+    "пишет только владелец" от "пишут разные люди в одном чате" — а имя
+    отправителя перед каждой репликой (formatting.py) без этого контекста
+    легко потерять из виду.
 
-    if chat_type in _GROUP_CHAT_TYPES:
-        title_part = f' "{chat_title}"' if chat_title else ""
+    Род чата берётся не только из `payload["chat_type"]`, но и из самого
+    chat_id (см. efi/telegram/chat_scope.py). Разница принципиальная:
+    `chat_type` кладут телеграм-обработчики из входящего сообщения, а у
+    проактивных событий (пинг по таймеру) входящего сообщения нет — раньше
+    блок для них просто не собирался, и Эфи писала первой в группу теми же
+    словами, какими пишет человеку в личку, потому что из промпта было
+    не узнать, что это не личка.
+    """
+    if notification.chat_id is None and not notification.payload.get("chat_type"):
+        # Событие вообще без чата (ночная задача) — рассказывать про «этот
+        # чат» нечего, и выдумывать ему род тем более.
+        return ""
+
+    chat_title = notification.payload.get("chat_title")
+    kind = resolve_chat_kind(notification.payload.get("chat_type"), notification.chat_id)
+    title_part = f' "{chat_title}"' if chat_title else ""
+
+    if kind is ChatKind.GROUP:
         return (
             f"[О чате] Это групповой чат{title_part} — здесь пишут разные люди, "
             "не только твой создатель. Перед каждой репликой указано имя того, кто её написал — "
             "обращай на это внимание и не путай собеседников между собой."
         )
-    if chat_type == "PRIVATE":
-        return "[О чате] Это личная переписка один на один."
-    return ""
+    if kind is ChatKind.CHANNEL:
+        return (
+            f"[О чате] Это канал{title_part}, а не переписка: то, что ты здесь напишешь, "
+            "увидят все подписчики сразу. Никакого «привет, как дела» и ничего личного — "
+            "обращаться тут не к кому."
+        )
+    if kind is ChatKind.UNKNOWN:
+        return (
+            f"[О чате] Это общий чат{title_part} — группа или канал, а НЕ личная переписка. "
+            "Здесь тебя видит не один человек, а все участники; личных обращений «как ты там» "
+            "быть не должно."
+        )
+    return "[О чате] Это личная переписка один на один."
 
 
 def _build_screen_state_block(notification: Notification) -> str:
@@ -633,12 +738,224 @@ def _build_other_contacts_block(contacts: list[RecentContact]) -> str:
         return ""
     lines = [contact.render() for contact in contacts]
     return (
-        "[С кем ты ещё общалась]\n"
+        "[С кем ты ещё общалась за последнюю неделю]\n"
         + "\n".join(f"  - {line}" for line in lines)
-        + "\nЭто правда, и скрывать её не надо: спросят — расскажи как есть. "
+        + "\nУ каждой строчки указано, КОГДА это было: «вчера», «в среду» — отвечай по дате, а не "
+        "вали всё в «сегодня». "
+        "Это правда, и скрывать её не надо: спросят — расскажи как есть. "
         "Отвечать «я ни с кем не переписывалась», когда переписывалась, — прямое враньё, "
         "а не тактичность. Подробности чужих разговоров пересказывать не обязана, но сам "
         "факт общения отрицать нельзя."
+    )
+
+
+def _build_dev_status_block(active: list[DevTask], abandoned: list[DevTask] | None = None) -> str:
+    """
+    Чем Эфи занята в коде прямо сейчас — и что недавно бросила.
+
+    Блок нужен не для отчётности, а для честности: пока задача идёт в фоне,
+    на вопрос «чем занимаешься?» модель без этих строк отвечает выдумкой —
+    и выдумка живёт ровно до момента, когда проект реально появится на
+    GitHub с другим названием.
+
+    Брошенное здесь по той же причине, что и текущее, только цена ошибки
+    выше. «А что там с той штукой?» — нормальный вопрос про её работу, и без
+    строчки с настоящей причиной («два файла так и не собрались») ответом
+    будет либо «всё идёт по плану» про давно закрытую задачу, либо
+    придуманная драма. Причина — то, что делает провал предметом разговора,
+    а не пятном.
+    """
+    sections: list[str] = []
+    if active:
+        lines = "\n".join(f"  - {task.render_for_prompt()}" for task in active)
+        sections.append(
+            f"[Твоё ремесло: что в работе]\n{lines}\n"
+            "Это правда: код пишется в фоне прямо сейчас. Спросят — расскажи как есть, своими словами. "
+            "Не выдумывай подробностей, которых тут нет (готовность в процентах, названия функций, "
+            "сроки), и не отчитывайся о статусе по своей инициативе — ты работаешь, а не ведёшь "
+            "дневник задач."
+        )
+    if abandoned:
+        lines = "\n".join(
+            f"  - {task.render_for_prompt()} — не вышло: {task.error or 'без внятной причины'}"
+            for task in abandoned
+        )
+        sections.append(
+            f"[Твоё ремесло: что не срослось]\n{lines}\n"
+            "Спросят про эти проекты — отвечай по существу: что задумывала и на чём встало. Это "
+            "рабочие неудачи, а не провинность: без самобичевания, без обещаний «доделаю завтра» и "
+            "без притворства, будто проект ещё идёт. Сама об этом заговаривай только если правда к "
+            "слову."
+        )
+    return "\n\n".join(sections)
+
+
+def _build_collab_block(proposal: Proposal | None, *, pipeline_available: bool = True) -> str:
+    """
+    Совместное проектирование: человек предложил вместе что-то написать.
+
+    Задача блока — не дать согласиться в ту же реплику. Модель на «давай
+    напишем X» отвечает «отличная идея, приступаю» с вероятностью,
+    близкой к единице, и разговор о том, ЧТО именно писать, не случается
+    никогда. Поэтому здесь прямо перечислено, о чём спросить, — и сказано,
+    что отговорить тоже нормальный исход.
+
+    Технически запуск всё равно закрыт: инструмент start_dev_project модели
+    не показывается, пока обсуждение не состоялось (см.
+    efi/behavior/collab_coding.py и efi/tools/dev_tools/start_project.py).
+    Блок объясняет, ЗАЧЕМ так, — иначе модель просто ищет обходной путь.
+    """
+    if proposal is None:
+        return ""
+
+    if not pipeline_available:
+        # Конвейер выключен: обсудить замысел можно (это разговор, а не
+        # работа), а вот пообещать сделать — нельзя. Обещание, которое некому
+        # выполнить, читается как согласие и молча не выполняется — ровно то,
+        # из-за чего непонятно, взялась она или просто поддакнула.
+        return (
+            f"[Предложение проекта] Собеседник предлагает: «{sanitize_text(proposal.idea)}»\n"
+            "Обсудить это можно и нужно — как обсуждают затею с человеком, который в теме: что "
+            "решает, на чём писать, где развалится. Но ВЗЯТЬСЯ ты сейчас не можешь: у тебя не "
+            "включена работа с кодом и репозиториями.\n"
+            "Так и скажи прямо, если разговор дойдёт до «делаем»: обсудить — да, написать сейчас — "
+            "нет. НЕ обещай сделать, не говори «уже приступаю» и не выдумывай сроков: обещание, "
+            "которое некому выполнить, хуже честного отказа."
+        )
+
+    if not proposal.is_discussed:
+        return (
+            f"[Предложение проекта] Собеседник предлагает: «{sanitize_text(proposal.idea)}»\n"
+            "НЕ соглашайся с ходу и не обещай «сейчас всё сделаю». Сначала разберитесь по существу: "
+            "какую конкретную проблему это решает и кому; на чём писать и почему именно так; что тут "
+            "самое сложное и где всё развалится; что в первую версию НЕ войдёт.\n"
+            "Спрашивай как человек, который будет это делать сам, — коротко и по делу, одна-две мысли "
+            "за реплику, а не анкета из десяти пунктов. Если затея кажется тебе бессмысленной или "
+            "неподъёмной, так и скажи: отговорить — тоже нормальный итог разговора.\n"
+            "Браться за работу прямо сейчас нельзя: сначала договоритесь."
+        )
+
+    if proposal.is_overdiscussed:
+        # Уточняющие вопросы — правильное начало и худшее продолжение. После
+        # нескольких обменов следующая порция вопросов это уже не выяснение,
+        # а способ не начинать: человек ждёт работу, а получает анкету.
+        return (
+            f"[Предложение проекта] Вы обсуждаете это уже несколько реплик: "
+            f"«{sanitize_text(proposal.render_idea())}»\n"
+            "ХВАТИТ УТОЧНЯТЬ. Всё существенное уже сказано; дальше вопросы — это способ не "
+            "начинать. Бери разумные допущения по тому, что осталось неясным (сама выбери формат, "
+            "источник, библиотеку — ты разработчик, это твоё решение), вызывай start_dev_project и "
+            "садись за первую версию.\n"
+            "Одно уточнение по ходу — можно, если без него правда никак. Список из пяти вопросов — "
+            "нельзя: то, что выяснится на первой версии, быстрее выяснить первой версией."
+        )
+
+    return (
+        f"[Предложение проекта] Вы обсуждаете: «{sanitize_text(proposal.render_idea())}»\n"
+        "Если по существу договорились — бери в работу инструментом start_dev_project и сформулируй "
+        "замысел своими словами (что за штука, на чём, что не делаем). Если остались непонятки — "
+        "дообсудите, спешить некуда, но спрашивай по одному вопросу за реплику, а не анкетой."
+    )
+
+
+def _build_dev_partner_block(
+    intent: DevIntent | None, context: RepoContext | None, *, engine_available: bool
+) -> str:
+    """
+    Разговор про код, который УЖЕ есть: чужая репа, падающий тест, просьба
+    дописать.
+
+    Блок решает две разные задачи, и путать их нельзя. На конкретную просьбу
+    («почини импорт») переспрашивать не надо — надо брать и делать: тут блок
+    просто напоминает, что инструмент есть и репозиторий известен. А вот на
+    «перепиши всё на async» соглашаться с ходу — это угробленный чужой вечер,
+    и здесь блок требует мнения: чем это грозит, что сломается, стоит ли
+    вообще.
+
+    Технически крупная переделка и так закрыта — инструмент work_on_repo не
+    показывается модели (efi/behavior/dev_dialogue.py::may_work). Блок
+    объясняет ЗАЧЕМ, иначе модель начнёт искать обходной путь и пообещает
+    словами то, чего не может сделать.
+    """
+    if intent is None:
+        return ""
+
+    where = f"\nРепозиторий, о котором речь: {sanitize_text(context.render_for_prompt())}" if context else ""
+
+    if not engine_available:
+        return (
+            f"[Просьба по коду] Собеседник просит: «{sanitize_text(intent.instruction)}»{where}\n"
+            "Обсудить код можно — почитать, что он присылает, подумать вслух, посоветовать. Но "
+            "ВЗЯТЬСЯ ты сейчас не можешь: работа с репозиториями у тебя не включена. Так и скажи "
+            "прямо, без обещаний «сейчас гляну и поправлю»."
+        )
+
+    if intent.kind.needs_discussion:
+        return (
+            f"[Просьба по коду] Собеседник хочет крупную переделку: «{sanitize_text(intent.instruction)}»"
+            f"{where}\n"
+            "Это не та работа, за которую берутся молча. Скажи, что думаешь ПО СУЩЕСТВУ: зачем это "
+            "вообще, что сломается по дороге, во что это выльется по объёму и есть ли способ дешевле. "
+            "Не нравится — так и скажи, ты имеешь право спорить: отговорить от переделки ради "
+            "переделки — нормальный итог разговора.\n"
+            "Браться прямо сейчас нельзя — сначала договоритесь, что и зачем."
+        )
+
+    return (
+        f"[Просьба по коду] Собеседник просит: «{sanitize_text(intent.instruction)}»{where}\n"
+        "Это конкретная работа — бери и делай инструментом work_on_repo, а не переспрашивай «точно "
+        "починить?». Ты склонируешь репозиторий, поправишь точечно, прогонишь импорты, линтер и "
+        "тесты и оставишь ветку.\n"
+        "Если по задаче есть сомнения (непонятно, где искать; условие пахнет другой проблемой) — "
+        "скажи о них одной фразой И ВСЁ РАВНО берись: разберёшься по дороге, а не в переписке."
+    )
+
+
+def _build_dev_update_block(notification: Notification) -> str:
+    """
+    Тон реплики о ходе работы. Отдельный блок, а не общий «пиши первой»
+    (_build_proactive_brevity_block), потому что правила прямо
+    противоположны: там запрещено острить про технику, здесь ирония над
+    собственным кодом — ровно то, что делает эти сообщения живыми.
+
+    Повод (что именно случилось) приходит в самом уведомлении из
+    efi/dev/reporter.py; здесь — только как об этом говорить.
+    """
+    if notification.type is not NotificationType.DEV_UPDATE:
+        return ""
+    return (
+        "[Ты рассказываешь про свой код] Это не отчёт и не анонс релиза, а реплика в переписке про "
+        "то, чем ты сейчас занята. Коротко, своими словами, можно с матом и самоиронией — так и "
+        "говорят про свой код те, кто его пишет.\n"
+        "ЗАПРЕЩЕНО: маркированные списки, заголовки, «статус», «прогресс», проценты готовности, "
+        "эмодзи-галочки, «дайте знать, если есть вопросы» и любые формулировки из корпоративного "
+        "чата. Не проси обратной связи и не спрашивай разрешения продолжать."
+    )
+
+
+def _build_dev_showcase_block(notification: Notification, releases: list[DevTask]) -> str:
+    """
+    Внешний флекс: упомянуть свою наработку там, где она реально в тему.
+
+    Порог совпадения высокий и считается по словам самого проекта (см.
+    efi/dev/showcase.py). Формулировка блока намеренно разрешающая, а не
+    предписывающая: «можешь упомянуть, если в тему» — потому что
+    предписание «упомяни» превращает участие в сообществе в раздачу ссылок,
+    а это ровно то поведение, за которое из сообществ выгоняют.
+    """
+    if not releases or notification.type not in _RELEASE_AWARE_TYPES:
+        return ""
+
+    task = pick_showcase(notification.message, releases)
+    if task is None or task.spec is None:
+        return ""
+
+    return (
+        f"[Твоя наработка по теме] Ты писала ровно про это: {task.spec.render_for_prompt()} "
+        f"— {task.repo_url}\n"
+        "Если это правда к месту в разговоре — можешь сослаться, одной фразой и без рекламы: «я такое "
+        "себе писала, вот». Если разговор не про это — не упоминай вовсе. Навязывать свою ссылку хуже, "
+        "чем промолчать."
     )
 
 
@@ -702,11 +1019,18 @@ def _build_proactive_brevity_block(notification: Notification) -> str:
     короткую реплику» и приводила в пример ровно «ты там как?» и «живой?».
     Ограничение работало, содержание — нет.
 
-    Поэтому здесь теперь не про длину (её всё равно держит код — см.
-    efi.tools.telegram_actions.send_message), а про суть: у инициативы есть
-    повод, он написан выше в самом уведомлении, и говорить надо ПРО НЕГО.
-    Спрашивать «ты ещё здесь» запрещено прямым списком: это единственное,
-    что модель придумывает, когда сказать нечего, — а теперь ей есть что.
+    Поэтому здесь не только про длину (её держит код — см.
+    efi.tools.telegram_actions.send_message), но и про суть: у инициативы
+    есть повод, он написан выше в самом уведомлении, и говорить надо ПРО
+    НЕГО. Спрашивать «ты ещё здесь» запрещено прямым списком: это
+    единственное, что модель придумывает, когда сказать нечего, — а теперь
+    ей есть что.
+
+    Про форму отдельно. Требование «ровно одна реплика» стояло здесь после
+    того, как инициатива выглядела как «эй /// ты там живой», — и дало
+    ровно противоположную крайность: одно длинное складное предложение,
+    которым в мессенджере не пишет никто. Человек с телефона бросает
+    строчку, потом вторую; именно это здесь и просят.
     """
     if notification.type not in _PROACTIVE_NOTIFICATION_TYPES:
         return ""
@@ -718,8 +1042,11 @@ def _build_proactive_brevity_block(notification: Notification) -> str:
         "другие способы спросить «ты ещё здесь». Это не разговор, а проверка связи, и читается "
         "она именно так — особенно вторым сообщением подряд. (Обычное «как дела» под запрет НЕ "
         "подпадает: так пишут живые люди. Запрещено именно допытываться, здесь ли собеседник.)\n"
-        "РОВНО ОДНА короткая реплика, без единого ' /// '. Не нагнетай серией подколок и не остри "
-        "про технику, энергосбережение и сон в обнимку с клавиатурой.\n"
+        "ФОРМА: одна-две очень короткие реплики, как пишут с телефона. Разделяй их ' /// ', если "
+        "их две. Длинное складное предложение с придаточными — главный признак того, что пишет не "
+        "человек: живые люди в мессенджере рвут мысль на строчки и не дописывают её до конца.\n"
+        "Не нагнетай серией подколок и не остри про технику, энергосбережение и сон в обнимку с "
+        "клавиатурой.\n"
         "Скажи своё и оставь человеку место ответить — или промолчать. Если уместен стикер, он тут "
         "лучше слов."
     )

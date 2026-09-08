@@ -47,6 +47,7 @@ from efi.llm.errors import LLMAuthError, LLMError, LLMRateLimitError, LLMTimeout
 from efi.llm.measurable import MeasurableLLMProvider, MetricsSink
 from efi.llm.providers.openai_compatible import OpenAICompatibleProvider
 from efi.llm.schemas import AudioTranscription, EmbeddingVector, LLMParams, Response, Session
+from efi.llm.timeouts import request_timeout
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +103,28 @@ class LLMRouter:
         return {key: remaining for key, deadline in self._cooldowns.items() if (remaining := deadline - now) > 0.0}
 
     async def chat(self, role: TaskRole, params: LLMParams, session: Session) -> Response:
-        """Нестриминговый запрос с автоматическим fallback между кандидатами роли."""
+        """
+        Нестриминговый запрос с автоматическим fallback между кандидатами роли.
+
+        Таймаут считается на КАЖДЫЙ запрос отдельно (см. efi/llm/timeouts.py):
+        пятнадцать секунд, разумные для реплики в чат, гарантированно
+        обрывают дневник на четыре тысячи токенов — и в логе это выглядит как
+        подряд отвалившиеся кандидаты роли, а в жизни как «не смогла
+        ответить» и оборванные записи.
+        """
 
         async def operation(provider: LLMProvider, endpoint: EndpointConfig) -> Response:
-            attempt_params = params.model_copy(update={"model": endpoint.model})
+            attempt_params = params.model_copy(
+                update={
+                    "model": endpoint.model,
+                    "timeout_seconds": self._timeout_for(endpoint, params, role),
+                }
+            )
             return await provider.chat(attempt_params, session)
 
-        return await self._attempt_with_fallback(role, operation)
+        return await self._attempt_with_fallback(
+            role, operation, timeout_for=lambda endpoint: self._timeout_for(endpoint, params, role)
+        )
 
     async def chat_streaming(self, role: TaskRole, params: LLMParams, session: Session) -> AsyncIterator[Response]:
         """
@@ -178,10 +194,29 @@ class LLMRouter:
 
         return await self._attempt_with_fallback(role, operation)
 
+    def _timeout_for(self, endpoint: EndpointConfig, params: LLMParams, role: TaskRole) -> float:
+        """
+        Сколько ждать этот запрос у этого кандидата.
+
+        Явно заданный вызывающей стороной таймаут уважается как есть: тот, кто
+        просит, иногда знает про задачу больше нас. Во всех остальных случаях
+        бюджет считается по объёму ответа, а «интерактивность» определяется
+        ролью: MAIN — единственная роль на критическом пути ответа человеку.
+        """
+        if params.timeout_seconds is not None:
+            return params.timeout_seconds
+        return request_timeout(
+            endpoint.timeout_seconds,
+            max_output_tokens=params.max_output_tokens,
+            interactive=role is TaskRole.MAIN,
+        )
+
     async def _attempt_with_fallback(
         self,
         role: TaskRole,
         operation: Callable[[LLMProvider, EndpointConfig], Awaitable[_T]],
+        *,
+        timeout_for: Callable[[EndpointConfig], float] | None = None,
     ) -> _T:
         """
         Общий алгоритм fallback для операций, которые либо полностью успешны,
@@ -190,7 +225,11 @@ class LLMRouter:
         общий бюджет времени на всю цепочку кандидатов (см. докстринг модуля).
         """
         candidates = self._candidates(role)
-        budget = sum(endpoint.timeout_seconds for endpoint in candidates) + self._role_timeout_buffer_seconds
+        # Общий бюджет считается по ТЕМ ЖЕ значениям, что уйдут в запросы:
+        # иначе внешний wait_for обрывал бы работу раньше, чем сам запрос
+        # успевал упереться в свой таймаут, и причина отказа была бы не та.
+        measure = timeout_for or (lambda endpoint: endpoint.timeout_seconds)
+        budget = sum(measure(endpoint) for endpoint in candidates) + self._role_timeout_buffer_seconds
         try:
             return await asyncio.wait_for(self._attempt_candidates(candidates, operation), timeout=budget)
         except TimeoutError as exc:

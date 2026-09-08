@@ -135,6 +135,31 @@ CREATE TABLE IF NOT EXISTS conversation_state (
 );
 """
 
+_DEV_TASKS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS dev_tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER,                          -- куда рассказывать о ходе работы; NULL — некому
+    idea        TEXT NOT NULL,                    -- замысел словами, как он был сформулирован
+    is_collab   INTEGER NOT NULL DEFAULT 0,       -- 1 = проект заказал человек, 0 = своя затея
+    status      TEXT NOT NULL DEFAULT 'pending',  -- значение efi.dev.schemas.DevTaskStatus
+    spec        TEXT NOT NULL DEFAULT '',         -- JSON ProjectSpec; пусто, пока не спроектировано
+    repo_url    TEXT NOT NULL DEFAULT '',
+    error       TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dev_tasks_status ON dev_tasks (status, created_at);
+"""
+
+_CHAT_DIRECTORY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_directory (
+    chat_id     INTEGER PRIMARY KEY,
+    chat_type   TEXT NOT NULL DEFAULT '',   -- имя pyrogram.enums.ChatType: PRIVATE/GROUP/SUPERGROUP/CHANNEL
+    title       TEXT NOT NULL DEFAULT '',   -- пусто для лички: у неё нет названия
+    updated_at  TEXT NOT NULL
+);
+"""
+
 _THREAD_STATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS thread_state (
     chat_id        INTEGER NOT NULL,
@@ -262,6 +287,104 @@ async def _migration_013_conversation_turns(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE conversation_state ADD COLUMN turns INTEGER NOT NULL DEFAULT 0")
 
 
+async def _migration_014_chat_directory(conn: aiosqlite.Connection) -> None:
+    """
+    Справочник чатов (см. efi/db/chat_directory.py): что за чат стоит за
+    chat_id — личка, группа или канал.
+
+    Заполняется по мере того, как в чатах приходят сообщения; для уже
+    накопленной истории таблица останется пустой, и род чата будет
+    выводиться из самого id (efi.telegram.chat_scope.classify_chat_id) —
+    задним числом восстановить тип неоткуда, а на главный вопрос («личка или
+    нет») id отвечает и без справочника.
+    """
+    await conn.executescript(_CHAT_DIRECTORY_SCHEMA)
+
+
+async def _migration_015_dev_tasks(conn: aiosqlite.Connection) -> None:
+    """
+    Очередь задач разработки (см. efi/dev/store.py).
+
+    Отдельная таблица, а не `proactive_tasks`: у той жизненный цикл «сработать
+    в назначенный момент», а здесь — конвейер от замысла до запушенного
+    репозитория, со своим статусом и спекой проекта.
+    """
+    await conn.executescript(_DEV_TASKS_SCHEMA)
+
+
+async def _migration_016_dev_reviews(conn: aiosqlite.Connection) -> None:
+    """
+    Когда Эфи последний раз возвращалась к своему проекту и сколько правок
+    внесла с тех пор (см. efi/dev/maintenance.py).
+
+    ALTER TABLE, а не пересоздание: у того, кто уже включил разработку, в
+    таблице лежат живые задачи со спеками и ссылками.
+    """
+    if not await _has_column(conn, "dev_tasks", "reviewed_at"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''")
+    if not await _has_column(conn, "dev_tasks", "revisions"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN revisions INTEGER NOT NULL DEFAULT 0")
+
+
+async def _migration_017_dev_attempts(conn: aiosqlite.Connection) -> None:
+    """
+    Сколько раз конвейер уже брался за эту задачу (см. efi/dev/worker.py).
+
+    Без счётчика любой временный отказ — 429 на третьем файле из четырёх,
+    оборванная сеть на пуше — хоронил проект навсегда: задача уходила в
+    «не вышло» и больше не поднималась. На бесплатных тирах это самый частый
+    конец работы, и он не имеет отношения ни к качеству замысла, ни к коду.
+    """
+    if not await _has_column(conn, "dev_tasks", "attempts"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
+
+
+async def _migration_018_dev_artifacts(conn: aiosqlite.Connection) -> None:
+    """
+    Файлы, уже написанные по этой задаче (см. efi/dev/worker.py).
+
+    Без них повторный заход переписывал проект с нуля: те же запросы к тому
+    же исчерпанному лимиту и новый шанс разойтись с тем, что в прошлый раз
+    уже сходилось. Работа, которая пережила заход, должна пережить и его
+    провал.
+    """
+    if not await _has_column(conn, "dev_tasks", "artifacts"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN artifacts TEXT NOT NULL DEFAULT ''")
+
+
+async def _migration_019_dev_revivals(conn: aiosqlite.Connection) -> None:
+    """
+    Сколько раз Эфи возвращалась к брошенному проекту (см. efi/dev/worker.py).
+
+    Счётчик, а не флаг: возвращаться стоит, но не бесконечно. Замысел, который
+    не собрался трижды подряд в двух заходах через день, — это уже не «не
+    повезло с лимитами», и десятый круг по нему стоит квоты, за которую можно
+    написать что-то новое.
+    """
+    if not await _has_column(conn, "dev_tasks", "revivals"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN revivals INTEGER NOT NULL DEFAULT 0")
+
+
+async def _migration_020_dev_swe(conn: aiosqlite.Connection) -> None:
+    """
+    Работа с чужим кодом в той же очереди, что и свои проекты
+    (см. efi/dev/swe_engine.py).
+
+    Очередь одна намеренно: и то и другое — её работа, у неё общий счётчик
+    заходов, общая занятость и общее место в дашборде. А вот конвейеры разные,
+    и `kind` — то, что не даёт SWE-задаче случайно уехать в конвейер
+    собственных проектов, где её попытались бы спроектировать с нуля.
+
+    По умолчанию 'project': всё, что уже лежит в таблице, — это проекты.
+    """
+    if not await _has_column(conn, "dev_tasks", "kind"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'project'")
+    if not await _has_column(conn, "dev_tasks", "source"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN source TEXT NOT NULL DEFAULT ''")
+    if not await _has_column(conn, "dev_tasks", "branch"):
+        await conn.execute("ALTER TABLE dev_tasks ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -277,6 +400,13 @@ MIGRATIONS = [
     _migration_011_knowledge,
     _migration_012_memory_domains,
     _migration_013_conversation_turns,
+    _migration_014_chat_directory,
+    _migration_015_dev_tasks,
+    _migration_016_dev_reviews,
+    _migration_017_dev_attempts,
+    _migration_018_dev_artifacts,
+    _migration_019_dev_revivals,
+    _migration_020_dev_swe,
 ]
 
 __all__ = ["MIGRATIONS"]

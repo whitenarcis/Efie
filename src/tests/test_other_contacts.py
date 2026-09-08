@@ -175,17 +175,28 @@ async def test_the_asker_is_not_listed_among_the_others(tmp_path: Path) -> None:
     assert contacts == []
 
 
-async def test_old_conversations_do_not_count_as_today(tmp_path: Path) -> None:
-    """На вопрос «ты сегодня с кем-то переписывалась?» ответ про позапрошлую неделю — не ответ."""
+async def test_conversations_are_remembered_for_a_week_not_a_day(tmp_path: Path) -> None:
+    """
+    Регрессия на «через пару дней забывает, с кем говорила». Окно было
+    ровно сутки, и на третий день Эфи отвечала «ни с кем не переписывалась»
+    про разговор, который прекрасно помнит дневник, — то есть врала, потому
+    что источник правды до неё просто не доезжал.
+    """
     database = Database(tmp_path / "efi.db", migrations=MIGRATIONS)
     people = PeopleStore(database)
     await people.record_message(_STRANGER_ID, "привет", display_name="Рихтер", chat_id=_STRANGER_CHAT)
+    builder = _builder(tmp_path, people)
 
-    contacts = await _builder(tmp_path, people)._resolve_other_contacts(
+    three_days_later = await builder._resolve_other_contacts(
         _notification(_OWNER_ID, _OWNER_CHAT), now=datetime.now(UTC) + timedelta(days=3)
     )
+    two_weeks_later = await builder._resolve_other_contacts(
+        _notification(_OWNER_ID, _OWNER_CHAT), now=datetime.now(UTC) + timedelta(days=14)
+    )
 
-    assert contacts == []
+    assert [contact.name for contact in three_days_later] == ["Рихтер"]
+    assert three_days_later[0].when is not None, "дата обязана быть: по ней отличают «сегодня» от «в среду»"
+    assert two_weeks_later == [], "две недели — это уже не «недавно», а архив"
 
 
 async def test_the_list_does_not_turn_into_an_address_book(tmp_path: Path) -> None:

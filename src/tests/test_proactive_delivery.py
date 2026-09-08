@@ -13,10 +13,18 @@
 
 Правило теперь формулируется через чат: личка владельца и то, что владелец
 сам перечислил в telegram.allowed_chats.
+
+Вторая половина файла — про обратный перекос того же правила. Разрешение
+«писать в этот чат» стало пониматься как «писать сюда первой», и спонтанный
+пинг ушёл в группу из allowed_chats — в общий чат, где у Эфи админка, ушло
+личное «слушай, а я тут подумала», адресованное неизвестно кому. Инициатива
+без просьбы теперь ограничена личкой; напоминание (FOLLOW_UP), о котором
+человек попросил сам, по-прежнему доходит туда, где он попросил.
 """
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from efi.behavior.busy_engine import BusyDecision
@@ -148,13 +156,51 @@ async def test_spontaneous_ping_to_the_owner_is_delivered(tmp_path: Path) -> Non
     assert send_tool.sent == [(_OWNER_ID, "слушай, а я тут подумала")]
 
 
-async def test_ping_to_an_allowed_group_is_delivered(tmp_path: Path) -> None:
-    """Чат, который владелец сам вписал в allowed_chats, — тоже «свой»: инициатива там разрешена."""
+async def test_unprompted_ping_to_an_allowed_group_is_refused(tmp_path: Path) -> None:
+    """
+    Группа в allowed_chats — «свой» чат, но не собеседник. Спонтанный пинг
+    туда — не инициатива в разговоре, а объявление на весь чат: ровно это и
+    случилось в проде, где Эфи написала «как дела» в группу с админкой,
+    считая, что пишет человеку.
+    """
     worker, send_tool, _history = _make_worker(tmp_path)
 
     await worker._handle(
         Notification(
             type=NotificationType.SPONTANEOUS_PING, chat_id=_ALLOWED_GROUP_ID, message="напиши первой", payload={}
+        )
+    )
+
+    assert send_tool.sent == []
+
+
+async def test_silence_ping_to_an_allowed_group_is_refused(tmp_path: Path) -> None:
+    """Пинг по затишью — та же непрошеная инициатива, и в общем чате он так же неуместен."""
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.SILENCE_PING, chat_id=_ALLOWED_GROUP_ID, message="тут тихо", payload={}
+        )
+    )
+
+    assert send_tool.sent == []
+
+
+async def test_follow_up_to_an_allowed_group_is_still_delivered(tmp_path: Path) -> None:
+    """
+    Напоминание — не инициатива Эфи, а просьба человека («напомни через 10
+    минут»). Попросил в группе — значит, и напомнить надо там же, иначе
+    запрет на непрошеные пинги молча ломал бы обещания.
+    """
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.FOLLOW_UP,
+            chat_id=_ALLOWED_GROUP_ID,
+            message="пора напомнить",
+            payload={"promise_text": "напомнить про созвон"},
         )
     )
 
@@ -312,3 +358,65 @@ async def test_undelivered_follow_up_keeps_the_promise_open(tmp_path: Path) -> N
 
     assert send_tool.sent == []
     assert (await working_memory.load()).items[0].done is False
+
+
+# -- протухший повод ---------------------------------------------------------
+
+
+async def test_a_stale_proactive_reason_is_dropped(tmp_path: Path) -> None:
+    """
+    Телефон спал без сети — в метро, ночью, по воле Android, — а фоновые
+    службы всё это время складывали поводы в очередь. Без этой проверки
+    человек, вернувшись в сеть, получал пачку сообщений подряд: «шесть часов
+    тишины», «доброе утро» и «ты обещала скинуть ссылку» — всё разом и всё
+    про вчера.
+    """
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.SPONTANEOUS_PING,
+            chat_id=_OWNER_ID,
+            message="напиши первой",
+            created_at=datetime.now(UTC) - timedelta(hours=6),
+        )
+    )
+
+    assert send_tool.sent == []
+
+
+async def test_a_fresh_proactive_reason_still_goes_through(tmp_path: Path) -> None:
+    """Порог не должен съедать обычную задержку в пару минут."""
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.SPONTANEOUS_PING,
+            chat_id=_OWNER_ID,
+            message="напиши первой",
+            created_at=datetime.now(UTC) - timedelta(minutes=2),
+        )
+    )
+
+    assert send_tool.sent == [(_OWNER_ID, "слушай, а я тут подумала")]
+
+
+async def test_a_late_message_from_a_person_is_never_dropped(tmp_path: Path) -> None:
+    """
+    Главная граница правила. На сообщение человека отвечают и с опозданием —
+    молча выбросить его нельзя ни при каких обстоятельствах, сколько бы оно
+    ни пролежало в очереди.
+    """
+    worker, send_tool, _history = _make_worker(tmp_path)
+
+    await worker._handle(
+        Notification(
+            type=NotificationType.USER_MESSAGE,
+            chat_id=_OWNER_ID,
+            message="ты тут?",
+            payload={"sender_id": _OWNER_ID},
+            created_at=datetime.now(UTC) - timedelta(hours=6),
+        )
+    )
+
+    assert send_tool.sent == [(_OWNER_ID, "слушай, а я тут подумала")]

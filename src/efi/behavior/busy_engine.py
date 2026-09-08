@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -85,6 +86,32 @@ class BusyState(Protocol):
 
     @property
     def is_researching(self) -> bool: ...
+
+
+class AnyBusyState:
+    """
+    Несколько фоновых дел как одно состояние занятости.
+
+    Дел, за которыми Эфи может «не сразу взять телефон», стало больше
+    одного: фоновое исследование (efi.behavior.life_engine.BackgroundLifeWorker.
+    is_researching) и работа над проектом (efi.dev.worker.DevWorker.is_coding).
+    Для BusyEngine разницы между ними нет — важно только, занята ли она
+    чем-то настоящим прямо сейчас, — поэтому источники складываются здесь, а
+    не размножаются полями в самом движке.
+
+    Принимает функции, а не объекты: у занятости разных служб свои имена по
+    существу («исследую» и «пишу код» — разные вещи, и называть их одинаково
+    ради общего протокола значило бы врать в обе стороны). Здесь же они
+    сводятся к одному вопросу, и делается это на месте сборки, где видно,
+    что именно сложили.
+    """
+
+    def __init__(self, *flags: Callable[[], bool]) -> None:
+        self._flags = flags
+
+    @property
+    def is_researching(self) -> bool:
+        return any(flag() for flag in self._flags)
 
 
 class LastMessageSource(Protocol):
@@ -211,4 +238,4 @@ def _calculate_ignore_delay(
     return max(settings.min_delay_seconds, min(delay, settings.max_delay_seconds))
 
 
-__all__ = ["BusyDecision", "BusyEngine", "BusyState", "LastMessageSource"]
+__all__ = ["AnyBusyState", "BusyDecision", "BusyEngine", "BusyState", "LastMessageSource"]

@@ -46,9 +46,13 @@ class _FakeRouter:
     def __init__(self, *responses: tuple[str, str | None]) -> None:
         self._responses = list(responses)
         self.calls: list[LLMParams] = []
+        #: Что именно спросили — нужно там, где инструкция уходит в
+        #: пользовательскую реплику, а не в системный промпт (просьба дописать).
+        self.prompts: list[str] = []
 
     async def chat(self, role: object, params: LLMParams, session: Session) -> Response:
         self.calls.append(params)
+        self.prompts.append(session.messages[-1].content if session.messages else "")
         text, finish_reason = self._responses[min(len(self.calls) - 1, len(self._responses) - 1)]
         return Response(
             choices=[
@@ -155,14 +159,48 @@ def _consolidator(tmp_path: Path, router: _FakeRouter) -> DiaryConsolidator:
     return DiaryConsolidator(Diary(tmp_path / "diary"), router, rag=None)  # type: ignore[arg-type]
 
 
+async def test_truncated_novelization_is_finished_not_cut(tmp_path: Path) -> None:
+    """
+    Главный сценарий: обрыв по лимиту лечится ДОПИСЫВАНИЕМ, а не обрезанием.
+
+    Промпт новеллизации требует подробностей и нескольких записей за проход,
+    поэтому упереться в лимит — норма активного дня, а не исключение. Пока
+    единственным лечением было отрезание хвоста, дневник наполнялся записями,
+    обрывающимися на полумысли.
+    """
+    router = _FakeRouter(
+        (_TRUNCATED, "length"),
+        (" казалось несущественным, а теперь понятно, что дело в теплоёмкости.", "stop"),
+    )
+
+    pieces = await _consolidator(tmp_path, router)._extract_memories(_episode("про кирпич"))
+
+    assert len(pieces) == 1
+    assert pieces[0].endswith("дело в теплоёмкости.")
+    assert pieces[0].startswith("Меня давно занимает")
+    assert len(router.calls) == 2, "один запрос на продолжение, а не переписывание с нуля"
+    assert "Продолжи РОВНО с этого места" in router.prompts[1]
+    assert _TRUNCATED[-40:] in router.prompts[1], "модели показан хвост, по которому она найдёт место обрыва"
+
+
+async def test_continuation_is_asked_no_more_than_twice(tmp_path: Path) -> None:
+    """Модель, которая не умеет останавливаться, не должна жечь лимиты бесконечно."""
+    router = _FakeRouter((_TRUNCATED, "length"))
+
+    pieces = await _consolidator(tmp_path, router)._extract_memories(_episode("про кирпич"))
+
+    assert len(router.calls) == 3, "исходный запрос плюс два дописывания"
+    assert pieces and pieces[0].endswith(".") , "то, что не удалось дописать, обрезается по фразе"
+
+
 async def test_only_the_last_novelized_entry_is_repaired(tmp_path: Path) -> None:
     """
-    Обрыв бьёт по хвосту, а не по всему ответу: записи до разделителя модель
-    успела дописать целиком, и терять их из-за оборванной последней — значит
-    выкинуть всю память за проход.
+    Дописать не удалось — тогда обрыв бьёт по хвосту, а не по всему ответу:
+    записи до разделителя модель успела закончить целиком, и терять их из-за
+    оборванной последней значит выкинуть всю память за проход.
     """
     complete = "Утро прошло за разговором про кирпич, и это было неожиданно интересно."
-    router = _FakeRouter((f"{complete}\n---\n{_TRUNCATED}", "length"))
+    router = _FakeRouter((f"{complete}\n---\n{_TRUNCATED}", "length"), ("", "length"))
 
     pieces = await _consolidator(tmp_path, router)._extract_memories(
         _episode("про кирпич")
@@ -173,7 +211,7 @@ async def test_only_the_last_novelized_entry_is_repaired(tmp_path: Path) -> None
 
 async def test_hopeless_last_entry_is_dropped_and_the_rest_survives(tmp_path: Path) -> None:
     complete = "Утро прошло за разговором про кирпич, и это было неожиданно интересно."
-    router = _FakeRouter((f"{complete}\n---\n{_HOPELESS}", "length"))
+    router = _FakeRouter((f"{complete}\n---\n{_HOPELESS}", "length"), ("", "length"))
 
     pieces = await _consolidator(tmp_path, router)._extract_memories(
         _episode("про кирпич")
@@ -227,3 +265,38 @@ async def test_truncated_perception_names_the_real_cause(finish_reason: str) -> 
 
     assert batch.parse_error
     assert ("оборван лимитом" in batch.parse_error) is (finish_reason == "length")
+
+
+async def test_a_slow_model_gets_a_smaller_diary_instead_of_none(tmp_path: Path) -> None:
+    """
+    Медленная модель не успевает написать столько, сколько попросили, — и
+    тогда пропадает ВСЯ запись, а не её часть. Короткий эпизод в дневнике
+    лучше, чем ещё одна дыра в памяти за этот вечер.
+    """
+    from efi.llm.errors import LLMTimeoutError
+
+    budgets: list[int] = []
+
+    class _SlowRouter:
+        async def chat(self, role: object, params: LLMParams, session: Session) -> Response:
+            budgets.append(params.max_output_tokens)
+            if len(budgets) == 1:
+                raise LLMTimeoutError("request timed out after 15s", provider="test")
+            return Response(
+                choices=[
+                    Choice(message=Message(role=Role.ASSISTANT, content="Короткая, но живая запись."))
+                ]
+            )
+
+    consolidator = DiaryConsolidator(
+        Diary(tmp_path / "diary"),
+        _SlowRouter(),  # type: ignore[arg-type]
+        rag=None,
+        novelization_max_output_tokens=4096,
+    )
+
+    written = await consolidator._novelize("Разговор был такой.")
+
+    assert written is not None
+    assert budgets == [4096, 2048], "просим не дольше ждать, а написать короче"
+    assert "живая запись" in written.body

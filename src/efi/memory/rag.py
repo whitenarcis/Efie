@@ -74,6 +74,14 @@ class RAGMemory:
         self._tfidf = tfidf
         self._local_embeddings = local_embeddings
         self._embedding_role = embedding_role
+        #: Уже сказанные вслух жалобы на эмбеддинги. Эмбеддинг считается на
+        #: КАЖДУЮ сборку промпта, то есть на каждое сообщение, и обе причины
+        #: отказа стабильны: «fastembed не установлен» не изменится никогда, а
+        #: недоступный провайдер держится в cooldown минутами. Без этого лог
+        #: за вечер состоял из одной и той же пары строк, и настоящая ошибка
+        #: в нём просто не была видна — а лог здесь читают именно тогда, когда
+        #: что-то сломалось.
+        self._reported_embedding_troubles: set[str] = set()
 
     async def search(
         self,
@@ -180,13 +188,32 @@ class RAGMemory:
                     return await self._local_embeddings.embed_query(text)
                 return await self._local_embeddings.embed_document(text)
             except RuntimeError as exc:
-                logger.warning("rag: local embedding failed (%s), falling back to LLMRouter", exc)
+                self._complain_once(
+                    "rag: local embedding failed (%s), falling back to LLMRouter", str(exc)
+                )
 
         try:
             return await self._router.embedding(self._embedding_role, text)
         except LLMError as exc:
-            logger.warning("rag: cloud embedding request failed (%s)", exc)
+            self._complain_once("rag: cloud embedding request failed (%s)", str(exc))
             return None
+
+    def _complain_once(self, template: str, detail: str) -> None:
+        """
+        Жалуется вслух один раз на каждую отдельную причину, дальше — в debug.
+
+        Эмбеддинг считается на каждую сборку промпта, то есть на каждое
+        сообщение, а причины отказа стабильны: «fastembed не установлен» не
+        изменится никогда, недоступный провайдер держится в cooldown минутами.
+        Пока каждая попытка писала WARNING, лог за вечер состоял из одной и
+        той же пары строк — и настоящая ошибка в нём терялась.
+        """
+        key = f"{template}|{detail}"
+        if key in self._reported_embedding_troubles:
+            logger.debug(template, detail)
+            return
+        self._reported_embedding_troubles.add(key)
+        logger.warning(template, detail)
 
 
 def _generate_entry_id() -> str:

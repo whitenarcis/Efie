@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
 from efi.db.core import Database
@@ -62,6 +62,24 @@ class SocialInteractionKind(StrEnum):
     STRANGER_DM = "stranger_dm"
     #: Эфи прочитала тред обсуждения (зашла посмотреть, что пишут).
     THREAD_READ = "thread_read"
+    #: Эфи довела свой проект до репозитория и выложила его
+    #: (efi.dev.reporter.DevReporter). Не «внешний контакт» в узком смысле,
+    #: но по природе то же самое: сделанное во внешнем мире, о чём она потом
+    #: может сослаться в разговоре («я эту штуку сама писала»). Домен H —
+    #: как и у остального прожитого опыта.
+    DEV_RELEASE = "dev_release"
+    #: Эфи взялась за проект: придумала, что писать, и села писать. Начало
+    #: работы — такая же часть прожитого, как и её конец: без этой записи на
+    #: вопрос «а что ты вчера делала?» ей нечего ответить, пока проект не
+    #: доведён, а доводится он часами.
+    DEV_STARTED = "dev_started"
+    #: Эфи бросила проект и почему. Самая нужная из трёх записей: провал без
+    #: причины — это «не вышло» на карточке дашборда, а с причиной это то, что
+    #: можно обсудить («почему ты забросила ту штуку с логами?»).
+    DEV_ABANDONED = "dev_abandoned"
+    #: Эфи вернулась к своему старому проекту и что-то в нём сделала
+    #: (efi/dev/maintenance.py) — или посмотрела и решила не трогать.
+    DEV_REVISION = "dev_revision"
     #: Эфи полезла в интернет прямо по ходу разговора (web_search).
     #: Раньше этот опыт не сохранялся НИГДЕ: результаты поиска приходят
     #: модели TOOL-сообщением, а в таблицу `messages` пишутся только реплика
@@ -82,6 +100,10 @@ _DIARY_TEMPLATES: dict[SocialInteractionKind, str] = {
     SocialInteractionKind.STRANGER_DM: "Мне в ЛС писал {who}: «{text}»",
     SocialInteractionKind.THREAD_READ: "Читала обсуждение {where}. Там: «{text}»",
     SocialInteractionKind.WEB_LOOKUP: "Полезла гуглить и вычитала: «{text}»",
+    SocialInteractionKind.DEV_RELEASE: "Дописала и выложила свой проект: {text}",
+    SocialInteractionKind.DEV_STARTED: "Взялась за свой проект: {text}",
+    SocialInteractionKind.DEV_ABANDONED: "Бросила свой проект: {text}",
+    SocialInteractionKind.DEV_REVISION: "Вернулась к своему старому проекту: {text}",
 }
 
 TAG_PUBLIC_COMMENT = "#public_comment"
@@ -292,6 +314,43 @@ class SocialInteractionStore:
             (peer_user_id, limit),
         )
         return [_row_to_interaction(row) for row in rows]
+
+    async def prune_old(self, *, older_than_days: int = 180, keep_last_per_peer: int = 50) -> int:
+        """
+        Удаляет старые записи журнала и возвращает их число.
+
+        Журнал растёт с каждым комментарием, реплаем и прочитанным тредом и
+        не убывал никогда. В контекст он не раздувается — все запросы к нему
+        идут с LIMIT, — но файл базы лежит на телефоне, и через полгода
+        активной жизни это уже заметный объём.
+
+        Порог двойной, как и у истории сообщений: запись удаляется, только
+        если ОНА СТАРШЕ полугода И вне последних `keep_last_per_peer` записей
+        по СВОЕМУ собеседнику. Иначе один разговорчивый канал вытеснил бы всю
+        память о человеке, с которым Эфи пересеклась дважды за год, — а именно
+        такая память здесь и ценна.
+
+        Полгода, а не девяносто дней как у сообщений: это не переписка, а
+        память о том, с кем она вообще имела дело, и она должна пережить
+        долгую паузу.
+        """
+        cutoff = (datetime.now(UTC) - timedelta(days=older_than_days)).isoformat()
+        removed = await self._database.execute_and_count_changes(
+            """
+            DELETE FROM social_interactions
+            WHERE created_at < ?
+              AND id NOT IN (
+                  SELECT id FROM social_interactions AS recent
+                  WHERE recent.peer_user_id IS social_interactions.peer_user_id
+                  ORDER BY recent.created_at DESC, recent.id DESC
+                  LIMIT ?
+              )
+            """,
+            (cutoff, keep_last_per_peer),
+        )
+        if removed:
+            logger.info("social_memory: убрала %d записей старше %d дней", removed, older_than_days)
+        return removed
 
     async def count_public_comments(self, chat_id: int) -> int:
         """Сколько раз Эфи уже комментировала в этом канале — вход для «не частить» в RandomCommentEngager."""

@@ -60,6 +60,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 import os
+from collections.abc import Mapping
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -478,6 +479,15 @@ class HumanizerSettings(BaseModel):
             "правилам системного промпта; здесь — только защита от явно неадекватной разметки."
         ),
     )
+    max_reply_chars_per_turn: int = Field(
+        default=700, ge=120,
+        description=(
+            "Потолок на ВЕСЬ ответ за один ход, в символах. Не стилистика, а защита от простыни: "
+            "модель, которой есть что сказать, выдаёт полторы тысячи символов подряд — и это уже не "
+            "переписка, а лекция в чате. Лишние бабблы отбрасываются целиком (обрывать мысль на "
+            "полуслове хуже), первый — подрезается по последнему законченному предложению"
+        ),
+    )
     short_bubble_delay_min_seconds: float = Field(
         default=0.3, ge=0.0,
         description=(
@@ -612,11 +622,14 @@ class MemorySettings(BaseModel):
         ),
     )
     novelization_max_output_tokens: int = Field(
-        default=2048, ge=1,
+        default=4096, ge=1,
         description=(
             "Лимит токенов вывода при извлечении воспоминаний из переписки — дневник должен быть точным и "
             "подробным на этом шаге; сжатие уже сохранённых старых записей (summarize_stale_entries) — "
-            "отдельная, намеренно более скупая операция, срабатывающая много позже (older_than)."
+            "отдельная, намеренно более скупая операция, срабатывающая много позже (older_than). "
+            "Раньше стояло 2048: по-русски это примерно ОДНА подробная запись (кириллица у бесплатных "
+            "токенизаторов дороже английского в 2-3 раза), и дневник наполнялся обрывками. Если обрывы "
+            "всё равно случаются, ответ дописывается вторым запросом — см. DiaryConsolidator._extract_memories."
         ),
     )
     use_local_embeddings: bool = Field(
@@ -701,9 +714,9 @@ class StateVectorSettings(BaseModel):
     sycophancy_protection_text: str = Field(
         default=(
             "Тебе строго запрещено соглашаться с собеседником просто чтобы не спорить, льстить или "
-            "подстраивать мнение под его ожидания. Если ты не согласна — так и скажи, прямо, даже если "
-            "это неприятно. Мгновенная капитуляция в споре без новых веских аргументов — провал "
-            "характера, а не вежливость."
+            "подстраивать мнение под его ожидания. Если ты не согласна — так и скажи, спокойно и "
+            "по-доброму, но не отступая от сути. Мгновенная капитуляция без новых веских аргументов — "
+            "провал характера, а не вежливость; спорить при этом надо ради истины, а не ради победы."
         ),
         description="Жёсткая инструкция подавления угодливости — попадает в блок текущего состояния промпта",
     )
@@ -860,6 +873,230 @@ class CommunitySettings(BaseModel):
         if self.min_delay_seconds > self.max_delay_seconds:
             raise ValueError("min_delay_seconds не может быть больше max_delay_seconds")
         return self
+
+
+class LaptopLinkSettings(BaseModel):
+    """
+    Ноутбук в домашней сети как тяжёлый ярус вычислений (efi/llm/network_router.py).
+
+    Смысл в одном: пока телефон в той же Wi-Fi, думать можно моделью, которой
+    у телефона нет и быть не может, — и стоит это ноль. Ушли из дома, ноутбук
+    уснул — Эфи прозрачно возвращается к облачному кодеру, без единого
+    «сервис недоступен».
+
+    Настраивается прямо в .env, без префикса EFI_ (так короче, а адрес
+    ноутбука меняется чаще всего остального):
+
+        OMNIROUTE_URL=http://192.168.0.109:8080/v1
+        OMNIROUTE_MODEL=claude-3-5-sonnet
+        OMNIROUTE_API_KEY=любая-строка-если-сервер-её-спрашивает
+
+    Имя OMNIROUTE здесь историческое — так называется связка «сервер, который
+    отдаёт OpenAI-совместимый API». С OmniRouteSettings (облачный прокси на
+    VPS) это разные вещи и разные адреса; путать их нельзя, поэтому и ключи
+    конфигурации разные.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str = Field(default="", description="База OpenAI-совместимого API на ноутбуке")
+    model: str = Field(default="", description="Имя модели, которую ноутбук отдаёт")
+    api_key: SecretStr = Field(
+        default=SecretStr("local"), description="Ключ, если локальный сервер его спрашивает"
+    )
+    timeout_seconds: float = Field(
+        default=180.0, gt=0.0,
+        description="Таймаут запроса к ноутбуку: сильная модель на CPU думает долго, и это нормально",
+    )
+    health_timeout_seconds: float = Field(
+        default=0.6, gt=0.0, le=5.0,
+        description=(
+            "Бюджет проверки живости. Больше — и проверка сама становится задержкой: ноутбук в "
+            "локальной сети отвечает за миллисекунды, а если не ответил за полсекунды, его нет"
+        ),
+    )
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.url.strip() and self.model.strip())
+
+    def as_endpoint(self) -> EndpointConfig | None:
+        """Настройки в форме обычного эндпоинта — или None, если ноутбук не настроен."""
+        if not self.is_configured:
+            return None
+        return EndpointConfig(
+            base_url=self.url.strip(),
+            api_key=self.api_key,
+            model=self.model.strip(),
+            timeout_seconds=self.timeout_seconds,
+        )
+
+    @classmethod
+    def from_environment(cls, environ: Mapping[str, str] | None = None) -> LaptopLinkSettings:
+        """
+        Читает OMNIROUTE_* из окружения.
+
+        Отдельно от pydantic-settings намеренно: эти переменные живут без
+        общего префикса EFI_ и без вложенности, потому что их правят чаще
+        всего остального — руками, в .env, когда роутер выдал ноутбуку другой
+        адрес.
+        """
+        source = environ if environ is not None else os.environ
+        raw_key = source.get("OMNIROUTE_API_KEY", "").strip()
+        return cls(
+            url=source.get("OMNIROUTE_URL", "").strip(),
+            model=source.get("OMNIROUTE_MODEL", "").strip(),
+            api_key=SecretStr(raw_key or "local"),
+            timeout_seconds=_positive_float(source.get("OMNIROUTE_TIMEOUT"), default=180.0),
+        )
+
+
+def _positive_float(raw: str | None, *, default: float) -> float:
+    """Число из переменной окружения; мусор трактуется как «не задано»."""
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+class DevSettings(BaseModel):
+    """
+    Цифровое ремесло Эфи (efi/dev/): собственные проекты, кодогенерация через
+    Qwen Coder и публикация на GitHub.
+
+    ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ, и это не осторожность ради осторожности:
+    подсистема создаёт публичные репозитории от имени владельца токена и
+    пушит туда код, написанный языковой моделью. Такое не включают молча
+    обновлением версии — только явным решением.
+
+    Ключ кодера отдельно можно не задавать: если `coder` не заполнен, он
+    собирается из уже настроенного ключа Groq (тот же приём, что у
+    SttSettings — см. Settings.resolve_coder_endpoint).
+
+    Без `github_token` подсистема работает в локальном режиме: проекты
+    пишутся, проверяются и коммитятся на диск, но никуда не уезжают. Режим
+    рабочий — по нему удобно посмотреть, что она вообще генерирует, прежде
+    чем давать ей доступ к своему GitHub.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    enabled: bool = Field(default=False, description="Полностью включает подсистему разработки")
+    coder: EndpointConfig | None = Field(
+        default=None,
+        description=(
+            "Эндпоинт кодера (Qwen Coder через Groq). Не задан — берётся ключ Groq из llm_roles и "
+            "модель coder_model, см. Settings.resolve_coder_endpoint()"
+        ),
+    )
+    coder_model: str = Field(
+        default="qwen-2.5-coder-32b",
+        description="Модель кодера, когда эндпоинт собирается автоматически из ключа Groq",
+    )
+    coder_base_url: str = Field(
+        default="https://api.groq.com/openai/v1", description="База API кодера при автосборке эндпоинта"
+    )
+    coder_timeout_seconds: float = Field(
+        default=90.0, gt=0.0,
+        description="Таймаут одного запроса к кодеру: файл целиком генерируется дольше реплики в чате",
+    )
+
+    check_interval_seconds: float = Field(
+        default=3600.0, gt=0.0, description="Как часто фоновый воркер смотрит, есть ли работа"
+    )
+    self_initiated_probability: float = Field(
+        default=0.25, ge=0.0, le=1.0,
+        description="Вероятность затеять СВОЙ проект, когда очередь пуста (0 — только совместные)",
+    )
+    max_fix_iterations: int = Field(
+        default=3, ge=0, le=10,
+        description="Сколько раз возвращать файл кодеру с замечаниями песочницы, прежде чем сдаться",
+    )
+    progress_probability: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Вероятность рассказать в чате об очередном этапе работы (не чаще раза в час)",
+    )
+    lint_generated_code: bool = Field(
+        default=True, description="Гонять ruff по сгенерированному коду (если он установлен в системе)"
+    )
+
+    review_probability: float = Field(
+        default=0.3, ge=0.0, le=1.0,
+        description=(
+            "Вероятность перечитать один из своих старых проектов, когда новой работы нет "
+            "(0 — выключает возвращение к проектам совсем)"
+        ),
+    )
+    review_interval_days: float = Field(
+        default=7.0, gt=0.0,
+        description="Через сколько дней после последнего просмотра проект снова попадает в выборку",
+    )
+    patch_importance_threshold: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="С какой важности находка при перечитывании становится настоящей правкой с коммитом",
+    )
+    discuss_importance_threshold: float = Field(
+        default=0.8, ge=0.0, le=1.0,
+        description=(
+            "С какой важности она пишет владельцу вопрос по проекту. Высоко намеренно: модель находит, "
+            "что улучшить, всегда, и без порога это превратилось бы в еженедельные вопросы про "
+            "переименование переменных"
+        ),
+    )
+
+    swe_enabled: bool = Field(
+        default=True,
+        description=(
+            "Работа с существующим кодом: чужие репозитории по ссылке и свой код по просьбе в чате "
+            "(efi/dev/swe_engine.py). Действует только при dev.enabled"
+        ),
+    )
+    laptop: LaptopLinkSettings = Field(
+        default_factory=LaptopLinkSettings,
+        description="Ноутбук в домашней сети как тяжёлый ярус; пусто — берётся из OMNIROUTE_* в .env",
+    )
+    workspaces_dir: str = Field(
+        default="/tmp/workspaces",  # noqa: S108 — рабочие копии по определению временные
+        description="Где держать одноразовые рабочие копии репозиториев",
+    )
+    max_repair_rounds: int = Field(
+        default=4, ge=1, le=8,
+        description="Сколько кругов автопочинки по трейсбэкам до того, как признать, что не вышло",
+    )
+    max_parallel_model_calls: int = Field(
+        default=2, ge=1, le=8,
+        description="Потолок одновременных запросов к модели в SWE-конвейере — защита от 429",
+    )
+    keep_workspaces: bool = Field(
+        default=False,
+        description="Не удалять рабочие копии после задачи (для разбора руками; ест место в /tmp)",
+    )
+
+    github_token: SecretStr | None = Field(
+        default=None,
+        description="Personal access token с правом repo. Не задан — проекты остаются локальными",
+    )
+    github_owner: str = Field(
+        default="", description="Логин владельца токена; нужен только для повторного взятия существующего репозитория"
+    )
+    github_ssh_key_path: Path | None = Field(
+        default=None,
+        description=(
+            "Приватный SSH-ключ для пуша. Не задан — git возьмёт ключ по умолчанию из ~/.ssh, что в "
+            "общем окружении может оказаться ключом владельца, а не Эфи"
+        ),
+    )
+    repo_private: bool = Field(
+        default=False, description="Создавать репозитории приватными (по умолчанию — публичные: их и показывают)"
+    )
+    push_enabled: bool = Field(default=True, description="Выключает пуш, оставляя локальные репозитории")
+    workspace_dir_name: str = Field(
+        default="projects", description="Каталог с проектами внутри data_dir"
+    )
+
+    def workspace_dir(self, paths: PathsSettings) -> Path:
+        return paths.data_dir / self.workspace_dir_name
 
 
 class QuietHoursSettings(BaseModel):
@@ -1049,6 +1286,7 @@ class Settings(BaseSettings):
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
     quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
     community: CommunitySettings = Field(default_factory=CommunitySettings)
+    dev: DevSettings = Field(default_factory=DevSettings)
     dashboard: DashboardSettings = Field(default_factory=DashboardSettings)
 
     @classmethod
@@ -1158,6 +1396,43 @@ class Settings(BaseSettings):
                     return endpoint.api_key
         return None
 
+    def resolve_laptop_endpoint(self) -> EndpointConfig | None:
+        """
+        Эндпоинт ноутбука — или None, если его не настраивали.
+
+        Приоритет: явная секция `dev.laptop` в конфиге, иначе OMNIROUTE_* из
+        окружения. None здесь — совершенно нормальный режим: Эфи работает
+        облачным кодером ровно так же, как работала до появления ноутбука.
+        """
+        if self.dev.laptop.is_configured:
+            return self.dev.laptop.as_endpoint()
+        return LaptopLinkSettings.from_environment().as_endpoint()
+
+    def resolve_coder_endpoint(self) -> EndpointConfig | None:
+        """
+        Эндпоинт кодера для efi.dev.qwen_client.QwenCoderClient.
+
+        Приоритет тот же, что у ключа Groq для STT: явная секция `dev.coder`,
+        иначе — сборка из уже настроенного ключа Groq и `dev.coder_model`.
+        Дублировать один и тот же секрет в конфиге дважды не нужно.
+
+        None означает «кодер не настроен»: без него подсистема разработки
+        бессмысленна, и приложение просто её не поднимает (см. efi/app.py) —
+        это не ошибка конфигурации, а выключенная возможность.
+        """
+        if self.dev.coder is not None:
+            return self.dev.coder
+
+        api_key = self.resolve_groq_api_key()
+        if api_key is None:
+            return None
+        return EndpointConfig(
+            base_url=self.dev.coder_base_url,
+            api_key=api_key,
+            model=self.dev.coder_model,
+            timeout_seconds=self.dev.coder_timeout_seconds,
+        )
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
@@ -1199,6 +1474,7 @@ __all__ = [
     "LifeEngineSettings",
     "BusyEngineSettings",
     "CommunitySettings",
+    "DevSettings",
     "QuietHoursSettings",
     "DashboardSettings",
     "Settings",

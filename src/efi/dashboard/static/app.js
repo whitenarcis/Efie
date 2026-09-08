@@ -188,6 +188,7 @@
     diary: { kicker: 'Эфи · память', title: 'Дневник', live: false, load: renderDiary },
     memory: { kicker: 'Эфи · память', title: 'Накопленное', live: false, load: renderMemory },
     people: { kicker: 'Эфи · окружение', title: 'Знакомые люди', live: true, load: renderPeople },
+    projects: { kicker: 'Эфи · ремесло', title: 'Её проекты', live: true, load: renderProjects },
     chats: { kicker: 'Эфи · разговоры', title: 'Чаты и переписка', live: true, load: renderChats },
     llm: { kicker: 'Эфи · инференс', title: 'Модели и вызовы', live: true, load: renderLLM },
     prompts: { kicker: 'Эфи · основа', title: 'Основа личности', live: false, load: renderPrompts },
@@ -658,6 +659,88 @@
     return `
       ${hero(PAGES.people.kicker, PAGES.people.title, 'Эфи помнит людей отдельно от чатов: у каждого своя история и своё впечатление.')}
       ${rows(people, 'Она пока ни с кем не знакома')}`;
+  }
+
+  /*
+   * Раздел «Проекты» отвечает на единственный вопрос, который иначе
+   * проверяется только руками через GitHub: она правда что-то делает или
+   * только говорит, что делает. Отсюда и состав: статус, ссылка и число
+   * правок после релиза — именно правки отличают «сгенерировала репозиторий»
+   * от «возвращается к своему коду».
+   */
+  const PROJECT_STATUS_TAGS = {
+    pending: ['mute', 'в очереди'],
+    speccing: ['warn', 'продумывает'],
+    coding: ['warn', 'пишет код'],
+    publishing: ['warn', 'выкладывает'],
+    done: ['ok', 'готово'],
+    failed: ['err', 'не вышло'],
+  };
+
+  const projectStatusTag = (status) => {
+    const [kind, label] = PROJECT_STATUS_TAGS[status] || ['mute', status];
+    return `<span class="tag ${kind}">${esc(label)}</span>`;
+  };
+
+  async function renderProjects() {
+    const data = await api('/api/projects', { limit: 100 });
+    const stats = data.stats || {};
+    const projects = data.projects || [];
+
+    if (!data.enabled && !projects.length) {
+      return `
+        ${hero(PAGES.projects.kicker, PAGES.projects.title, 'Своё ремесло выключено: dev.enabled = false в конфигурации.')}
+        <div class="empty">Эфи не пишет проекты. Включите раздел [dev] в behavior.toml, чтобы она начала.</div>`;
+    }
+
+    const grid = [
+      cell('В работе', num(stats.in_work), 'проектов пишется прямо сейчас'),
+      cell('Выложено', num(stats.released), 'доведено до репозитория'),
+      cell('Правок после релиза', num(stats.revisions), 'возвращалась и меняла'),
+      cell('Не вышло', num(stats.failed), 'брошено на полпути'),
+      cell('Правок в чужом коде', num(stats.code_work), 'веток сдано по чужим репозиториям'),
+    ].join('');
+
+    const items = projects.map((project) => {
+      const tags = [
+        projectStatusTag(project.status),
+        project.kind === 'swe' ? '<span class="tag">чужой код</span>' : '',
+        project.is_collab ? '<span class="tag">вместе</span>' : '<span class="tag">своя затея</span>',
+        project.revisions ? `<span class="tag">правок ${esc(project.revisions)}</span>` : '',
+      ].join('');
+      const link = project.repo_url
+        ? `<a href="${esc(project.repo_url)}" target="_blank" rel="noreferrer noopener">${esc(project.repo_url)}</a>`
+        : '';
+      const stack = (project.stack || []).join(' · ');
+      const meta = [
+        stack ? esc(stack) : '',
+        project.source ? esc(project.source) : '',
+        project.branch ? `ветка ${esc(project.branch)}` : '',
+        project.reviewed_at ? `перечитывала ${esc(fmtAgo(project.reviewed_at))}` : 'ещё не перечитывала',
+        `обновлён ${esc(fmtAgo(project.updated_at))}`,
+      ].filter(Boolean).join(' · ');
+      const files = (project.files || [])
+        .map((file) => `<li><code>${esc(file.path)}</code>${file.purpose ? ` — ${esc(file.purpose)}` : ''}</li>`)
+        .join('');
+
+      return `
+        <article class="project">
+          <header class="project-head">
+            <h3>${esc(project.title)}</h3>
+            <div class="project-tags">${tags}</div>
+          </header>
+          ${project.problem && project.problem !== project.title ? `<p class="project-problem">${esc(project.problem)}</p>` : ''}
+          ${link ? `<p class="project-link">${link}</p>` : ''}
+          ${project.error ? `<p class="project-error">${esc(project.error)}</p>` : ''}
+          ${files ? `<ul class="project-files">${files}</ul>` : ''}
+          <p class="project-meta">${meta}</p>
+        </article>`;
+    });
+
+    return `
+      ${hero(PAGES.projects.kicker, PAGES.projects.title, 'Что она написала сама, что пишет сейчас и к чему возвращалась после релиза.')}
+      <div class="grid wide">${grid}</div>
+      ${items.length ? `<div class="projects">${items.join('')}</div>` : '<div class="empty">Проектов пока нет</div>'}`;
   }
 
   async function renderChats() {

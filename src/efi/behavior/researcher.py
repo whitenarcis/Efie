@@ -22,10 +22,12 @@ import json
 import logging
 import random
 from pathlib import Path
+from typing import Protocol
 
 import aiofiles
 
 from efi.config.schema import TaskRole
+from efi.dev.research_topics import ResearchQuestion
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
 from efi.llm.schemas import LLMParams, Message, Role, Session
@@ -65,6 +67,27 @@ _HYPOTHESIS_SYSTEM_PROMPT = (
     "мысль, которая у тебя реально возникла, пока ты гуглила от скуки."
 )
 
+#: То же самое, но когда искали по работе. Здесь нужна не мысль, а ответ:
+#: имя функции, флаг, порядок действий. Красивое рассуждение о предмете
+#: ничем не поможет тому, у кого падает импорт.
+_TECHNICAL_SYSTEM_PROMPT = (
+    "Тебе показаны результаты веб-поиска по конкретной технической проблеме, с которой ты сейчас "
+    "столкнулась в своём коде. Выпиши из них КОРОТКИЙ ПРАКТИЧЕСКИЙ вывод: что именно делать, какая "
+    "функция/флаг/параметр нужен, чего избегать. 1-3 предложения, конкретика вместо рассуждений: "
+    "имена, а не «стоит обратить внимание».\n"
+    "Если в выдаче ответа нет — так и напиши одной фразой, что решение не нашлось. Придумывать "
+    "несуществующие API категорически нельзя: это ровно тот случай, когда выдумка дороже незнания."
+)
+
+
+class WorkTopicSource(Protocol):
+    """
+    Откуда берутся вопросы из работы. Реализация —
+    efi.dev.research_topics.DevResearchTopics.
+    """
+
+    async def next_question(self) -> ResearchQuestion | None: ...
+
 
 class BackgroundResearcher:
     """
@@ -91,6 +114,7 @@ class BackgroundResearcher:
         check_interval_seconds: float = 2700.0,  # 45 минут
         research_probability: float = 0.25,
         hypothesis_role: TaskRole = TaskRole.BACKGROUND,
+        work_topics: WorkTopicSource | None = None,
     ) -> None:
         self._worldview_path = worldview_path
         self._web_search = web_search
@@ -100,6 +124,12 @@ class BackgroundResearcher:
         self._check_interval_seconds = check_interval_seconds
         self._research_probability = research_probability
         self._hypothesis_role = hypothesis_role
+        #: Вопросы из её собственной работы (efi/dev/research_topics.py).
+        #: Необязателен, но когда он есть — идёт первым: у запроса «почему у
+        #: меня падает вот это» есть адресат, а у случайного факта из
+        #: worldview.json адресата нет, и он честно лежит в дневнике
+        #: «использован 0 раз».
+        self._work_topics = work_topics
 
     async def run(self) -> None:
         """Основной цикл. Останавливается по отмене задачи (CancelledError) — см. efi/app.py graceful shutdown."""
@@ -125,9 +155,10 @@ class BackgroundResearcher:
         return thought
 
     async def _research_once(self) -> None:
-        topic = await self._pick_topic()
-        if topic is None:
+        question = await self._pick_question()
+        if question is None:
             return
+        topic = question.query
 
         # search(), а не execute(): нужен разбор причины, а не текст для
         # модели. Раньше здесь разбирался именно текст ответа («error:» или
@@ -142,14 +173,39 @@ class BackgroundResearcher:
             logger.info("researcher: search for %r returned no results, skipping", topic)
             return
 
-        hypothesis = await self._formulate_hypothesis(topic, outcome.render())
+        hypothesis = await self._formulate_hypothesis(topic, outcome.render(), question=question)
         if hypothesis is None:
             return
 
         entry = await self._rag.remember(hypothesis, confidence=_HYPOTHESIS_CONFIDENCE)
         if entry is not None:
             logger.info("researcher: incubated new hypothesis on %r -> diary entry %s", topic, entry.id)
+        if question.task_id:
+            # Найденное по работе — не «мысль на потом», а ответ по конкретной
+            # задаче. В инкубатор спонтанных пингов оно не идёт: рассказывать
+            # человеку про сигнатуру функции, потому что «просто вспомнилось»,
+            # — это не разговор.
+            logger.info("researcher: технический ответ по задаче #%s: %.120s", question.task_id, hypothesis)
+            return
         await self._facts.upsert(_INCUBATED_THOUGHT_ENTITY, _INCUBATED_THOUGHT_KEY, hypothesis)
+
+    async def _pick_question(self) -> ResearchQuestion | None:
+        """
+        О чём искать. Работа важнее любопытства: у вопроса «почему падает вот
+        это» есть адресат и сегодняшняя польза, у случайного факта — нет.
+        """
+        if self._work_topics is not None:
+            try:
+                question = await self._work_topics.next_question()
+            except Exception:
+                logger.warning("researcher: не удалось взять вопрос из работы", exc_info=True)
+                question = None
+            if question is not None:
+                logger.info("researcher: ищу по работе (%s): %s", question.reason, question.query)
+                return question
+
+        topic = await self._pick_topic()
+        return ResearchQuestion(query=topic, reason="просто любопытно") if topic else None
 
     async def _pick_topic(self) -> str | None:
         try:
@@ -171,9 +227,14 @@ class BackgroundResearcher:
             return None
         return random.choice(interests)
 
-    async def _formulate_hypothesis(self, topic: str, search_text: str) -> str | None:
+    async def _formulate_hypothesis(
+        self, topic: str, search_text: str, *, question: ResearchQuestion | None = None
+    ) -> str | None:
+        technical = question is not None and bool(question.task_id)
         params = LLMParams(
-            model="", system_prompt=_HYPOTHESIS_SYSTEM_PROMPT, max_output_tokens=_HYPOTHESIS_MAX_OUTPUT_TOKENS
+            model="",
+            system_prompt=_TECHNICAL_SYSTEM_PROMPT if technical else _HYPOTHESIS_SYSTEM_PROMPT,
+            max_output_tokens=_HYPOTHESIS_MAX_OUTPUT_TOKENS,
         )
         session = Session(messages=[Message(role=Role.USER, content=f"Тема: {topic}\n\n{search_text}")])
         try:
