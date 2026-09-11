@@ -1,0 +1,19 @@
+[telegram]
+api_id = 0
+api_hash = ""
+owner_id = 0
+allowed_chats = []
+community_chats = []
+lockdown_mode = "owner_only"
+check_chats_on_startup = true
+can_join_chats = false
+can_leave_chats = true
+
+[community]
+enabled = true
+comment_probability = 0.35
+min_delay_seconds = 300.0
+max_delay_seconds = 1800.0
+thread_scan_interval_seconds = 1800.0
+max_replies_per_thread = 1
+topic_match_min_score = 0.34

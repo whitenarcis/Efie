@@ -1,66 +1,9 @@
-"""
-efi/config/schema.py
-
-Типизированная конфигурация проекта на pydantic-settings.
-
-Приоритет источников (от высшего к низшему), как и в предыдущей реализации
-(config_loader.py): явные значения при создании объекта > переменные окружения
-(.env / os.environ, с префиксом ``EFI_`` и разделителем вложенности ``__``) >
-TOML-файл (``behavior.toml``) > значения по умолчанию, заданные в моделях ниже.
-
-Пример переопределения через переменные окружения:
-    EFI_TELEGRAM__API_HASH=xxx
-    EFI_LLM_ROLES__MAIN__PRIMARY__API_KEY=xxx
-    EFI_HUMANIZER__TYPING_WPM_MAX=160
-
-Пример секции TOML (``behavior.toml``):
-    [telegram]
-    api_id = 123456
-    owner_id = 625207005
-
-    # Основной провайдер инфраструктуры — OmniRoute; три роли (MAIN/FAST/VISION)
-    # покрывают задачи разной "тяжести", см. TaskRole/RoleRoute/LLMRolesSettings ниже.
-    [llm_roles.main]
-    degrade_to = "fast"
-
-    [llm_roles.main.primary]
-    base_url = "https://omni.thegoyhole.fun/v1"
-    api_key = "..."
-    model = "google/gemma-4-31b-it:free"
-
-    [llm_roles.main.fallback]
-    base_url = "https://api.groq.com/openai/v1"
-    api_key = "..."
-    model = "llama-3.1-8b-instant"
-
-    [llm_roles.fast.primary]
-    base_url = "https://api.groq.com/openai/v1"
-    api_key = "..."
-    model = "llama-3.1-8b-instant"
-
-    [llm_roles.vision.primary]
-    base_url = "https://omni.thegoyhole.fun/v1"
-    api_key = "..."
-    model = "qwen/qwen3.6-27b"
-
-    [humanizer]
-    typing_wpm_min = 120
-    typing_wpm_max = 150
-
-Примечание: для чтения TOML требуется пакет ``pydantic-settings[toml]``
-(на Python 3.11+ он использует стандартный ``tomllib`` под капотом).
-
-Загрузка конфигурации намеренно синхронна: чтение .env/TOML — одноразовая
-операция на старте процесса, до создания event loop, поэтому async здесь не
-даёт выигрыша и только усложнил бы инициализацию.
-"""
-
 from __future__ import annotations
 
 import ipaddress
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
@@ -75,81 +18,74 @@ from pydantic_settings import (
 )
 
 if TYPE_CHECKING:
-    # Только для тайп-чекера — реальный импорт делается лениво внутри build_router(),
-    # чтобы не создавать цикл: efi.llm.router импортирует типы из этого модуля.
     from efi.llm.router import LLMRouter
 
-# Корень пакета: .../efi/efi/config/schema.py -> .../efi/efi -> .../efi (корень репозитория)
-_PACKAGE_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT = _PACKAGE_ROOT.parent
-_DEFAULT_TOML_PATH = PROJECT_ROOT / "behavior.toml"
+_CONFIG_DIR = Path(__file__).resolve().parent
+_PACKAGE_ROOT = _CONFIG_DIR.parent
+_SRC_ROOT = _PACKAGE_ROOT.parent
+PROJECT_ROOT = _SRC_ROOT.parent
+DEFAULT_CONFIG_DIR = _SRC_ROOT / "config"
 
-#: По этой подстроке в base_url эндпоинта опознаётся Groq — чтобы переиспользовать
-#: уже настроенный ключ для STT вместо дублирования секрета (Settings.resolve_groq_api_key).
 _GROQ_HOST_MARKER = "api.groq.com"
-
-# Маркеры внешнего хранилища Android, которое Termux иногда монтирует в режиме,
-# не поддерживающем sqlite journal/WAL-файлы (известная проблема: readonly database).
 _TERMUX_READONLY_MARKERS = ("/sdcard", "/mnt/sdcard", "/storage/emulated")
 
 
 class ConfigurationError(RuntimeError):
-    """
-    Конфигурация синтаксически корректна, но не заполнена до рабочего
-    состояния: остались плейсхолдеры из behavior.toml (нулевой api_id,
-    пустой api_hash/api_key/base_url/model).
-
-    Отдельный тип, а не pydantic.ValidationError: с точки зрения схемы
-    `api_id = 0` и `api_key = ""` — валидные значения нужных типов, поэтому
-    поймать их можно только отдельной проверкой «готовности к запуску».
-    Без неё незаполненный конфиг проявлялся не на старте, а глубоко внутри
-    сторонних библиотек: Pyrogram падал на авторизации с нулевым api_id, а
-    httpx — на запросе к пустому base_url, и связать это с конфигом по
-    трейсбеку было нечем.
-    """
+    pass
 
 
 def _termux_safe_path(path: Path) -> Path:
-    """Переносит файл во внутреннее хранилище Termux, если путь указывает на /sdcard и т.п."""
     if any(marker in str(path) for marker in _TERMUX_READONLY_MARKERS):
         return Path.home() / ".efi_data" / path.name
     return path
 
 
-class Environment(StrEnum):
-    """Окружение исполнения — влияет на уровень логирования, отладочные тулы и т.п."""
+def _positive_float(raw: str | None, *, default: float) -> float:
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
+
+def _is_loopback_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if not normalized:
+        return False
+    if normalized == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def _is_public_host(host: str) -> bool:
+    normalized = host.strip().strip("[]").lower()
+    if not normalized or normalized in {"0.0.0.0", "::", "localhost"}:
+        return False
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return True
+    return bool(address.is_global)
+
+
+class Environment(StrEnum):
     DEVELOPMENT = "development"
     PRODUCTION = "production"
 
 
 class LockdownMode(StrEnum):
-    """
-    Режим доступа к личности Эфи, аналог Config::LockdownMode из референса.
-
-    NONE           — публичный режим, отвечает в любом чате.
-    CONTACTS_ONLY  — отвечает только контактам аккаунта.
-    OWNER_ONLY     — отвечает только владельцу (папику); максимально закрытый режим.
-    """
-
     NONE = "none"
     CONTACTS_ONLY = "contacts_only"
     OWNER_ONLY = "owner_only"
 
 
 class PathsSettings(BaseModel):
-    """
-    Системные пути проекта.
-
-    Каталоги (``data_dir``, ``diary_dir`` и т.п.) — вычисляемые свойства
-    относительно ``base_dir``, а не хранимые поля: это исключает рассинхронизацию
-    между «где лежит база» и «где лежит дневник», если кто-то поменяет только
-    один путь через .env.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    base_dir: Path = Field(default=PROJECT_ROOT, description="Корень проекта")
+    base_dir: Path = Field(default=PROJECT_ROOT)
 
     data_dir_name: str = "data"
     diary_dir_name: str = "diary"
@@ -204,7 +140,6 @@ class PathsSettings(BaseModel):
         return self.data_dir / self.selfie_filename
 
     def ensure_directories(self) -> None:
-        """Создаёт все необходимые директории. Вызывается один раз при старте приложения."""
         for directory in (self.data_dir, self.diary_dir, self.cache_dir, self.logs_dir):
             directory.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -212,34 +147,17 @@ class PathsSettings(BaseModel):
 
 
 class TelegramSettings(BaseModel):
-    """Параметры подключения Pyrogram (userbot-режим, MTProto)."""
-
     model_config = ConfigDict(frozen=True)
 
-    api_id: int = Field(..., description="Telegram API ID, my.telegram.org")
-    api_hash: SecretStr = Field(..., description="Telegram API hash, my.telegram.org")
-    phone_number: SecretStr | None = Field(
-        default=None, description="Нужен только при первой интерактивной авторизации"
-    )
+    api_id: int
+    api_hash: SecretStr
+    phone_number: SecretStr | None = None
 
-    owner_id: int = Field(..., description="Telegram ID владельца — единственный безусловно доверенный собеседник")
-    owner_display_name: str | None = Field(
-        default=None,
-        description="Как обращаться к владельцу в личности (подстановка {user_name} в personality.md). "
-        "Если не задано — берётся Telegram-имя отправителя, когда он владелец, либо общее 'создатель'.",
-    )
-    allowed_chats: list[int] = Field(default_factory=list, description="Явный allowlist чатов помимо владельца")
-    community_chats: list[int] = Field(
-        default_factory=list,
-        description=(
-            "Каналы/группы обсуждений, где Эфи участвует как обычный участник сообщества (комментарии, "
-            "треды, ответы на упоминания). ЯВНЫЙ opt-in: только эти чаты обходят lockdown_mode — всё "
-            "остальное он по-прежнему закрывает. Пустой список = Эфи остаётся персональным ботом."
-        ),
-    )
-    chat_labels: dict[int, str] = Field(
-        default_factory=dict, description="Человекочитаемые метки чатов для контекста LLM"
-    )
+    owner_id: int
+    owner_display_name: str | None = None
+    allowed_chats: list[int] = Field(default_factory=list)
+    community_chats: list[int] = Field(default_factory=list)
+    chat_labels: dict[int, str] = Field(default_factory=dict)
 
     lockdown_mode: LockdownMode = LockdownMode.OWNER_ONLY
     check_chats_on_startup: bool = True
@@ -248,14 +166,6 @@ class TelegramSettings(BaseModel):
 
 
 class EndpointConfig(BaseModel):
-    """
-    Конфигурация одного LLM-эндпоинта: базовый URL + ключ + модель + таймаут.
-
-    Прямой аналог связки Endpoint/EndpointAndModel из C++-референса — все
-    параметры подключения к конкретному провайдеру инкапсулированы в одном
-    объекте, который целиком передаётся в llm/providers/*.
-    """
-
     model_config = ConfigDict(frozen=True)
 
     base_url: str
@@ -265,67 +175,24 @@ class EndpointConfig(BaseModel):
 
 
 class GroqSettings(EndpointConfig):
-    """
-    Groq — быстрый провайдер для роутинга интентов и суммаризации.
-    Не используется для генерации ответов от лица личности Эфи.
-    """
-
     base_url: str = "https://api.groq.com/openai/v1"
     model: str = "llama-3.1-8b-instant"
 
 
 class OmniRouteSettings(EndpointConfig):
-    """
-    OmniRoute — самохостируемый прокси на VPS, ротирующий аккаунты OpenRouter.
-    Основной канал инференса личности Эфи.
-    """
-
     base_url: str = "https://omni.thegoyhole.fun/v1"
     model: str = "google/gemma-4-31b-it:free"
 
 
 class TaskRole(StrEnum):
-    """
-    Роль задачи, под которую подбирается модель.
-
-    РЕГЛАМЕНТ РОЛЕЙ (строгий — не смешивать):
-        MAIN       — ТОЛЬКО живой диалог в чате. Единственная роль на
-                     критическом пути ответа собеседнику, поэтому под неё
-                     ставится самая БЫСТРАЯ пригодная модель, а не самая
-                     "умная": человек ждёт ответа в реальном времени.
-        FAST       — быстрые служебные вызовы вне критического пути
-                     (эмбеддинги-фолбэк, короткая классификация).
-        BACKGROUND — фоновая жизнь Эфи: новеллизация дневника, извлечение
-                     фактов, гипотезы фоновых исследований, находки
-                     BackgroundLifeWorker, проактивные проверки. Никто не
-                     ждёт этих ответов в чате, поэтому здесь допустимы
-                     большие таймауты и более медленные модели.
-        VISION     — отдельная мультимодальная модель: описание картинок,
-                     транскрипция голосовых/видео-кружков.
-    """
-
-    #: Живой диалог в чате — и больше ничего (см. регламент выше).
     MAIN = "main"
-    #: Быстрые служебные вызовы вне критического пути ответа.
     FAST = "fast"
-    #: Фоновая жизнь: дневник, факты, исследования, проактивные проверки.
     BACKGROUND = "background"
-    #: Мультимодальная модель: картинки, голосовые, видео-кружки.
     VISION = "vision"
+    CODER = "coder"
 
 
 class RoleRoute(BaseModel):
-    """
-    Маршрутизация одной роли: основной эндпоинт, необязательный резервный
-    эндпоинт того же уровня и необязательная деградация на другую роль.
-
-    Порядок перебора кандидатов при сбое (см. efi.llm.router.LLMRouter):
-    `primary` -> `fallback` -> (рекурсивно) кандидаты роли `degrade_to`.
-    Например, для MAIN можно задать `fallback` — Groq, на случай 429/5xx у
-    основной модели, и `degrade_to=TaskRole.FAST` — как крайний случай, если
-    недоступны и primary, и fallback.
-    """
-
     model_config = ConfigDict(frozen=True)
 
     primary: EndpointConfig
@@ -334,62 +201,27 @@ class RoleRoute(BaseModel):
 
 
 class LLMRolesSettings(BaseModel):
-    """
-    Конфигурация всех ролей LLM разом — единая точка входа для сборки LLMRouter.
-    Разделение задач по ролям — см. регламент в докстринге `TaskRole`.
-
-    Типичная схема при основном провайдере OmniRoute:
-        main.primary       -> самая БЫСТРАЯ пригодная модель (живой диалог)
-        main.fallback      -> запасная модель на случай 429/5xx/таймаута
-        main.degrade_to    -> TaskRole.FAST, как крайний случай
-        fast.primary       -> быстрая служебная модель
-        background.primary -> модель фоновой жизни (дневник/факты/исследования)
-        vision.primary     -> мультимодальная модель
-
-    ОБЯЗАТЕЛЕН ТОЛЬКО `main`. Остальные роли, если не заданы, используют его
-    маршрут: FAST и VISION — напрямую, BACKGROUND — через FAST.
-
-    Так сделано ради первого запуска. Раньше схема требовала заполнить main,
-    fast и vision, а шаблон конфига объявлял ещё и main.fallback с
-    background — итого восемнадцать обязательных полей, из которых
-    пятнадцать про LLM. Человек, у которого есть один бесплатный ключ и
-    желание попробовать, упирался в стену раньше, чем видел хоть одно
-    сообщение. При этом ничто в архитектуре не требовало разных эндпоинтов:
-    регламент ролей — про то, КТО какой канал занимает, а не про то, сколько
-    у владельца ключей.
-
-    Регламент от этого не размывается: фоновые потребители по-прежнему
-    просят именно BACKGROUND и физически не могут занять канал живого
-    диалога. Просто по умолчанию все каналы ведут в одну модель — а разнести
-    их по разным можно тогда, когда в этом появится смысл.
-    """
-
     model_config = ConfigDict(frozen=True)
 
     main: RoleRoute
     fast: RoleRoute | None = None
     vision: RoleRoute | None = None
     background: RoleRoute | None = None
+    coder: RoleRoute | None = None
 
     def as_routes(self) -> dict[TaskRole, RoleRoute]:
-        """Приводит конфигурацию к виду, который принимает конструктор `LLMRouter`."""
         fast = self.fast if self.fast is not None else self.main
-        return {
+        routes = {
             TaskRole.MAIN: self.main,
             TaskRole.FAST: fast,
             TaskRole.BACKGROUND: self.background if self.background is not None else fast,
             TaskRole.VISION: self.vision if self.vision is not None else self.main,
         }
+        if self.coder is not None:
+            routes[TaskRole.CODER] = self.coder
+        return routes
 
     def describe_fallbacks(self) -> list[str]:
-        """
-        Роли, которые пойдут в чужую модель, — человеческим языком для лога
-        при старте.
-
-        Молча подставить main вместо vision нельзя: текстовая модель на
-        фотографию ответит ошибкой или выдумкой, и владелец должен узнать об
-        этом при запуске, а не когда ему пришлют картинку.
-        """
         notes: list[str] = []
         if self.fast is None:
             notes.append("FAST не задана — служебные вызовы пойдут в модель MAIN")
@@ -400,140 +232,47 @@ class LLMRolesSettings(BaseModel):
             )
         if self.vision is None:
             notes.append(
-                "VISION не задана — фотографии пойдут в модель MAIN; если она не "
-                "мультимодальная, разбор изображений работать не будет"
+                "VISION не задана — фотографии пойдут в модель MAIN; если она не мультимодальная, разбор изображений работать не будет"
             )
+        if self.coder is None:
+            notes.append("CODER не задана — кодогенерация использует резервный эндпоинт")
         return notes
 
     def build_router(self, **router_kwargs: Any) -> LLMRouter:
-        """
-        Собирает `LLMRouter` из текущей конфигурации ролей.
-
-        Импорт `LLMRouter` — намеренно локальный (внутри метода), а не на
-        уровне модуля: `efi.llm.router` зависит от типов, определённых здесь
-        (`EndpointConfig`, `TaskRole`, `RoleRoute`), поэтому импорт в обратную
-        сторону на уровне модуля создал бы цикл. `router_kwargs` пробрасываются
-        в конструктор `LLMRouter` как есть (например, `default_cooldown_seconds=`).
-        """
         from efi.llm.router import LLMRouter
 
         return LLMRouter(self.as_routes(), **router_kwargs)
 
 
 class HumanizerSettings(BaseModel):
-    """
-    Параметры «очеловечивания» вывода — прямой ответ на главную цель проекта:
-    сделать диалог и поведение Эфи неотличимыми от реального человека.
-
-    Объединяет симуляцию набора текста, генерацию опечаток и защиту от
-    самоповторов (аналог util/typos.h и полей typingSimulation*/antiRepeat*
-    из config.h референсного проекта).
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    # --- Симуляция набора текста ---
-    typing_wpm_min: int = Field(default=120, gt=0, description="Минимальная скорость набора, слов/мин")
-    typing_wpm_max: int = Field(default=150, gt=0, description="Максимальная скорость набора, слов/мин")
-    typing_thinking_pause_min_seconds: float = Field(
-        default=1.0, ge=0.0, description="Пауза «осмысления» перед набором"
-    )
+    typing_wpm_min: int = Field(default=120, gt=0)
+    typing_wpm_max: int = Field(default=150, gt=0)
+    typing_thinking_pause_min_seconds: float = Field(default=1.0, ge=0.0)
     typing_thinking_pause_max_seconds: float = Field(default=2.2, ge=0.0)
-    typing_delay_min_seconds: float = Field(default=1.8, ge=0.0, description="Нижний предел суммарной задержки ответа")
-    typing_delay_max_seconds: float = Field(default=7.0, gt=0.0, description="Верхний предел суммарной задержки ответа")
+    typing_delay_min_seconds: float = Field(default=1.8, ge=0.0)
+    typing_delay_max_seconds: float = Field(default=7.0, gt=0.0)
 
-    # --- Опечатки ---
-    typo_probability: float = Field(
-        default=0.04, ge=0.0, le=1.0,
-        description="Шанс алгоритмической опечатки на кусок сообщения (пропуск/сосед по клавише/перестановка "
-        "соседних букв — см. efi/humanizer/typos.py); рекомендованный диапазон 3-5%",
-    )
-    typo_min_text_length: int = Field(default=10, ge=0, description="Не портим опечаткой слишком короткие сообщения")
-    typo_self_correct_probability: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="Из тех сообщений, где случилась опечатка, доля тех, что она сама 'замечает' и исправляет "
-        "через edit_message спустя короткую паузу — как реальный человек. Остальные остаются неисправленными "
-        "(реальные люди тоже не всегда себя вычитывают).",
-    )
-    keyboard_neighbors: dict[str, list[str]] = Field(
-        default_factory=dict,
-        description="Раскладка соседних клавиш (RU/EN) для правдоподобных опечаток; заполняется из behavior.toml",
-    )
+    typo_probability: float = Field(default=0.04, ge=0.0, le=1.0)
+    typo_min_text_length: int = Field(default=10, ge=0)
+    typo_self_correct_probability: float = Field(default=0.5, ge=0.0, le=1.0)
+    keyboard_neighbors: dict[str, list[str]] = Field(default_factory=dict)
 
-    # --- Защита от самоповторов ---
-    anti_repeat_trigger_max: float = Field(
-        default=0.95, ge=0.0, le=1.0, description="Порог схожести с любым из последних N сообщений"
-    )
-    anti_repeat_trigger_avg: float = Field(
-        default=0.85, ge=0.0, le=1.0, description="Порог средней схожести с последними N сообщениями"
-    )
-    anti_repeat_max_history: int = Field(default=32, ge=1, description="Глубина истории для проверки на повторы")
+    anti_repeat_trigger_max: float = Field(default=0.95, ge=0.0, le=1.0)
+    anti_repeat_trigger_avg: float = Field(default=0.85, ge=0.0, le=1.0)
+    anti_repeat_max_history: int = Field(default=32, ge=1)
 
-    # --- Разбивка ответа на несколько сообщений ---
-    max_messages_per_burst: int = Field(
-        default=12, ge=1,
-        description=(
-            "АВАРИЙНЫЙ потолок сообщений в серии, а не нормальная длина ответа. Раньше стоял на 5 и "
-            "работал как настоящий лимит: «поток мыслей» из 8 коротких реплик схлопывался в 5, где "
-            "последнее было слипшимся комом из остатка. Сколько бабблов уместно, решает модель по "
-            "правилам системного промпта; здесь — только защита от явно неадекватной разметки."
-        ),
-    )
-    max_reply_chars_per_turn: int = Field(
-        default=700, ge=120,
-        description=(
-            "Потолок на ВЕСЬ ответ за один ход, в символах. Не стилистика, а защита от простыни: "
-            "модель, которой есть что сказать, выдаёт полторы тысячи символов подряд — и это уже не "
-            "переписка, а лекция в чате. Лишние бабблы отбрасываются целиком (обрывать мысль на "
-            "полуслове хуже), первый — подрезается по последнему законченному предложению"
-        ),
-    )
-    short_bubble_delay_min_seconds: float = Field(
-        default=0.3, ge=0.0,
-        description=(
-            "Нижняя граница паузы перед коротышом (1-3 слова). Обычный расчёт по WPM прибавляет паузу "
-            "«на подумать» и зажат снизу typing_delay_min_seconds, из-за чего «а ты?» уходило через "
-            "две секунды, а серия коротких реплик растягивалась на полминуты."
-        ),
-    )
-    short_bubble_delay_max_seconds: float = Field(
-        default=0.8, gt=0.0, description="Верхняя граница той же паузы — серия должна читаться как быстрая печать"
-    )
+    max_messages_per_burst: int = Field(default=12, ge=1)
+    max_reply_chars_per_turn: int = Field(default=700, ge=120)
+    short_bubble_delay_min_seconds: float = Field(default=0.3, ge=0.0)
+    short_bubble_delay_max_seconds: float = Field(default=0.8, gt=0.0)
 
-    # --- Сборка быстрых сообщений собеседника в одну пачку: плавающее окно
-    # плюс живой статус "печатает" (efi/telegram/buffer.py + typing_tracker.py) ---
-    debounce_window_min_seconds: float = Field(
-        default=1.5, ge=0.0,
-        description=(
-            "Нижняя граница плавающего окна сборки. Каждое новое сообщение сдвигает окно вперёд, "
-            "поэтому пачка коротких реплик подряд («найду романтику» / «и пох» / «пошел есть») уходит "
-            "в LLM одним входом. Раньше окна не было вовсе: буфер держался ровно столько, сколько "
-            "горел статус «печатает», а между двумя короткими репликами он успевает погаснуть — и "
-            "Эфи запускала генерацию на первую строчку."
-        ),
-    )
-    debounce_window_max_seconds: float = Field(
-        default=2.5, gt=0.0,
-        description="Верхняя граница того же окна — дольше человек не готов ждать реакции на одиночное сообщение",
-    )
-    debounce_typing_poll_interval_seconds: float = Field(
-        default=0.3, gt=0.0,
-        description="Как часто перепроверять статус 'печатает', пока он активен",
-    )
-    debounce_typing_ttl_seconds: float = Field(
-        default=6.0, gt=0.0,
-        description=(
-            "Сколько секунд без нового сигнала считать статус 'печатает' ещё актуальным (Telegram обновляет его "
-            "каждые ~5-6с)"
-        ),
-    )
-    debounce_max_wait_seconds: float = Field(
-        default=15.0, gt=0.0,
-        description=(
-            "Жёсткий потолок ожидания от первого сообщения пачки — не даёт активному собеседнику бесконечно "
-            "откладывать ответ"
-        ),
-    )
+    debounce_window_min_seconds: float = Field(default=1.5, ge=0.0)
+    debounce_window_max_seconds: float = Field(default=2.5, gt=0.0)
+    debounce_typing_poll_interval_seconds: float = Field(default=0.3, gt=0.0)
+    debounce_typing_ttl_seconds: float = Field(default=6.0, gt=0.0)
+    debounce_max_wait_seconds: float = Field(default=15.0, gt=0.0)
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> HumanizerSettings:
@@ -550,7 +289,6 @@ class HumanizerSettings(BaseModel):
         return self
 
     def characters_per_second_range(self) -> tuple[float, float]:
-        """Переводит WPM в диапазон символов/сек (1 «слово» ≈ 5 символов — стандартная метрика WPM)."""
         chars_per_word = 5.0
         return (
             self.typing_wpm_min * chars_per_word / 60.0,
@@ -559,156 +297,36 @@ class HumanizerSettings(BaseModel):
 
 
 class MemorySettings(BaseModel):
-    """
-    Параметры подсистемы памяти (efi/memory/) — пороги дневника и лимиты RAG-поиска.
-    Аналоги diaryPlagiarismThreshold/diaryMinRelatedness из референса.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    diary_dir: Path | None = Field(
-        default=None,
-        description="Переопределяет paths.diary_dir, если задано; иначе используется вычисляемый путь из PathsSettings",
-    )
-    plagiarism_threshold: float = Field(
-        default=0.97,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Порог relatedness, выше которого новая запись дневника считается дублем существующей "
-            "(diaryPlagiarismThreshold)"
-        ),
-    )
-    min_relatedness: float = Field(
-        default=0.80,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Нижний порог relatedness для результатов RAG-поиска (diaryMinRelatedness); ниже — запись не считается "
-            "релевантной"
-        ),
-    )
-    max_rag_results: int = Field(
-        default=10, ge=1, description="Максимум записей, возвращаемых RAG-поиском за один запрос"
-    )
-    history_limit: int = Field(
-        default=30, ge=1,
-        description="Сколько последних сообщений диалога подмешивать в каждый запрос к LLM (Worker.history_limit). "
-        "Больше — лучше короткая память в активном разговоре, но и больше риск упереться в TPM-лимиты "
-        "узких бесплатных тиров (см. Worker._chat_with_size_retry, который подрезает историю при 413).",
-    )
-    novelization_lookback_days: int = Field(
-        default=1, ge=1,
-        description=(
-            "На сколько дней назад заглядывать при первой ночной новеллизации чата, если для него ещё нет отметки "
-            "'докуда уже новеллизировано'"
-        ),
-    )
-    novelization_min_messages: int = Field(
-        default=3, ge=1,
-        description=(
-            "Минимум новых сообщений в чате с прошлой новеллизации, чтобы вообще запускать по нему "
-            "извлечение памяти. Раньше стояло 6, и чат, где за сутки прошёл короткий, но "
-            "содержательный обмен из 4-5 реплик, не попадал в дневник НИКОГДА: порог не набирался, "
-            "а на следующий день окно уже уезжало вперёд."
-        ),
-    )
-    novelization_char_limit: int = Field(
-        default=10_000, ge=1,
-        description=(
-            "Сколько символов недавней переписки максимум передавать LLM за один запрос новеллизации "
-            "(DiaryConsolidator._extract_memories). Раньше стояло 2000 — активный день переписки обрубался "
-            "почти сразу, в дневник попадало только начало дня; см. novelization_max_output_tokens."
-        ),
-    )
-    novelization_max_output_tokens: int = Field(
-        default=4096, ge=1,
-        description=(
-            "Лимит токенов вывода при извлечении воспоминаний из переписки — дневник должен быть точным и "
-            "подробным на этом шаге; сжатие уже сохранённых старых записей (summarize_stale_entries) — "
-            "отдельная, намеренно более скупая операция, срабатывающая много позже (older_than). "
-            "Раньше стояло 2048: по-русски это примерно ОДНА подробная запись (кириллица у бесплатных "
-            "токенизаторов дороже английского в 2-3 раза), и дневник наполнялся обрывками. Если обрывы "
-            "всё равно случаются, ответ дописывается вторым запросом — см. DiaryConsolidator._extract_memories."
-        ),
-    )
-    use_local_embeddings: bool = Field(
-        default=True,
-        description=(
-            "Использовать локальный embedding-движок (fastembed/ONNX) как основной источник эмбеддингов вместо "
-            "облачного LLMRouter"
-        ),
-    )
-    local_embedding_model: str = Field(
-        default="intfloat/multilingual-e5-large",
-        description="Имя модели fastembed для локальных эмбеддингов (см. efi/memory/local_embeddings.py)",
-    )
+    diary_dir: Path | None = None
+    plagiarism_threshold: float = Field(default=0.97, ge=0.0, le=1.0)
+    min_relatedness: float = Field(default=0.80, ge=0.0, le=1.0)
+    max_rag_results: int = Field(default=10, ge=1)
+    history_limit: int = Field(default=30, ge=1)
+    novelization_lookback_days: int = Field(default=1, ge=1)
+    novelization_min_messages: int = Field(default=3, ge=1)
+    novelization_char_limit: int = Field(default=10_000, ge=1)
+    novelization_max_output_tokens: int = Field(default=4096, ge=1)
+    use_local_embeddings: bool = True
+    local_embedding_model: str = "intfloat/multilingual-e5-large"
 
     def resolve_diary_dir(self, paths: PathsSettings) -> Path:
-        """Возвращает diary_dir с учётом переопределения — используется при сборке Diary в app.py."""
         return self.diary_dir if self.diary_dir is not None else paths.diary_dir
 
 
 class MemoryPulseSettings(BaseModel):
-    """
-    Параметры пульса памяти (efi.memory.pulse.MemoryPulse) — насколько часто
-    прожитое превращается в воспоминания.
-
-    До появления пульса это происходило ровно один раз в сутки, ночью, и
-    день переписки до 03:30 не был памятью вообще (см. докстринг
-    efi/memory/pulse.py). Дефолты подобраны так, чтобы эпизод осмыслялся
-    вскоре после того, как разговор закончился, но LLM-вызов не уходил на
-    каждую пару реплик живого диалога.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    enabled: bool = Field(
-        default=True,
-        description="Выключает частую новеллизацию, оставляя только ночной проход (поведение до появления пульса)",
-    )
-    check_interval_seconds: float = Field(
-        default=600.0, gt=0.0, description="Как часто проверять, не завершился ли где-то разговорный эпизод"
-    )
-    episode_idle_seconds: float = Field(
-        default=900.0, gt=0.0,
-        description=(
-            "Сколько тишины в чате означает, что эпизод закончился и его пора запоминать. Человек "
-            "запоминает разговор не по часам, а когда общение закончилось — отсюда и критерий."
-        ),
-    )
-    max_messages_before_flush: int = Field(
-        default=30, ge=2,
-        description=(
-            "Сколько сообщений может накопиться с прошлого разбора, прежде чем эпизод разбирается "
-            "принудительно, не дожидаясь паузы — иначе марафонская переписка снова свернулась бы "
-            "в один обрубленный кусок."
-        ),
-    )
-    min_messages: int = Field(
-        default=3, ge=1,
-        description=(
-            "Минимум сообщений в эпизоде, чтобы вообще звать LLM. Ниже, чем у ночного прохода "
-            "(memory.novelization_min_messages): короткий, но содержательный обмен репликами — "
-            "это тоже прожитый эпизод, а не пустяк."
-        ),
-    )
-    lookback_hours: int = Field(
-        default=12, ge=1,
-        description="На сколько часов назад заглядывать в чате, для которого ещё нет отметки 'докуда новеллизировано'",
-    )
+    enabled: bool = True
+    check_interval_seconds: float = Field(default=600.0, gt=0.0)
+    episode_idle_seconds: float = Field(default=900.0, gt=0.0)
+    max_messages_before_flush: int = Field(default=30, ge=2)
+    min_messages: int = Field(default=3, ge=1)
+    lookback_hours: int = Field(default=12, ge=1)
 
 
 class StateVectorSettings(BaseModel):
-    """
-    Параметры динамического блока текущего состояния личности в системном
-    промпте (efi.prompts.builder._build_state_vector_block). mood и
-    social_distance считаются на лету из efi.memory.beliefs.BeliefStore и
-    efi.behavior.affinity.AffinityTracker — здесь настраивается только текст
-    жёсткой инструкции подавления угодливости, который остаётся неизменным
-    вне зависимости от конкретного mood/social_distance.
-    """
-
     model_config = ConfigDict(frozen=True)
 
     sycophancy_protection_text: str = Field(
@@ -717,107 +335,38 @@ class StateVectorSettings(BaseModel):
             "подстраивать мнение под его ожидания. Если ты не согласна — так и скажи, спокойно и "
             "по-доброму, но не отступая от сути. Мгновенная капитуляция без новых веских аргументов — "
             "провал характера, а не вежливость; спорить при этом надо ради истины, а не ради победы."
-        ),
-        description="Жёсткая инструкция подавления угодливости — попадает в блок текущего состояния промпта",
+        )
     )
-    relevant_beliefs_limit: int = Field(
-        default=3, ge=1, description="Сколько релевантных убеждений максимум подмешивать в блок состояния"
-    )
+    relevant_beliefs_limit: int = Field(default=3, ge=1)
 
 
 class SttSettings(BaseModel):
-    """
-    Настройки распознавания речи.
-
-    `groq_api_key` — необязательное поле-ПЕРЕОПРЕДЕЛЕНИЕ. Обычно задавать его
-    не нужно: ключ Groq, как правило, уже прописан в behavior.toml как
-    api_key одного из LLM-эндпоинтов (роль VISION часто и есть Groq), и
-    дублировать один и тот же секрет во второй раз — лишний источник
-    расхождений (поменял в одном месте, забыл в другом → STT молча
-    перестал работать). Settings.resolve_groq_api_key() сначала смотрит
-    сюда, а если пусто — сам находит ключ среди уже настроенных
-    LLM-эндпоинтов, указывающих на api.groq.com.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    groq_api_key: SecretStr | None = Field(
-        default=None,
-        description=(
-            "Явное переопределение ключа Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT, "
-            "whisper-large-v3). Обычно не нужно — ключ подхватывается из llm_roles, см. resolve_groq_api_key()"
-        ),
-    )
+    groq_api_key: SecretStr | None = None
 
 
 class LifeEngineSettings(BaseModel):
-    """
-    Параметры движка фоновой автономии (efi.behavior.life_engine.BackgroundLifeWorker):
-    как часто проверять семена любопытства (efi.behavior.curiosity.CuriosityTracker)
-    и с какого веса находка считается достаточно важной, чтобы Эфи сама
-    написала о ней (efi.behavior.organic_ping.OrganicPingGenerator).
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    check_interval_seconds: float = Field(
-        default=1800.0, gt=0.0, description="Как часто проверять pending-семена любопытства (раз в N минут)"
-    )
-    ping_importance_threshold: float = Field(
-        default=0.6, ge=0.0, le=1.0,
-        description="Минимальный вес семени, при котором находка достаточно важна для органического пинга",
-    )
+    check_interval_seconds: float = Field(default=1800.0, gt=0.0)
+    ping_importance_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
 
 
 class BusyEngineSettings(BaseModel):
-    """
-    Параметры симуляции занятости (efi.behavior.busy_engine.BusyEngine):
-    диапазон базовой задержки перед тем, как Worker вообще "заметит"
-    уведомление, плюс поправки на то, что Эфи занята фоновым исследованием
-    (efi.behavior.life_engine.BackgroundLifeWorker.is_researching), устала
-    (WorkingMemorySnapshot.energy) или отвечает близкому человеку
-    (efi.behavior.affinity.AffinityTracker).
-
-    Дефолты намеренно скромные: эта задержка встаёт ДО обращения к LLM (см.
-    efi/notifications/worker.py), а сама LLM (особенно при деградации между
-    несколькими кандидатами роли — efi/llm/router.py) уже может занять
-    десятки секунд. Заметная "занятость" не должна складываться с и без того
-    небыстрым ответом провайдера в минуты ожидания.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    base_delay_min_seconds: float = Field(default=1.0, ge=0.0, description="Нижняя граница базовой ignore_delay")
-    base_delay_max_seconds: float = Field(default=8.0, gt=0.0, description="Верхняя граница базовой ignore_delay")
-    research_busy_multiplier: float = Field(
-        default=1.5, gt=1.0,
-        description="Во сколько раз растягивается верхняя граница базовой задержки, пока идёт фоновое исследование",
-    )
-    low_energy_extra_seconds: float = Field(
-        default=10.0, ge=0.0, description="Максимальная добавка к задержке при энергии, стремящейся к 0"
-    )
-    high_affinity_discount_seconds: float = Field(
-        default=5.0, ge=0.0, description="Максимальная скидка с задержки при близости/уважении, стремящихся к 1"
-    )
-    min_delay_seconds: float = Field(default=0.5, ge=0.0, description="Нижний потолок итоговой ignore_delay")
-    max_delay_seconds: float = Field(default=25.0, gt=0.0, description="Верхний потолок итоговой ignore_delay")
+    base_delay_min_seconds: float = Field(default=1.0, ge=0.0)
+    base_delay_max_seconds: float = Field(default=8.0, gt=0.0)
+    research_busy_multiplier: float = Field(default=1.5, gt=1.0)
+    low_energy_extra_seconds: float = Field(default=10.0, ge=0.0)
+    high_affinity_discount_seconds: float = Field(default=5.0, ge=0.0)
+    min_delay_seconds: float = Field(default=0.5, ge=0.0)
+    max_delay_seconds: float = Field(default=25.0, gt=0.0)
 
-    active_conversation_window_seconds: float = Field(
-        default=300.0, ge=0.0,
-        description=(
-            "Если в чате уже было сообщение (в любую сторону) не позже, чем это число секунд назад — "
-            "разговор считается 'активным', и Эфи не 'уходит и возвращается' на каждую реплику: полная "
-            "ignore_delay применяется только к ПЕРВОМУ сообщению после паузы, не к каждому подряд."
-        ),
-    )
-    active_conversation_delay_min_seconds: float = Field(
-        default=0.2, ge=0.0,
-        description="Нижняя граница крошечной задержки-реакции внутри активного разговора — не занятость, а живой темп",
-    )
-    active_conversation_delay_max_seconds: float = Field(
-        default=1.5, ge=0.0,
-        description="Верхняя граница крошечной задержки-реакции внутри активного разговора",
-    )
+    active_conversation_window_seconds: float = Field(default=300.0, ge=0.0)
+    active_conversation_delay_min_seconds: float = Field(default=0.2, ge=0.0)
+    active_conversation_delay_max_seconds: float = Field(default=1.5, ge=0.0)
 
     @model_validator(mode="after")
     def _validate_ranges(self) -> BusyEngineSettings:
@@ -833,40 +382,15 @@ class BusyEngineSettings(BaseModel):
 
 
 class CommunitySettings(BaseModel):
-    """
-    Параметры участия Эфи в жизни сообщества (efi.telegram.comments):
-    комментарии под постами и выборочное включение в треды обсуждений.
-
-    Сами чаты перечисляются в `telegram.community_chats` — здесь только
-    ПОВЕДЕНИЕ: насколько охотно вписываться и с какой задержкой. Дефолты
-    намеренно сдержанные: участник сообщества, который комментирует каждый
-    пост, — это спамер, а не участник.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    enabled: bool = Field(default=True, description="Полностью выключает комментирование, не трогая community_chats")
-    comment_probability: float = Field(
-        default=0.35, ge=0.0, le=1.0,
-        description="Вероятность вписаться в подходящий по теме пост (тема уже совпала — это ещё и «в настроении ли»)",
-    )
-    min_delay_seconds: float = Field(
-        default=300.0, ge=0.0,
-        description="Нижняя граница задержки перед комментарием: живой человек не отвечает на пост в ту же секунду",
-    )
-    max_delay_seconds: float = Field(
-        default=1800.0, gt=0.0, description="Верхняя граница той же задержки (по умолчанию 30 минут)"
-    )
-    thread_scan_interval_seconds: float = Field(
-        default=1800.0, gt=0.0, description="Как часто RandomCommentEngager заглядывает в треды"
-    )
-    max_replies_per_thread: int = Field(
-        default=1, ge=1, description="Сколько комментариев Эфи оставляет в одном треде за заход"
-    )
-    topic_match_min_score: float = Field(
-        default=0.34, ge=0.0, le=1.0,
-        description="Минимальная доля пересечения слов поста с интересами/семенами любопытства",
-    )
+    enabled: bool = True
+    comment_probability: float = Field(default=0.35, ge=0.0, le=1.0)
+    min_delay_seconds: float = Field(default=300.0, ge=0.0)
+    max_delay_seconds: float = Field(default=1800.0, gt=0.0)
+    thread_scan_interval_seconds: float = Field(default=1800.0, gt=0.0)
+    max_replies_per_thread: int = Field(default=1, ge=1)
+    topic_match_min_score: float = Field(default=0.34, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def _validate_delay_range(self) -> CommunitySettings:
@@ -876,52 +400,19 @@ class CommunitySettings(BaseModel):
 
 
 class LaptopLinkSettings(BaseModel):
-    """
-    Ноутбук в домашней сети как тяжёлый ярус вычислений (efi/llm/network_router.py).
-
-    Смысл в одном: пока телефон в той же Wi-Fi, думать можно моделью, которой
-    у телефона нет и быть не может, — и стоит это ноль. Ушли из дома, ноутбук
-    уснул — Эфи прозрачно возвращается к облачному кодеру, без единого
-    «сервис недоступен».
-
-    Настраивается прямо в .env, без префикса EFI_ (так короче, а адрес
-    ноутбука меняется чаще всего остального):
-
-        OMNIROUTE_URL=http://192.168.0.109:8080/v1
-        OMNIROUTE_MODEL=claude-3-5-sonnet
-        OMNIROUTE_API_KEY=любая-строка-если-сервер-её-спрашивает
-
-    Имя OMNIROUTE здесь историческое — так называется связка «сервер, который
-    отдаёт OpenAI-совместимый API». С OmniRouteSettings (облачный прокси на
-    VPS) это разные вещи и разные адреса; путать их нельзя, поэтому и ключи
-    конфигурации разные.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    url: str = Field(default="", description="База OpenAI-совместимого API на ноутбуке")
-    model: str = Field(default="", description="Имя модели, которую ноутбук отдаёт")
-    api_key: SecretStr = Field(
-        default=SecretStr("local"), description="Ключ, если локальный сервер его спрашивает"
-    )
-    timeout_seconds: float = Field(
-        default=180.0, gt=0.0,
-        description="Таймаут запроса к ноутбуку: сильная модель на CPU думает долго, и это нормально",
-    )
-    health_timeout_seconds: float = Field(
-        default=0.6, gt=0.0, le=5.0,
-        description=(
-            "Бюджет проверки живости. Больше — и проверка сама становится задержкой: ноутбук в "
-            "локальной сети отвечает за миллисекунды, а если не ответил за полсекунды, его нет"
-        ),
-    )
+    url: str = ""
+    model: str = ""
+    api_key: SecretStr = Field(default=SecretStr("local"))
+    timeout_seconds: float = Field(default=180.0, gt=0.0)
+    health_timeout_seconds: float = Field(default=0.6, gt=0.0, le=5.0)
 
     @property
     def is_configured(self) -> bool:
         return bool(self.url.strip() and self.model.strip())
 
     def as_endpoint(self) -> EndpointConfig | None:
-        """Настройки в форме обычного эндпоинта — или None, если ноутбук не настроен."""
         if not self.is_configured:
             return None
         return EndpointConfig(
@@ -933,14 +424,6 @@ class LaptopLinkSettings(BaseModel):
 
     @classmethod
     def from_environment(cls, environ: Mapping[str, str] | None = None) -> LaptopLinkSettings:
-        """
-        Читает OMNIROUTE_* из окружения.
-
-        Отдельно от pydantic-settings намеренно: эти переменные живут без
-        общего префикса EFI_ и без вложенности, потому что их правят чаще
-        всего остального — руками, в .env, когда роутер выдал ноутбуку другой
-        адрес.
-        """
         source = environ if environ is not None else os.environ
         raw_key = source.get("OMNIROUTE_API_KEY", "").strip()
         return cls(
@@ -951,222 +434,62 @@ class LaptopLinkSettings(BaseModel):
         )
 
 
-def _positive_float(raw: str | None, *, default: float) -> float:
-    """Число из переменной окружения; мусор трактуется как «не задано»."""
-    try:
-        value = float(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
 class DevSettings(BaseModel):
-    """
-    Цифровое ремесло Эфи (efi/dev/): собственные проекты, кодогенерация через
-    Qwen Coder и публикация на GitHub.
-
-    ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ, и это не осторожность ради осторожности:
-    подсистема создаёт публичные репозитории от имени владельца токена и
-    пушит туда код, написанный языковой моделью. Такое не включают молча
-    обновлением версии — только явным решением.
-
-    Ключ кодера отдельно можно не задавать: если `coder` не заполнен, он
-    собирается из уже настроенного ключа Groq (тот же приём, что у
-    SttSettings — см. Settings.resolve_coder_endpoint).
-
-    Без `github_token` подсистема работает в локальном режиме: проекты
-    пишутся, проверяются и коммитятся на диск, но никуда не уезжают. Режим
-    рабочий — по нему удобно посмотреть, что она вообще генерирует, прежде
-    чем давать ей доступ к своему GitHub.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    enabled: bool = Field(default=False, description="Полностью включает подсистему разработки")
-    coder: EndpointConfig | None = Field(
-        default=None,
-        description=(
-            "Эндпоинт кодера (Qwen Coder через Groq). Не задан — берётся ключ Groq из llm_roles и "
-            "модель coder_model, см. Settings.resolve_coder_endpoint()"
-        ),
-    )
-    coder_model: str = Field(
-        default="qwen-2.5-coder-32b",
-        description="Модель кодера, когда эндпоинт собирается автоматически из ключа Groq",
-    )
-    coder_base_url: str = Field(
-        default="https://api.groq.com/openai/v1", description="База API кодера при автосборке эндпоинта"
-    )
-    coder_timeout_seconds: float = Field(
-        default=90.0, gt=0.0,
-        description="Таймаут одного запроса к кодеру: файл целиком генерируется дольше реплики в чате",
-    )
+    enabled: bool = False
+    coder: EndpointConfig | None = None
+    coder_model: str = "qwen-2.5-coder-32b"
+    coder_base_url: str = "https://api.groq.com/openai/v1"
+    coder_timeout_seconds: float = Field(default=90.0, gt=0.0)
 
-    check_interval_seconds: float = Field(
-        default=3600.0, gt=0.0, description="Как часто фоновый воркер смотрит, есть ли работа"
-    )
-    self_initiated_probability: float = Field(
-        default=0.25, ge=0.0, le=1.0,
-        description="Вероятность затеять СВОЙ проект, когда очередь пуста (0 — только совместные)",
-    )
-    max_fix_iterations: int = Field(
-        default=3, ge=0, le=10,
-        description="Сколько раз возвращать файл кодеру с замечаниями песочницы, прежде чем сдаться",
-    )
-    progress_probability: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="Вероятность рассказать в чате об очередном этапе работы (не чаще раза в час)",
-    )
-    lint_generated_code: bool = Field(
-        default=True, description="Гонять ruff по сгенерированному коду (если он установлен в системе)"
-    )
+    check_interval_seconds: float = Field(default=3600.0, gt=0.0)
+    self_initiated_probability: float = Field(default=0.25, ge=0.0, le=1.0)
+    max_fix_iterations: int = Field(default=3, ge=0, le=10)
+    progress_probability: float = Field(default=0.5, ge=0.0, le=1.0)
+    lint_generated_code: bool = True
 
-    review_probability: float = Field(
-        default=0.3, ge=0.0, le=1.0,
-        description=(
-            "Вероятность перечитать один из своих старых проектов, когда новой работы нет "
-            "(0 — выключает возвращение к проектам совсем)"
-        ),
-    )
-    review_interval_days: float = Field(
-        default=7.0, gt=0.0,
-        description="Через сколько дней после последнего просмотра проект снова попадает в выборку",
-    )
-    patch_importance_threshold: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="С какой важности находка при перечитывании становится настоящей правкой с коммитом",
-    )
-    discuss_importance_threshold: float = Field(
-        default=0.8, ge=0.0, le=1.0,
-        description=(
-            "С какой важности она пишет владельцу вопрос по проекту. Высоко намеренно: модель находит, "
-            "что улучшить, всегда, и без порога это превратилось бы в еженедельные вопросы про "
-            "переименование переменных"
-        ),
-    )
+    review_probability: float = Field(default=0.3, ge=0.0, le=1.0)
+    review_interval_days: float = Field(default=7.0, gt=0.0)
+    patch_importance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    discuss_importance_threshold: float = Field(default=0.8, ge=0.0, le=1.0)
 
-    swe_enabled: bool = Field(
-        default=True,
-        description=(
-            "Работа с существующим кодом: чужие репозитории по ссылке и свой код по просьбе в чате "
-            "(efi/dev/swe_engine.py). Действует только при dev.enabled"
-        ),
-    )
-    laptop: LaptopLinkSettings = Field(
-        default_factory=LaptopLinkSettings,
-        description="Ноутбук в домашней сети как тяжёлый ярус; пусто — берётся из OMNIROUTE_* в .env",
-    )
-    workspaces_dir: str = Field(
-        default="/tmp/workspaces",  # noqa: S108 — рабочие копии по определению временные
-        description="Где держать одноразовые рабочие копии репозиториев",
-    )
-    max_repair_rounds: int = Field(
-        default=4, ge=1, le=8,
-        description="Сколько кругов автопочинки по трейсбэкам до того, как признать, что не вышло",
-    )
-    max_parallel_model_calls: int = Field(
-        default=2, ge=1, le=8,
-        description="Потолок одновременных запросов к модели в SWE-конвейере — защита от 429",
-    )
-    keep_workspaces: bool = Field(
-        default=False,
-        description="Не удалять рабочие копии после задачи (для разбора руками; ест место в /tmp)",
-    )
+    swe_enabled: bool = True
+    laptop: LaptopLinkSettings = Field(default_factory=LaptopLinkSettings)
+    workspaces_dir: str = "/tmp/workspaces"
+    max_repair_rounds: int = Field(default=4, ge=1, le=8)
+    max_parallel_model_calls: int = Field(default=2, ge=1, le=8)
+    keep_workspaces: bool = False
 
-    github_token: SecretStr | None = Field(
-        default=None,
-        description="Personal access token с правом repo. Не задан — проекты остаются локальными",
-    )
-    github_owner: str = Field(
-        default="", description="Логин владельца токена; нужен только для повторного взятия существующего репозитория"
-    )
-    github_ssh_key_path: Path | None = Field(
-        default=None,
-        description=(
-            "Приватный SSH-ключ для пуша. Не задан — git возьмёт ключ по умолчанию из ~/.ssh, что в "
-            "общем окружении может оказаться ключом владельца, а не Эфи"
-        ),
-    )
-    repo_private: bool = Field(
-        default=False, description="Создавать репозитории приватными (по умолчанию — публичные: их и показывают)"
-    )
-    push_enabled: bool = Field(default=True, description="Выключает пуш, оставляя локальные репозитории")
-    workspace_dir_name: str = Field(
-        default="projects", description="Каталог с проектами внутри data_dir"
-    )
+    github_token: SecretStr | None = None
+    github_owner: str = ""
+    github_ssh_key_path: Path | None = None
+    repo_private: bool = False
+    push_enabled: bool = True
+    workspace_dir_name: str = "projects"
 
     def workspace_dir(self, paths: PathsSettings) -> Path:
         return paths.data_dir / self.workspace_dir_name
 
 
 class QuietHoursSettings(BaseModel):
-    """
-    Ночные "тихие часы" для проактивных путей (efi.behavior.spontaneous_ping,
-    efi.behavior.organic_ping, efi.behavior.silence_monitor) — окно, в
-    котором Эфи не пишет первой сама. НЕ блокирует ответ на входящее
-    сообщение пользователя: если собеседник написал сам, Эфи всё равно
-    отвечает, независимо от часа.
-
-    Без этого раньше проактивные сервисы будили собеседника пингами в 5 и 7
-    утра наравне с днём — ни один из них не смотрел на время суток вообще.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    enabled: bool = Field(default=True)
-    start_hour: int = Field(default=23, ge=0, le=23, description="Час начала тихих часов (локальное время сервера)")
-    end_hour: int = Field(default=8, ge=0, le=23, description="Час окончания тихих часов (локальное время сервера)")
+    enabled: bool = True
+    start_hour: int = Field(default=23, ge=0, le=23)
+    end_hour: int = Field(default=8, ge=0, le=23)
 
 
 class DashboardSettings(BaseModel):
-    """
-    Веб-дашборд (efi/dashboard/): подробные логи, состояние подсистем,
-    дневник и вся накопленная память в браузере.
-
-    По умолчанию слушает ВСЕ интерфейсы (`0.0.0.0`): смысл дашборда в том,
-    чтобы смотреть на Эфи, которая крутится в Termux на телефоне, с ноутбука
-    в той же сети — а на самом телефоне открывать браузер поверх работающего
-    userbot'а неудобно и незачем. Ограничить его одной машиной по-прежнему
-    можно, поставив `host = "127.0.0.1"`.
-
-    Дашборд показывает переписку, дневник и профили людей, поэтому при выходе
-    за петлевой интерфейс он ТРЕБУЕТ токен, если сеть не выглядит домашней
-    (см. валидатор ниже): в локальной сети за роутером его можно не заводить,
-    а вот на машине с публичным адресом — обязательно.
-    """
-
     model_config = ConfigDict(frozen=True)
 
-    enabled: bool = Field(default=True, description="Поднимать ли дашборд вместе с приложением")
-    host: str = Field(
-        default="0.0.0.0",  # noqa: S104 — осознанно: см. докстринг класса и валидатор ниже
-        description=(
-            "Интерфейс, который слушает дашборд. 0.0.0.0 — доступен с других устройств локальной сети "
-            "(http://<ip-машины>:8765/), 127.0.0.1 — только с самой машины"
-        ),
-    )
-    port: int = Field(default=8765, ge=0, le=65535, description="Порт дашборда (0 — выбрать свободный, для тестов)")
-    token: SecretStr | None = Field(
-        default=None,
-        description=(
-            "Токен доступа. Не обязателен в домашней сети (localhost или частный адрес), обязателен, если "
-            "дашборд слушает публично маршрутизируемый адрес. Принимается заголовком X-Efi-Token, cookie "
-            "или ?token=... в ссылке"
-        ),
-    )
-    log_buffer_size: int = Field(
-        default=2000, ge=100, le=100_000, description="Сколько последних записей лога держать в памяти для ленты"
-    )
-    log_level: str = Field(
-        default="INFO",
-        description=(
-            "Минимальный уровень записей, попадающих в ленту дашборда. DEBUG показывает решения буфера, "
-            "оркестратора и роутера — полезно при отладке, но лента растёт быстро"
-        ),
-    )
-    metrics_history: int = Field(
-        default=200, ge=10, le=5000, description="Сколько последних LLM-вызовов держать в ленте метрик"
-    )
+    enabled: bool = True
+    host: str = "0.0.0.0"
+    port: int = Field(default=8765, ge=0, le=65535)
+    token: SecretStr | None = None
+    log_buffer_size: int = Field(default=2000, ge=100, le=100_000)
+    log_level: str = "INFO"
+    metrics_history: int = Field(default=200, ge=10, le=5000)
 
     @model_validator(mode="after")
     def _validate_exposure(self) -> DashboardSettings:
@@ -1176,10 +499,7 @@ class DashboardSettings(BaseModel):
             raise ValueError(f"dashboard.log_level: неизвестный уровень логирования {self.log_level!r}")
         if self.token is None and _is_public_host(self.host):
             raise ValueError(
-                f"dashboard.host = {self.host!r} — это публично маршрутизируемый адрес, а dashboard.token "
-                "не задан. Дашборд отдаёт дневник, историю переписки и профили людей, поэтому наружу он "
-                'без токена не поднимается. Задайте EFI_DASHBOARD__TOKEN, либо оставьте host = "0.0.0.0" '
-                "(доступ только из локальной сети, если машина не смотрит в интернет напрямую)."
+                f"dashboard.host = {self.host!r} — публичный адрес, а dashboard.token не задан."
             )
         return self
 
@@ -1189,66 +509,89 @@ class DashboardSettings(BaseModel):
 
     @property
     def is_local_only(self) -> bool:
-        """Доступен ли дашборд только с самой машины (тогда про токен можно вообще не думать)."""
         return _is_loopback_host(self.host)
 
 
-def _is_loopback_host(host: str) -> bool:
-    """Петлевой ли это адрес — то есть слышен ли дашборд только с самой машины."""
-    normalized = host.strip().strip("[]").lower()
-    if not normalized:
-        return False  # пустой host в asyncio означает «все интерфейсы»
-    if normalized == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(normalized).is_loopback
-    except ValueError:
-        return False
+KNOWN_CONFIG_FILES: tuple[str, ...] = (
+    "behavour.toml",
+    "behavior.toml",
+    "telegram.toml",
+    "llm.toml",
+    "dashboard.toml",
+    "experemental.toml",
+    "experimental.toml",
+)
 
 
-def _is_public_host(host: str) -> bool:
-    """
-    Смотрит ли этот адрес в интернет.
+def _collect_toml_files(config_dir: Path) -> list[Path]:
+    if not config_dir.is_dir():
+        return []
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for name in KNOWN_CONFIG_FILES:
+        p = config_dir / name
+        if p.is_file():
+            resolved = p.resolve()
+            if resolved not in seen:
+                files.append(p)
+                seen.add(resolved)
+    for p in sorted(config_dir.glob("*.toml")):
+        resolved = p.resolve()
+        if resolved not in seen:
+            files.append(p)
+            seen.add(resolved)
+    return files
 
-    Различение нужно, чтобы не мешать основному сценарию: Эфи живёт в Termux
-    на телефоне, а дашборд открывают с ноутбука в той же сети — требовать в
-    этом случае токен значит требовать его всегда, потому что без `0.0.0.0`
-    другое устройство не подключится вовсе.
 
-    `0.0.0.0` / пустая строка (все интерфейсы) публичным адресом НЕ считаются:
-    какие адреса за ними стоят, зависит от машины, и на домашнем телефоне за
-    NAT это ровно локальная сеть. А вот явно прописанный внешний адрес —
-    осознанное решение выставить дашборд в интернет, и вот там токен нужен.
-    """
-    normalized = host.strip().strip("[]").lower()
-    if not normalized or normalized in {"0.0.0.0", "::", "localhost"}:  # noqa: S104 — сравнение, а не bind
-        return False
-    try:
-        address = ipaddress.ip_address(normalized)
-    except ValueError:
-        # Доменное имя: куда оно резолвится, здесь не проверить, а
-        # предполагать лучшее для чужого адреса не стоит.
-        return True
-    # is_global — ровно нужный вопрос «маршрутизируется ли этот адрес в
-    # интернете»: он уже учитывает и петлю, и частные диапазоны, и
-    # link-local, и зарезервированные сети, а не только 10/172.16/192.168.
-    return bool(address.is_global)
+class ModularTomlSettingsSource(TomlConfigSettingsSource):
+    def __init__(
+        self,
+        settings_cls: type[BaseSettings],
+        toml_files: Sequence[Path | str] | None = None,
+    ) -> None:
+        self.toml_files = [Path(p) for p in toml_files] if toml_files else []
+        super().__init__(settings_cls, toml_file=self.toml_files[0] if len(self.toml_files) == 1 else None)
+
+    def _read_file(self, file_path: Path) -> dict[str, Any]:
+        if not file_path.is_file():
+            return {}
+        try:
+            return super()._read_file(file_path)
+        except Exception:
+            try:
+                import tomllib
+            except ImportError:
+                import tomli as tomllib  # type: ignore[no-redef]
+            try:
+                with file_path.open("rb") as f:
+                    return tomllib.load(f)
+            except Exception:
+                return {}
+
+    @staticmethod
+    def _deep_update(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
+        for k, v in update.items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                base[k] = ModularTomlSettingsSource._deep_update(base[k], v)
+            else:
+                base[k] = v
+        return base
+
+    def __call__(self) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for file_path in self.toml_files:
+            file_data = self._read_file(file_path)
+            if isinstance(file_data, dict):
+                data = self._deep_update(data, file_data)
+        return data
 
 
 class Settings(BaseSettings):
-    """
-    Корневой объект конфигурации приложения.
-
-    Инстанцировать напрямую обычно не нужно — используйте `get_settings()`,
-    которая кэширует единственный экземпляр на процесс.
-    """
-
     model_config = SettingsConfigDict(
         env_prefix="EFI_",
         env_nested_delimiter="__",
         env_file=".env",
         env_file_encoding="utf-8",
-        toml_file=str(_DEFAULT_TOML_PATH),
         case_sensitive=False,
         extra="ignore",
         frozen=True,
@@ -1257,22 +600,8 @@ class Settings(BaseSettings):
     environment: Environment = Environment.PRODUCTION
     debug: bool = False
     character_name: str = "Эфи"
-    personality_prompt: str = Field(
-        default="",
-        description=(
-            "Базовое описание личности персонажа для системного промпта (секция [character]/personality_prompt в "
-            "behavior.toml)"
-        ),
-    )
-
-    timezone: str = Field(
-        default="",
-        description=(
-            "Часовой пояс Эфи в формате IANA (например Europe/Moscow). По нему считаются тихие часы и блок "
-            "[Время] в системном промпте. Пусто — брать пояс системы; задавайте явно, если процесс может "
-            "стартовать без TZ (proot, cron, VPS), иначе Эфи будет считать четыре утра полуднем"
-        ),
-    )
+    personality_prompt: str = ""
+    timezone: str = ""
 
     paths: PathsSettings = Field(default_factory=PathsSettings)
     telegram: TelegramSettings
@@ -1298,29 +627,32 @@ class Settings(BaseSettings):
         dotenv_settings: PydanticBaseSettingsSource,
         file_secret_settings: PydanticBaseSettingsSource,
     ) -> tuple[PydanticBaseSettingsSource, ...]:
-        # Порядок — от высшего приоритета к низшему: init > env > .env > TOML > file secrets.
-        toml_path = Path(os.environ.get("EFI_CONFIG_TOML", str(_DEFAULT_TOML_PATH)))
+        env_toml = os.environ.get("EFI_CONFIG_TOML")
+        env_dir = os.environ.get("EFI_CONFIG_DIR")
+        if env_toml:
+            p = Path(env_toml)
+            toml_files = _collect_toml_files(p) if p.is_dir() else ([p] if p.is_file() else [])
+        elif env_dir:
+            toml_files = _collect_toml_files(Path(env_dir))
+        else:
+            toml_files = _collect_toml_files(DEFAULT_CONFIG_DIR)
+            if not toml_files:
+                legacy = PROJECT_ROOT / "behavior.toml"
+                if legacy.is_file():
+                    toml_files = [legacy]
+
         return (
             init_settings,
             env_settings,
             dotenv_settings,
-            TomlConfigSettingsSource(settings_cls, toml_file=toml_path),
+            ModularTomlSettingsSource(settings_cls, toml_files=toml_files),
             file_secret_settings,
         )
 
     def ensure_directories(self) -> None:
-        """Идемпотентно создаёт всю файловую структуру данных приложения."""
         self.paths.ensure_directories()
 
     def unfilled_placeholders(self) -> list[str]:
-        """
-        Поля, оставшиеся плейсхолдерами из шаблонного behavior.toml, в виде
-        путей вида ``telegram.api_id`` / ``llm_roles.main.primary.api_key``.
-
-        Пустой список = конфиг заполнен и запускаться можно. Ничего не
-        бросает: вызывающая сторона (`validate_ready`, тесты, будущая
-        диагностическая команда) сама решает, что делать с находками.
-        """
         problems: list[str] = []
 
         if self.telegram.api_id <= 0:
@@ -1330,14 +662,12 @@ class Settings(BaseSettings):
         if self.telegram.owner_id <= 0:
             problems.append("telegram.owner_id")
 
-        # Роли, а не as_routes(): BACKGROUND без своей секции переиспользует
-        # маршрут FAST, и жаловаться на него отдельно значило бы требовать
-        # заполнить секцию, которой в конфиге сознательно нет.
         declared_routes = {
             "main": self.llm_roles.main,
             "fast": self.llm_roles.fast,
             "vision": self.llm_roles.vision,
             "background": self.llm_roles.background,
+            "coder": self.llm_roles.coder,
         }
         for role_name, route in declared_routes.items():
             if route is None:
@@ -1356,10 +686,6 @@ class Settings(BaseSettings):
         return problems
 
     def validate_ready(self) -> None:
-        """
-        Бросает `ConfigurationError`, если конфиг ещё не заполнен — см.
-        докстринг того исключения про то, почему схемы для этого мало.
-        """
         problems = self.unfilled_placeholders()
         if not problems:
             return
@@ -1367,26 +693,12 @@ class Settings(BaseSettings):
             "конфигурация не заполнена — осталось "
             f"{len(problems)} незаполненное(ых) поле(й):\n  - "
             + "\n  - ".join(problems)
-            + f"\n\nЗаполните их в {_DEFAULT_TOML_PATH.name} (в корне проекта) либо задайте "
-            "переменными окружения EFI_* (например, EFI_TELEGRAM__API_ID=12345, "
-            "EFI_LLM_ROLES__MAIN__PRIMARY__API_KEY=sk-...). Секреты надёжнее держать "
-            "в переменных окружения: behavior.toml отслеживается git'ом."
         )
 
     def build_router(self, **router_kwargs: Any) -> LLMRouter:
-        """Шорткат: `settings.build_router()` эквивалентно `settings.llm_roles.build_router()`."""
         return self.llm_roles.build_router(**router_kwargs)
 
     def resolve_groq_api_key(self) -> SecretStr | None:
-        """
-        Ключ Groq для прямой транскрипции (efi.media.stt_groq.GroqSTT).
-
-        Приоритет: явное переопределение `stt.groq_api_key`, иначе — первый
-        ключ среди уже настроенных LLM-эндпоинтов, чей base_url указывает на
-        Groq. Так один и тот же секрет не нужно дублировать в конфиге дважды
-        (см. докстринг SttSettings): достаточно того, что он уже прописан
-        как api_key нужного эндпоинта в llm_roles.
-        """
         if self.stt.groq_api_key is not None:
             return self.stt.groq_api_key
 
@@ -1397,29 +709,14 @@ class Settings(BaseSettings):
         return None
 
     def resolve_laptop_endpoint(self) -> EndpointConfig | None:
-        """
-        Эндпоинт ноутбука — или None, если его не настраивали.
-
-        Приоритет: явная секция `dev.laptop` в конфиге, иначе OMNIROUTE_* из
-        окружения. None здесь — совершенно нормальный режим: Эфи работает
-        облачным кодером ровно так же, как работала до появления ноутбука.
-        """
         if self.dev.laptop.is_configured:
             return self.dev.laptop.as_endpoint()
         return LaptopLinkSettings.from_environment().as_endpoint()
 
     def resolve_coder_endpoint(self) -> EndpointConfig | None:
-        """
-        Эндпоинт кодера для efi.dev.qwen_client.QwenCoderClient.
+        if self.llm_roles.coder is not None:
+            return self.llm_roles.coder.primary
 
-        Приоритет тот же, что у ключа Groq для STT: явная секция `dev.coder`,
-        иначе — сборка из уже настроенного ключа Groq и `dev.coder_model`.
-        Дублировать один и тот же секрет в конфиге дважды не нужно.
-
-        None означает «кодер не настроен»: без него подсистема разработки
-        бессмысленна, и приложение просто её не поднимает (см. efi/app.py) —
-        это не ошибка конфигурации, а выключенная возможность.
-        """
         if self.dev.coder is not None:
             return self.dev.coder
 
@@ -1436,18 +733,6 @@ class Settings(BaseSettings):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """
-    Синглтон-фабрика конфигурации.
-
-    Кэшируется на процесс: конфигурация читается один раз при первом вызове
-    и переиспользуется всеми модулями (llm/, memory/, telegram/, dashboard/).
-    Для тестов с другой конфигурацией используйте ``get_settings.cache_clear()``.
-
-    Готовность конфига проверяется здесь же (`validate_ready`) — до создания
-    каталогов и задолго до первого сетевого вызова: незаполненный шаблон
-    должен останавливать запуск внятной ошибкой, а не проявляться позже
-    падением внутри Pyrogram или httpx.
-    """
     settings = Settings()
     settings.validate_ready()
     settings.ensure_directories()

@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+src/behavior.toml
+.gitignore
+data/
+src/logs/
+.idea
+src/config/

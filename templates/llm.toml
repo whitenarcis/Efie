@@ -1,0 +1,41 @@
+[llm_roles.main]
+degrade_to = "fast"
+
+[llm_roles.main.primary]
+base_url = "http://localhost:20128/v1"
+api_key = ""
+model = "ollamacloud/gemma4:31b"
+timeout_seconds = 15.0
+
+[llm_roles.main.fallback]
+base_url = "http://localhost:20128/v1"
+api_key = ""
+model = "ollamacloud/nemotron-3-super"
+timeout_seconds = 15.0
+
+[llm_roles.fast.primary]
+base_url = "http://localhost:20128/v1"
+api_key = ""
+model = "ollamacloud/gpt-oss:20b"
+timeout_seconds = 15.0
+
+[llm_roles.background.primary]
+base_url = "http://localhost:20128/v1"
+api_key = ""
+model = "ollamacloud/gpt-oss:20b"
+timeout_seconds = 45.0
+
+[llm_roles.vision.primary]
+base_url = "http://localhost:20128/v1"
+api_key = ""
+model = "qwen/qwen3.6-27b"
+timeout_seconds = 60.0
+
+[llm_roles.coder]
+degrade_to = "fast"
+
+[llm_roles.coder.primary]
+base_url = "http://localhost:20128/v1"
+api_key = ""
+model = "siliconflow/zai-org/GLM-4.7"
+timeout_seconds = 90.0
