@@ -904,29 +904,15 @@ cd Efie
 python3 -m venv .venv
 .venv/bin/pip install -e ".[dev,local-embeddings]"
 ```
-#### Отредактируйте значения для Telegram в behavior.toml
+#### Мастер установки
 ```bash
-nano src/behavior.toml
+python src/scripts/setup.py
 ```
-<img width="830" height="272" alt="image" src="https://github.com/user-attachments/assets/0ff4a847-2151-4b3d-9a72-2b86c5426856" />
-
-#### Отредактируйте значения API ключей для LLM в behavior.toml
-```bash
-nano src/behavior.toml
-```
-<img width="790" height="775" alt="image" src="https://github.com/user-attachments/assets/72929b59-7d3f-47bc-9aae-eb904aa04106" />
 
 #### Запуск
+```bash
+efie
 ```
-.venv/bin/python src/scripts/run.py --log-level INFO
-```
-
-Конфиг читается строго из `behavior.toml` в корне проекта. Секреты лучше
-держать не в нём, а в `.env` или переменных окружения `EFI_*` — см.
-[Конфигурация](#конфигурация).
-
-При первом запуске Pyrogram спросит номер телефона и код подтверждения.
-Сессия сохранится в `data/efi_session.session` — второй раз не спросит.
 
 ### Windows
 
