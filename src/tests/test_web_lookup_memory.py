@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import httpx
+import pytest
 
 from efi.db.core import Database
 from efi.db.models import MIGRATIONS
@@ -28,14 +28,46 @@ from efi.memory.social_memory import (
 from efi.memory.transcript import render_transcript
 from efi.notifications.schemas import Notification, NotificationType
 from efi.tools.base import ToolContext
+from efi.tools.web_tools import web_search
 from efi.tools.web_tools.web_search import WebSearchTool
 
-_SEARCH_HTML = """
-<html><body><table>
-<tr><td><a class="result-link" href="https://example.org/lazy">Ленивые импорты в Python</a></td></tr>
-<tr><td>PEP 690 предлагал отложенный импорт, но был отклонён в 2023 году.</td></tr>
-</table></body></html>
-"""
+
+class _FakeDDGS:
+    """Подмена ddgs.DDGS: один статичный результат, без сети."""
+
+    def __call__(self, *, timeout: float) -> _FakeDDGS:  # noqa: ARG002 — совместимость с DDGS(timeout=...)
+        return self
+
+    def __enter__(self) -> _FakeDDGS:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def text(self, query: str, **kwargs: object) -> list[dict[str, str]]:  # noqa: ARG002
+        return [
+            {
+                "href": "https://example.org/lazy",
+                "title": "Ленивые импорты в Python",
+                "body": "PEP 690 предлагал отложенный импорт, но был отклонён в 2023 году.",
+            }
+        ]
+
+
+class _EmptyDDGS:
+    """Подмена ddgs.DDGS: все бэкенды отвечают пустотой."""
+
+    def __call__(self, *, timeout: float) -> _EmptyDDGS:  # noqa: ARG002
+        return self
+
+    def __enter__(self) -> _EmptyDDGS:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+    def text(self, query: str, **kwargs: object) -> list[dict[str, str]]:  # noqa: ARG002
+        return []
 
 
 class _RecordingRAG:
@@ -58,9 +90,9 @@ class _RecordingJournal:
         return len(self.calls)
 
 
-def _tool(handler: Any, *, journal: Any = None) -> WebSearchTool:
-    transport = httpx.MockTransport(handler)
-    return WebSearchTool(client=httpx.AsyncClient(transport=transport), journal=journal)
+def _tool(monkeypatch: pytest.MonkeyPatch, *, ddgs: type | None = None, journal: Any = None) -> WebSearchTool:
+    monkeypatch.setattr(web_search, "DDGS", ddgs if ddgs is not None else _FakeDDGS())
+    return WebSearchTool(journal=journal)
 
 
 def _context(chat_id: int | None = 42) -> ToolContext:
@@ -72,9 +104,9 @@ def _context(chat_id: int | None = 42) -> ToolContext:
 # -- инструмент откладывает поиск в память ----------------------------------------
 
 
-async def test_successful_search_is_journalled(tmp_path: Path) -> None:
+async def test_successful_search_is_journalled(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     journal = _RecordingJournal()
-    tool = _tool(lambda request: httpx.Response(200, text=_SEARCH_HTML), journal=journal)
+    tool = _tool(monkeypatch, journal=journal)
 
     result = await tool.execute({"query": "ленивые импорты python"}, _context())
 
@@ -85,30 +117,32 @@ async def test_successful_search_is_journalled(tmp_path: Path) -> None:
     assert journal.calls[0]["chat_id"] == 42
 
 
-async def test_empty_search_is_not_an_experience(tmp_path: Path) -> None:
+async def test_empty_search_is_not_an_experience(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """«Ничего не нашлось» запоминать нечего — это не поход в интернет, а пустой звук."""
     journal = _RecordingJournal()
-    tool = _tool(lambda request: httpx.Response(200, text="<html><body></body></html>"), journal=journal)
+    tool = _tool(monkeypatch, ddgs=_EmptyDDGS, journal=journal)
 
     await tool.execute({"query": "асдфасдф"}, _context())
     assert journal.calls == []
 
 
-async def test_journal_failure_does_not_lose_the_search_results(tmp_path: Path) -> None:
+async def test_journal_failure_does_not_lose_the_search_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Модель уже получила результаты — терять их из-за проблемы с записью в память недопустимо."""
 
     class _BrokenJournal:
         async def record_web_lookup(self, **kwargs: Any) -> int:
             raise RuntimeError("database is gone")
 
-    tool = _tool(lambda request: httpx.Response(200, text=_SEARCH_HTML), journal=_BrokenJournal())
+    tool = _tool(monkeypatch, journal=_BrokenJournal())
     result = await tool.execute({"query": "ленивые импорты python"}, _context())
 
     assert "Ленивые импорты в Python" in result
 
 
-async def test_tool_works_without_a_journal_at_all(tmp_path: Path) -> None:
-    tool = _tool(lambda request: httpx.Response(200, text=_SEARCH_HTML))
+async def test_tool_works_without_a_journal_at_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    tool = _tool(monkeypatch)
     assert "Ленивые импорты в Python" in await tool.execute({"query": "x"}, _context())
 
 

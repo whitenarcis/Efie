@@ -298,7 +298,18 @@ class EfiApp:
         # память сразу. Без этого веб-поиск внутри разговора не сохранялся
         # НИГДЕ — результаты приходят модели TOOL-сообщением, а оно в таблицу
         # `messages` не пишется (см. SocialInteractionKind.WEB_LOOKUP).
-        self._web_search_tool = WebSearchTool(journal=self._social_memory)
+        #
+        # rewriter/embedder — «умный слой» поиска: рерайтинг запроса через
+        # FAST-модель и реранжирование выдачи через локальные эмбеддинги.
+        # Оба необязательны: их сбой не должен ломать сам поиск.
+        self._web_search_tool = WebSearchTool(
+            journal=self._social_memory,
+            rewriter=self._llm_router,
+            embedder=self._local_embeddings,
+            tavily_api_key=settings.web_search.tavily_api_key.get_secret_value()
+            if settings.web_search.tavily_api_key is not None
+            else "",
+        )
         self._weather_tool = GetWeatherTool()
         # Ключ Groq для STT не дублируется отдельным полем в конфиге — берётся
         # из уже настроенных LLM-эндпоинтов, если явного переопределения нет

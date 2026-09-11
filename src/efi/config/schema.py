@@ -346,6 +346,20 @@ class SttSettings(BaseModel):
     groq_api_key: SecretStr | None = None
 
 
+class WebSearchSettings(BaseModel):
+    """
+    Веб-поиск (efi/tools/web_tools/web_search.py). Основной путь — Tavily:
+    1000 бесплатных кредитов/мес, ключ выдаётся на app.tavily.com. Ключ
+    удобнее держать в .env (EFI_WEB_SEARCH__TAVILY_API_KEY), а не здесь —
+    этот конфиг отслеживается git. Пустой ключ — не поломка: поиск уходит
+    на бесплатный ddgs-фолбэк.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    tavily_api_key: SecretStr | None = None
+
+
 class LifeEngineSettings(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -520,6 +534,7 @@ KNOWN_CONFIG_FILES: tuple[str, ...] = (
     "dashboard.toml",
     "experemental.toml",
     "experimental.toml",
+    "web_search.toml",
 )
 
 
@@ -611,6 +626,7 @@ class Settings(BaseSettings):
     humanizer: HumanizerSettings = Field(default_factory=HumanizerSettings)
     state_vector: StateVectorSettings = Field(default_factory=StateVectorSettings)
     stt: SttSettings = Field(default_factory=SttSettings)
+    web_search: WebSearchSettings = Field(default_factory=WebSearchSettings)
     life_engine: LifeEngineSettings = Field(default_factory=LifeEngineSettings)
     busy_engine: BusyEngineSettings = Field(default_factory=BusyEngineSettings)
     quiet_hours: QuietHoursSettings = Field(default_factory=QuietHoursSettings)
@@ -756,6 +772,7 @@ __all__ = [
     "HumanizerSettings",
     "StateVectorSettings",
     "SttSettings",
+    "WebSearchSettings",
     "LifeEngineSettings",
     "BusyEngineSettings",
     "CommunitySettings",

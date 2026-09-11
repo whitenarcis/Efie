@@ -256,7 +256,7 @@ topic_match_min_score = 0.34
 
     if templates_dir.exists():
         # Список файлов, которые нужно перенести «как есть», если их еще нет в config
-        extra_configs = ["behaviour.toml", "dashboard.toml", "experemental.toml"]
+        extra_configs = ["behaviour.toml", "dashboard.toml", "experemental.toml", "web_search.toml"]
 
         for config_file in extra_configs:
             src_file = templates_dir / config_file
