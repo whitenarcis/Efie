@@ -50,6 +50,7 @@ from efi.db.chat_directory import ChatDirectory
 from efi.db.core import Database
 from efi.db.history_repository import SqliteHistoryRepository
 from efi.db.models import MIGRATIONS
+from efi.db.sticker_descriptions import StickerDescriptionStore
 from efi.dev.engine import DevEngine
 from efi.dev.github_sync import GitHubSync
 from efi.dev.maintenance import ProjectMaintainer
@@ -215,6 +216,10 @@ class EfiApp:
         # входящих сообщений, читается проактивным путём — единственным, у
         # которого своего Pyrogram-объекта чата нет (см. efi/db/chat_directory.py).
         self._chat_directory = ChatDirectory(self._database)
+        # Кэш описаний стикеров: «file_unique_id -> описание от vision».
+        # Наполняется из входящих стикеров (efi/telegram/handlers.py), а
+        # читается send_sticker'ом и промптом — поэтому живёт здесь, до обоих.
+        self._sticker_descriptions = StickerDescriptionStore(self._database)
         # -- ремесло: свои проекты, код, GitHub ------------------------------
         # Хранилище задач и стол переговоров поднимаются ВСЕГДА, даже при
         # выключенной подсистеме: они дёшевы (таблица и словарь в памяти) и
@@ -342,6 +347,7 @@ class EfiApp:
             dev_store=self._dev_store,
             collab=self._collab_desk,
             dev_desk=self._dev_desk,
+            stickers=self._sticker_descriptions,
         )
 
         # -- humanizer / проактивность --------------------------------------
@@ -500,6 +506,7 @@ class EfiApp:
             chat_recorder=self._chat_directory,
             collab_recorder=self._collab_desk,
             dev_dialogue_recorder=self._dev_desk,
+            sticker_store=self._sticker_descriptions,
             stt=self._stt,
             orchestrator=self._orchestrator,
         )
@@ -766,7 +773,7 @@ class EfiApp:
             EditMessageTool(self._telegram_client),
             ReactWithEmojiTool(self._telegram_client),
             ForwardMessageTool(self._telegram_client),
-            SendStickerTool(self._telegram_client),
+            SendStickerTool(self._telegram_client, self._sticker_descriptions),
             JoinChatTool(self._telegram_client, enabled=self._settings.telegram.can_join_chats),
             LeaveChatTool(self._telegram_client, enabled=self._settings.telegram.can_leave_chats),
             SearchChatsTool(self._telegram_client),

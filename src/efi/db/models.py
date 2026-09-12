@@ -385,6 +385,39 @@ async def _migration_020_dev_swe(conn: aiosqlite.Connection) -> None:
         await conn.execute("ALTER TABLE dev_tasks ADD COLUMN branch TEXT NOT NULL DEFAULT ''")
 
 
+_STICKER_DESCRIPTIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sticker_descriptions (
+    sticker_id      INTEGER PRIMARY KEY AUTOINCREMENT,  -- короткий id для модели (виден в промпте)
+    file_unique_id  TEXT NOT NULL UNIQUE,               -- стабильный id стикера из Telegram
+    file_id         TEXT NOT NULL,                      -- рабочий file_id для send_sticker
+    description     TEXT NOT NULL,                      -- описание от vision (см. efi/telegram/media/sticker.py)
+    seen_count      INTEGER NOT NULL DEFAULT 1,
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sticker_descriptions_last_seen
+    ON sticker_descriptions (last_seen_at DESC);
+"""
+
+
+async def _migration_021_sticker_descriptions(conn: aiosqlite.Connection) -> None:
+    """
+    Кэш описаний стикеров (см. efi/db/sticker_descriptions.py).
+
+    Зачем нужен. Стикер должен доходить до модели не как file_id+эмодзи, а как
+    описание от vision — иначе модель не понимает, ЧТО на стикере. Но дергать
+    vision на каждый приход одного и того же стикера нельзя: это дорогой запрос,
+    а стикеры люди пересылают подряд. Таблица хранит связку «короткий id для
+    модели -> Telegram file_unique_id -> рабочий file_id -> описание», чтобы
+    описать стикер ровно один раз, а дальше брать из кэша.
+
+    `sticker_id` (AUTOINCREMENT) намеренно отдельный от file_unique_id: модель
+    видит в промпте короткий id («[стикер: кот смеётся (id 7)]»), и он должен
+    быть коротким числом, а не двадцатизначным Telegram-ключом.
+    """
+    await conn.executescript(_STICKER_DESCRIPTIONS_SCHEMA)
+
+
 #: Применяются по порядку при первом получении соединения (см. efi.db.core.Database).
 MIGRATIONS = [
     _migration_001_messages,
@@ -407,6 +440,7 @@ MIGRATIONS = [
     _migration_018_dev_artifacts,
     _migration_019_dev_revivals,
     _migration_020_dev_swe,
+    _migration_021_sticker_descriptions,
 ]
 
 __all__ = ["MIGRATIONS"]

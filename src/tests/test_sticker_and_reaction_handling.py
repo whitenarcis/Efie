@@ -1,12 +1,14 @@
 """
-Тесты на два взаимосвязанных дефекта, из-за которых Эфи фактически не могла
-пользоваться стикерами/реакциями:
+Тесты на обработку стикеров и эмодзи-реакций:
 
-1. efi.telegram.handlers._build_sticker_text_and_payload — раньше входящие
-   стикеры вообще не обрабатывались (не было обработчика на filters.sticker),
-   поэтому ни в истории, ни в контексте модели о них не оставалось следа, и
-   у модели не было ни одного известного ей file_id для send_sticker.
-2. efi.tools.telegram_actions.react_with_emoji.ReactWithEmojiTool — раньше
+1. efi.telegram.handlers._format_sticker_message — входящий стикер доходит до
+   модели КАК ОПИСАНИЕ от vision с коротким id («[стикер: кот смеётся (id 7)]»),
+   а не как file_id+эмодзи. Telegram-иды остаются только в payload, никогда в
+   тексте промпта.
+2. efi.tools.telegram_actions.SendStickerTool — отправка по короткому id из
+   кэша описаний (efi/db/sticker_descriptions.py): инструмент сам достаёт
+   актуальный file_id, модель ничего про Telegram-иды не знает.
+3. efi.tools.telegram_actions.react_with_emoji.ReactWithEmojiTool — раньше
    требовал message_id ПАРАМЕТРОМ от модели, а взять его было неоткуда (ни
    один message_id нигде не показывается в тексте промпта), из-за чего
    инструмент был фактически недоступен для реального использования.
@@ -14,10 +16,8 @@
 
 from __future__ import annotations
 
-from pyrogram.types import Message, Sticker
-
 from efi.notifications.schemas import Notification, NotificationType
-from efi.telegram.handlers import _build_sticker_text_and_payload
+from efi.telegram.handlers import _format_sticker_message
 from efi.tools.base import ToolContext
 from efi.tools.telegram_actions.react_with_emoji import (
     _ALLOWED_REACTIONS,
@@ -25,40 +25,45 @@ from efi.tools.telegram_actions.react_with_emoji import (
     normalize_reaction_emoji,
 )
 from efi.tools.telegram_actions.send_message import SendMessageTool
+from efi.tools.telegram_actions.stickers import SendStickerTool
 
 
-def _sticker(*, emoji: str | None = "😂", file_id: str | None = "AAAA_file_id") -> Sticker:
-    return Sticker(
-        file_id=file_id or "",
-        file_unique_id="unique",
-        width=512,
-        height=512,
-        is_animated=False,
-        is_video=False,
-        emoji=emoji,
+def test_sticker_text_is_a_vision_description_with_short_id() -> None:
+    text, payload = _format_sticker_message(
+        description="кот смеётся", sticker_id=7, file_unique_id="U1", file_id="F1", emoji="😂"
     )
 
-
-def test_sticker_text_includes_emoji_and_file_id() -> None:
-    message = Message(id=1, sticker=_sticker(emoji="😂", file_id="AAAA_file_id"))
-    text, payload = _build_sticker_text_and_payload(message)
-
-    assert "😂" in text
-    assert "AAAA_file_id" in text
+    assert text == "[прислал(а) стикер: кот смеётся (id 7)]"
+    # Никаких Telegram-идов в тексте: у модели их нет и быть не должно.
+    assert "F1" not in text
+    assert "U1" not in text
     assert payload["media_type"] == "sticker"
-    assert payload["sticker_file_id"] == "AAAA_file_id"
+    assert payload["sticker_id"] == 7
+    assert payload["sticker_file_id"] == "F1"
+    assert payload["sticker_file_unique_id"] == "U1"
 
 
-def test_sticker_text_falls_back_when_no_emoji() -> None:
-    message = Message(id=1, sticker=_sticker(emoji=None))
-    text, _payload = _build_sticker_text_and_payload(message)
-    assert "?" in text
+def test_sticker_without_id_keeps_description_only() -> None:
+    text, payload = _format_sticker_message(description="озабоченный пёс")
+
+    assert text == "[прислал(а) стикер: озабоченный пёс]"
+    assert "sticker_id" not in payload
 
 
-def test_sticker_payload_omits_file_id_when_missing() -> None:
-    message = Message(id=1, sticker=_sticker(file_id=None))
-    _text, payload = _build_sticker_text_and_payload(message)
-    assert "sticker_file_id" not in payload
+def test_sticker_falls_back_to_emoji_when_undescribed() -> None:
+    """Vision не сработал — остаётся эмодзи как последняя доступная информация, честно помеченная."""
+    text, payload = _format_sticker_message(description=None, emoji="😂", file_id="F1")
+
+    assert "не удалось распознать" in text
+    assert "😂" in text
+    assert payload["sticker_file_id"] == "F1"
+    assert "sticker_id" not in payload
+
+
+def test_animated_sticker_fallback_note() -> None:
+    text, _payload = _format_sticker_message(description=None, emoji="🔥", degraded_note="анимированный стикер")
+    assert "анимированный стикер" in text
+    assert "🔥" in text
 
 
 class _FakeReactor:
@@ -193,7 +198,10 @@ class _RecordingSender:
 def _send_context(**payload: object) -> ToolContext:
     return ToolContext(
         notification=Notification(
-            type=NotificationType.PUBLIC_COMMENT, priority=7, chat_id=-1002, message="повод",
+            type=NotificationType.PUBLIC_COMMENT,
+            priority=7,
+            chat_id=-1002,
+            message="повод",
             payload={"telegram_message_ids": [77], **payload},
         )
     )
@@ -215,3 +223,85 @@ async def test_without_force_reply_the_model_still_decides() -> None:
     await tool.execute({"text": "просто реплика"}, _send_context())
 
     assert sender.reply_to_message_id is None
+
+
+# -- send_sticker по короткому id из кэша описаний --------------------------
+# Модель ничего не знает про Telegram-иды: ей виден «id 7» из описания
+# входящего стикера или из блока «[Известные стикеры]», а инструмент сам
+# достаёт из кэша efi/db/sticker_descriptions.py актуальный file_id.
+
+
+class _FakeStickerSender:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, str]] = []
+
+    async def send_sticker(self, chat_id: int, sticker_file_id: str) -> None:
+        self.calls.append((chat_id, sticker_file_id))
+
+
+class _FakeStickerStore:
+    """Дак-тайпинг StickerDescriptionStore: только то, что нужно инструменту."""
+
+    def __init__(self, known: dict[int, object] | None = None) -> None:
+        self.known: dict[int, object] = known or {}
+
+    async def by_id(self, sticker_id: int) -> object | None:
+        return self.known.get(sticker_id)
+
+    async def recent(self, limit: int) -> list[object]:
+        items = list(self.known.items())[:limit]
+        return [item[1] for item in items]
+
+
+def _sticker_context() -> ToolContext:
+    return ToolContext(notification=Notification(type=NotificationType.USER_MESSAGE, chat_id=42, message="x"))
+
+
+async def test_send_sticker_resolves_short_id_to_file_id() -> None:
+    sender = _FakeStickerSender()
+    store = _FakeStickerStore({7: _Known(7, "F7")})
+    tool = SendStickerTool(sender, store)  # type: ignore[arg-type]
+
+    result = await tool.execute({"sticker_id": 7}, _sticker_context())
+
+    assert "Стикер отправлен" in result
+    assert sender.calls == [(42, "F7")]
+
+
+class _Known:
+    """Минимальный объект записи: инструменту нужны только sticker_id и file_id."""
+
+    def __init__(self, sticker_id: int, file_id: str) -> None:
+        self.sticker_id = sticker_id
+        self.file_id = file_id
+
+
+def _fake_known(id_: int) -> _Known:
+    return _Known(id_, f"FILE_{id_}")
+
+
+async def test_send_sticker_rejects_unknown_id_with_hint() -> None:
+    sender = _FakeStickerSender()
+    store = _FakeStickerStore({5: _fake_known(5)})
+    tool = SendStickerTool(sender, store)  # type: ignore[arg-type]
+
+    result = await tool.execute({"sticker_id": 99}, _sticker_context())
+
+    assert result.startswith("error:")
+    assert "99" in result
+    # Подсказка должна перечислить реально известные id, чтобы модель
+    # могла выбрать правильный, а не гадать.
+    assert "5" in result
+    assert sender.calls == []
+
+
+async def test_send_sticker_is_unavailable_without_a_current_chat() -> None:
+    tool = SendStickerTool(_FakeStickerSender(), _FakeStickerStore({1: _fake_known(1)}))  # type: ignore[arg-type]
+    context = ToolContext(notification=Notification(type=NotificationType.USER_MESSAGE, chat_id=None, message="x"))
+    assert not tool.is_available(context)
+
+
+async def test_send_sticker_rejects_non_integer_id() -> None:
+    tool = SendStickerTool(_FakeStickerSender(), _FakeStickerStore())  # type: ignore[arg-type]
+    result = await tool.execute({"sticker_id": "7"}, _sticker_context())
+    assert result.startswith("error:")

@@ -60,6 +60,7 @@ from efi.telegram.buffer import InboundMessageBuffer
 from efi.telegram.chat_orchestrator import ChatOrchestrator
 from efi.telegram.formatting import format_user_message
 from efi.telegram.media.image import describe_photo
+from efi.telegram.media.sticker import describe_sticker
 from efi.telegram.media.video import transcribe_video_note
 from efi.telegram.media.voice import transcribe_voice_message
 from efi.telegram.typing_tracker import TypingTracker
@@ -123,6 +124,13 @@ class TelegramEventHandlers:
     проактивным событиям (пинг по таймеру) взять тип чата больше неоткуда,
     и без справочника Эфи писала в группу так же, как в личку.
 
+    `sticker_store` — необязательный дак-тайпинг (обычно
+    efi.db.sticker_descriptions.StickerDescriptionStore; асинхронные методы
+    `find`/`remember`/`touch`), кэш описаний стикеров от vision. Входящий
+    стикер описывается ровно один раз, дальше описание берётся из БД — без
+    этого каждый приход одного и того же стикера дёргал бы vision заново
+    (см. efi/db/sticker_descriptions.py).
+
     `people_recorder` — аналогичный необязательный дак-тайпинг (обычно
     efi.memory.people.PeopleStore; асинхронный метод `record_message(user_id,
     text, *, display_name, chat_id, chat_title)`), которым ведётся учёт
@@ -157,6 +165,7 @@ class TelegramEventHandlers:
         collab_recorder: Any | None = None,
         dev_dialogue_recorder: Any | None = None,
         chat_recorder: Any | None = None,
+        sticker_store: Any | None = None,
         stt: GroqSTT | None = None,
         orchestrator: ChatOrchestrator | None = None,
     ) -> None:
@@ -174,6 +183,7 @@ class TelegramEventHandlers:
         #: (обычно efi.behavior.dev_dialogue.DevPartnerDesk).
         self._dev_dialogue_recorder = dev_dialogue_recorder
         self._chat_recorder = chat_recorder
+        self._sticker_store = sticker_store
         self._stt = stt
         self._buffer: InboundMessageBuffer[_PendingMessage] = InboundMessageBuffer(
             self._flush_debounced,
@@ -271,21 +281,77 @@ class TelegramEventHandlers:
 
     async def _handle_sticker(self, client: Client, message: PyrogramMessage) -> None:
         """
-        Раньше стикеры не обрабатывались вообще — не было зарегистрировано
-        ни одного обработчика на filters.sticker, поэтому входящий стикер
-        просто исчезал: ни в истории, ни в контексте модели о нём не
-        оставалось ни следа. Заодно кладём file_id в текст: это единственный
-        способ, которым Эфи вообще может УЗНАТЬ file_id хоть какого-то
-        стикера — send_sticker (efi.tools.telegram_actions.stickers.
-        SendStickerTool) принимает file_id, но собственного индекса стикеров
-        у неё нет, так что раньше ей было физически неоткуда взять хотя бы
-        один валидный file_id для отправки.
+        Входящий стикер превращается в ОПИСАНИЕ от vision (а не в id+эмодзи):
+        модели нечего делать с file_id, зато описание — «кот смеётся» — это
+        ровно то, чем стикер является в разговоре.
+
+        Vision вызывается ТОЛЬКО при промахе кэша: описание лежит в
+        efi/db/sticker_descriptions.py, и повторный приход того же стикера
+        (люди пересылают любимые стикеры десятки раз) не должен каждый раз
+        стоить дорогого запроса. Описание с коротким id попадает и в текст
+        («[стикер: кот смеётся (id 7)]»), и в payload — тот же путь, что
+        у фото/голосовых: медиа превращается в текст ДО Worker'а.
+
+        Анимированные (tgs) и видео-стикеры (webm) vision не читает — это не
+        растровые картинки; для них остаётся эмодзи как последняя доступная
+        информация, без кэширования и без короткого id.
         """
         access_info = await self._authorize(client, message)
         if access_info is None:
             return
 
-        text, payload = _build_sticker_text_and_payload(message)
+        sticker = message.sticker
+        file_unique_id = getattr(sticker, "file_unique_id", None) or ""
+        file_id = getattr(sticker, "file_id", None) or ""
+
+        description: str | None = None
+        sticker_id: int | None = None
+        degraded_note = "не удалось распознать"
+
+        if file_unique_id:
+            if self._sticker_store is not None:
+                known = await self._sticker_store.find(file_unique_id)
+                if known is not None:
+                    # Хит кэша: описание уже есть, обновляем только рабочий file_id
+                    # (меняется между сессиями) и счётчик встреч.
+                    description = known.description
+                    sticker_id = known.sticker_id
+                    await self._sticker_store.touch(file_unique_id, file_id)
+
+            if description is None:
+                if getattr(sticker, "is_animated", False) or getattr(sticker, "is_video", False):
+                    degraded_note = "анимированный стикер"
+                else:
+                    downloaded_path = await self._download_media(client, message)
+                    try:
+                        vision_description = (
+                            await describe_sticker(self._router, downloaded_path)
+                            if downloaded_path is not None
+                            else None
+                        )
+                    finally:
+                        await self._cleanup_media(downloaded_path)
+                    if vision_description:
+                        # Кэшируем только УСПЕШНОЕ описание: сорвавшийся раз запрос
+                        # не должен навсегда заморозить стикер без описания.
+                        if self._sticker_store is not None:
+                            stored = await self._sticker_store.remember(file_unique_id, file_id, vision_description)
+                            if stored is not None:
+                                description = stored.description
+                                sticker_id = stored.sticker_id
+                        else:
+                            # Хранилища нет (частичная обивка) — показываем
+                            # описание без короткого id и без кэширования.
+                            description = vision_description
+
+        text, payload = _format_sticker_message(
+            description=description,
+            sticker_id=sticker_id,
+            emoji=getattr(sticker, "emoji", None),
+            file_unique_id=file_unique_id,
+            file_id=file_id,
+            degraded_note=degraded_note,
+        )
         await self._dispatch_user_message(access_info, message, text=text, payload=payload)
 
     async def _transcribe_audio(
@@ -498,23 +564,45 @@ class TelegramEventHandlers:
         await self._manager.put(notification)
 
 
-def _build_sticker_text_and_payload(message: PyrogramMessage) -> tuple[str, dict[str, Any]]:
+def _format_sticker_message(
+    *,
+    description: str | None,
+    sticker_id: int | None = None,
+    emoji: str | None = None,
+    file_unique_id: str | None = None,
+    file_id: str | None = None,
+    degraded_note: str = "не удалось распознать",
+) -> tuple[str, dict[str, Any]]:
     """
-    Текст и payload для входящего стикера — вынесено из _handle_sticker в
-    чистую функцию, чтобы её можно было протестировать без реального
-    Client/дебаунсера. file_id кладётся и в текст (единственный способ,
-    которым модель вообще может узнать хоть один валидный file_id для
-    send_sticker — см. докстринг _handle_sticker), и в payload отдельным
-    ключом на случай, если он понадобится программно, а не через текст.
+    Текст и payload для входящего стикера — чистая функция, чтобы её можно было
+    протестировать без реального Client/БД/vision.
+
+    Модель получает стикер КАК ОПИСАНИЕ, а не как id+эмодзи: «[прислал(а)
+    стикер: кот смеётся (id 7)]». Короткий id — то, чем send_sticker
+    (efi.tools.telegram_actions.stickers.SendStickerTool) отправляет стикер;
+    Telegram-иды (file_id/file_unique_id) никому в промпте не показываются и
+    кладутся только в payload для программного использования.
+
+    Когда описание недоступно (vision не смог, анимированный/видео-стикер) —
+    деградируем до эмодзи как последней доступной информации, с явной пометкой,
+    что это не распознано.
     """
-    sticker = message.sticker
-    emoji = getattr(sticker, "emoji", None) or "?"
-    file_id = getattr(sticker, "file_id", None)
-    text = f"[прислал(а) стикер {emoji}]"
+    if description:
+        text = f"[прислал(а) стикер: {description}"
+        if sticker_id is not None:
+            text += f" (id {sticker_id})"
+        text += "]"
+    else:
+        emoji_part = f" {emoji}" if emoji else ""
+        text = f"[прислал(а) стикер — {degraded_note}{emoji_part}]"
+
     payload: dict[str, Any] = {"media_type": "sticker"}
+    if file_unique_id:
+        payload["sticker_file_unique_id"] = file_unique_id
     if file_id:
-        text += f" (file_id для повторной отправки через send_sticker: {file_id})"
         payload["sticker_file_id"] = file_id
+    if sticker_id is not None:
+        payload["sticker_id"] = sticker_id
     return text, payload
 
 

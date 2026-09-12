@@ -64,6 +64,7 @@ from efi.behavior.ambiguity import PendingClarification, PendingClarifications
 from efi.behavior.collab_coding import CollabCodingDesk, Proposal
 from efi.behavior.dev_dialogue import DevIntent, DevPartnerDesk, RepoContext
 from efi.config.schema import LockdownMode, Settings
+from efi.db.sticker_descriptions import StickerDescription, StickerDescriptionStore
 from efi.dev.schemas import DevTask
 from efi.dev.showcase import pick_showcase
 from efi.dev.store import DevTaskStore
@@ -106,6 +107,12 @@ _PERSONALITY_TEMPLATE_NAME = "personality"
 #: общалась», а не выгрузка адресной книги.
 _OTHER_CONTACTS_LOOKUP = 20
 _OTHER_CONTACTS_SHOWN = 8
+
+#: Сколько известных стикеров показывать в блоке «[Известные стикеры]».
+#: Ограничение намеренное: промпт не должен разбухать из-за того, что человек
+#: годами пересылает любимые стикеры. Самых свежих достаточно — стикер из
+#: верхушки списка, как правило, и есть самый уместный для текущей беседы.
+_KNOWN_STICKERS_SHOWN = 15
 
 #: За какой срок общение ещё считается «недавним».
 #:
@@ -274,6 +281,7 @@ class EfiSystemPromptBuilder:
         dev_store: DevTaskStore | None = None,
         collab: CollabCodingDesk | None = None,
         dev_desk: DevPartnerDesk | None = None,
+        stickers: StickerDescriptionStore | None = None,
     ) -> None:
         self._loader = loader
         self._settings = settings
@@ -296,6 +304,11 @@ class EfiSystemPromptBuilder:
         #: Разговор про существующий код (efi/behavior/dev_dialogue.py).
         #: Необязателен: без него блока просто нет, как и раньше.
         self._dev_desk = dev_desk
+        #: Кэш описаний стикеров (efi/db/sticker_descriptions.py): из него в
+        #: промпт поднимается блок «[Известные стикеры]», чтобы модель могла
+        #: отправлять стикеры по короткому id, а не гадать по Telegram-идам.
+        #: Необязателен: без него блок просто отсутствует.
+        self._stickers = stickers
         #: Без состояния — один на билдер, см. efi/memory/router.py.
         self._memory_router = MemoryRouter()
 
@@ -328,6 +341,7 @@ class EfiSystemPromptBuilder:
         person_task = self._resolve_person_profile(notification)
         contacts_task = self._resolve_other_contacts(notification, now=local_now(self._settings.timezone))
         dev_task = self._resolve_dev_context(notification)
+        stickers_task = self._resolve_known_stickers()
 
         # Вложенный gather, а не один на семь задач: у asyncio.gather
         # перегрузки с точными типами заканчиваются на шести аргументах, и
@@ -340,7 +354,7 @@ class EfiSystemPromptBuilder:
             relevant_beliefs,
             affinity_snapshot,
             person_profile,
-        ), known_facts, other_contacts, dev_context = await asyncio.gather(
+        ), known_facts, other_contacts, dev_context, known_stickers = await asyncio.gather(
             asyncio.gather(
                 personality_task,
                 rag_task,
@@ -352,6 +366,7 @@ class EfiSystemPromptBuilder:
             knowledge_task,
             contacts_task,
             dev_task,
+            stickers_task,
         )
 
         now = local_now(self._settings.timezone)
@@ -396,6 +411,7 @@ class EfiSystemPromptBuilder:
             _build_behavioral_overrides_block(history, notification.message),
             render_facts_block(known_facts),
             _build_rag_block(rag_results),
+            _build_known_stickers_block(known_stickers),
             _build_safety_block(self._settings.telegram.lockdown_mode),
         ]
         return "\n\n".join(block for block in blocks if block)
@@ -467,6 +483,25 @@ class EfiSystemPromptBuilder:
             logger.warning("prompts: не удалось прочитать задачи разработки", exc_info=True)
             return _DevContext()
         return _DevContext(active=active, releases=releases, abandoned=abandoned)
+
+    async def _resolve_known_stickers(self) -> list[StickerDescription]:
+        """
+        Последние известные стикеры — для блока «[Известные стикеры]».
+
+        Модель отправляет стикеры по короткому id из этого блока или из
+        описания входящего стикера («[стикер: кот смеётся (id 7)]»). Без блока
+        выбор «подходящего по смыслу» из накопленного набора был бы гаданием:
+        описания вне конкретного сообщения ей больше нигде не видны.
+        """
+        if self._stickers is None:
+            return []
+        try:
+            return await self._stickers.recent(limit=_KNOWN_STICKERS_SHOWN)
+        except Exception:
+            # Стикеры — не условие ответа: сбой чтения не должен срывать
+            # генерацию (тот же принцип, что у RAG и фактов).
+            logger.warning("prompts: не удалось прочитать список известных стикеров", exc_info=True)
+            return []
 
     async def _resolve_other_contacts(
         self, notification: Notification, *, now: datetime
@@ -1177,6 +1212,21 @@ def _format_local(moment: datetime) -> str:
 #: подаются модели иначе, чем обычные воспоминания о переписке — см.
 #: _build_rag_block: на них можно и нужно ссылаться вслух ("я тут вычитала").
 _AUTONOMOUS_THOUGHT_TAG = "#autonomous_thought"
+
+
+def _build_known_stickers_block(stickers: list[StickerDescription]) -> str:
+    """
+    Список известных стикеров: id -> описание, чтобы модель могла выбрать
+    уместный по смыслу и отправить send_sticker по короткому id. Пустой
+    список — пустая строка, а не заголовок без содержимого (как в
+    render_facts_block).
+    """
+    if not stickers:
+        return ""
+    lines = "\n".join(f"- id {item.sticker_id} — {item.description}" for item in stickers)
+    return (
+        "[Известные стикеры] Стикеры, которые ты умеешь отправлять (send_sticker по числу после «id»):\n" + lines + "\n"
+    )
 
 
 def _build_rag_block(rag_results: list[DiaryQueryResult]) -> str:
