@@ -50,6 +50,41 @@ class _MissingLocalEngine:
         raise RuntimeError("fastembed не установлен")
 
 
+class _FakeEmbedder:
+    """
+    Детерминированный эмбеддер для тестов: кодирует слова в индексы плотного
+    вектора через хэш. Похожие по словам тексты получают высокое косинусное
+    сходство — достаточно для проверки дедупликации. Не универсальный, только
+    для тестов.
+    """
+
+    def __init__(self, dim: int = 32) -> None:
+        self.dim = dim
+        self.calls = 0
+
+    def _vectorize(self, text: str) -> EmbeddingVector:
+        import hashlib
+        import re
+
+        vector = [0.0] * self.dim
+        for token in re.findall(r"[а-яёa-z0-9]+", text.lower()):
+            digest = hashlib.sha256(token.encode("utf-8")).digest()
+            index = int.from_bytes(digest[:8], "little", signed=False) % self.dim
+            vector[index] += 1.0
+        norm = sum(x * x for x in vector) ** 0.5 or 1.0
+        return [x / norm for x in vector]
+
+    async def embedding(self, role: TaskRole, text: str) -> EmbeddingVector:
+        self.calls += 1
+        return self._vectorize(text)
+
+    async def embed_query(self, text: str) -> EmbeddingVector:
+        return self._vectorize(text)
+
+    async def embed_document(self, text: str) -> EmbeddingVector:
+        return self._vectorize(text)
+
+
 def _rag(tmp_path: Path, *, local: object | None = None) -> tuple[RAGMemory, _DeadRouter]:
     router = _DeadRouter()
     memory = RAGMemory(
@@ -69,9 +104,7 @@ def _rag_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
-async def test_the_same_trouble_is_reported_once(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_the_same_trouble_is_reported_once(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """Главное: одна причина — одна строчка, сколько бы сообщений ни пришло."""
     memory, router = _rag(tmp_path)
 
@@ -83,9 +116,7 @@ async def test_the_same_trouble_is_reported_once(
     assert len(_rag_warnings(caplog)) == 1
 
 
-async def test_a_new_trouble_is_still_reported(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_a_new_trouble_is_still_reported(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     """
     Обратная сторона: приглушать нужно повтор, а не сам факт. Сменилась
     причина — значит, изменилось состояние мира, и это стоит сказать.
@@ -110,3 +141,59 @@ async def test_muting_the_log_does_not_mute_the_failure(tmp_path: Path) -> None:
 
     assert await memory._compute_embedding(_LONG_ENOUGH, is_query=True) is None
     assert await memory._compute_embedding(_LONG_ENOUGH, is_query=True) is None
+
+
+async def test_search_deduplicates_semantic_duplicates(tmp_path: Path) -> None:
+    """
+    Один и тот же эпизод, сохранённый в дневник несколько раз под разными
+    формулировками, должен склеиваться в один результат с повышенным
+    usage_count. Иначе в промпт улетают дубли и модель рассказывает одно и то же.
+    """
+    from efi.llm.schemas import DiaryEntry, DiaryEntryMetadata, DiaryQueryOptions
+
+    embedder = _FakeEmbedder(dim=8)
+    diary = Diary(tmp_path / "diary")
+    # Два дубля: одинаковый вектор, разный текст.
+    dup_vector = await embedder.embed_document("отношения")
+    unique_vector = await embedder.embed_document("погода")
+    await diary.save(
+        DiaryEntry(
+            id="duplicate_1",
+            metadata=DiaryEntryMetadata(confidence=0.6, embedding=dup_vector),
+            body="Гуглила про отношения. Нашла определение.",
+        )
+    )
+    await diary.save(
+        DiaryEntry(
+            id="duplicate_2",
+            metadata=DiaryEntryMetadata(confidence=0.6, embedding=dup_vector),
+            body="Полезла в интернет за определением отношений. Вычитала умное.",
+        )
+    )
+    # Уникальная запись — другой вектор.
+    await diary.save(
+        DiaryEntry(
+            id="unique",
+            metadata=DiaryEntryMetadata(confidence=0.5, embedding=unique_vector),
+            body="Совсем другая тема про погоду за окном.",
+        )
+    )
+
+    memory = RAGMemory(
+        diary,
+        embedder,  # type: ignore[arg-type]
+        TfidfFallbackIndex(),
+        local_embeddings=embedder,  # type: ignore[arg-type]
+    )
+
+    results = await memory.search(
+        "расскажи что-нибудь интересное из того что ты читала",
+        DiaryQueryOptions(min_relatedness=0.0),
+    )
+
+    ids = [r.entry.id for r in results]
+    # два дубля склейся в один, плюс уникальная = 2
+    assert len(ids) == 2, "два дубля должны склейся в один"
+    assert "unique" in ids
+    # usage_count одной из записей вырос
+    assert any(r.entry.metadata.usage_count >= 1 for r in results)

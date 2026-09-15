@@ -25,8 +25,7 @@ from efi.utils.text import looks_unfinished, salvage_truncated, trim_to_last_sen
 
 def _response(finish_reason: str | None) -> Response:
     return Response(
-        choices=[Choice(index=0, message=Message(role=Role.ASSISTANT, content="текст"),
-                        finish_reason=finish_reason)]
+        choices=[Choice(index=0, message=Message(role=Role.ASSISTANT, content="текст"), finish_reason=finish_reason)]
     )
 
 
@@ -147,6 +146,22 @@ def test_unfinished_tails_are_detected(text: str) -> None:
 
 @pytest.mark.parametrize("text", ["Это законченная мысль.", "Правда?!", "И всё…", 'Он сказал "нет."'])
 def test_finished_tails_are_not_flagged(text: str) -> None:
+    assert looks_unfinished(text) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Гуглила странное: это было любопытно. #web_lookup",
+        "Мне в ЛС писал тип: как дела? #stranger_dm #channel_8406476035",
+        "Полезла гуглить и вычитала. #web_lookup #channel_8406476035",
+    ],
+)
+def test_trailing_diary_tags_do_not_flag_a_finished_entry(text: str) -> None:
+    """
+    Метатеги дописываются в дневник ПОСЛЕ точки программно — запись вида
+    «...разделяете. #web_lookup» законченная, а не оборванная.
+    """
     assert looks_unfinished(text) is False
 
 

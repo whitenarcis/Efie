@@ -34,6 +34,8 @@ import time
 import uuid
 from collections.abc import Iterable
 
+import numpy as np
+
 from efi.config.schema import TaskRole
 from efi.llm.errors import LLMError
 from efi.llm.router import LLMRouter
@@ -113,7 +115,60 @@ class RAGMemory:
         if query_embedding is None:
             return await self._tfidf.search(query_text, options, filter_fn=filter_fn)
 
-        return await self._diary.query(query_embedding, options, filter_fn=filter_fn)
+        results = await self._diary.query(query_embedding, options, filter_fn=filter_fn)
+        return self._dedup_by_embedding(results, query_embedding)
+
+    @staticmethod
+    def _dedup_by_embedding(
+        results: list[DiaryQueryResult],
+        query_embedding: EmbeddingVector,
+        *,
+        threshold: float = 0.90,
+    ) -> list[DiaryQueryResult]:
+        """
+        Склейка семантических дублей в выдаче.
+
+        Без неё один и тот же эпизод — сохранённый в дневник несколько раз
+        (web_lookup + researcher + novelization одного гуглёжа) — всплывает
+        в промпте дважды-трижды под разными формулировками. Порог 0.90 ловит
+        перефразы одного и того же, не склевая соседние по теме, но разные
+        воспоминания (как 0.88 в dedup.py, чуть мягче — выдача шире корпуса).
+
+        Склейка детерминистична: идём от самого релевантного, и для каждой
+        следующей проверяем, не дубль ли она любой уже оставленной. При
+        совпадении догоняем usage_count оставленной — модель видит «это
+        подтверждалось дважды», даже если формулировка одна.
+        """
+        if len(results) < 2:
+            return results
+
+        kept: list[DiaryQueryResult] = []
+        kept_vectors: list[np.ndarray] = []
+
+        for result in results:
+            vector = np.asarray(result.entry.metadata.embedding, dtype=np.float64)
+            norm = float(np.linalg.norm(vector))
+            if norm <= 0.0:
+                kept.append(result)
+                continue
+
+            duplicate_index = None
+            for index, kept_vector in enumerate(kept_vectors):
+                kept_norm = float(np.linalg.norm(kept_vector))
+                if kept_norm <= 0.0:
+                    continue
+                cosine = float(np.dot(vector, kept_vector) / (norm * kept_norm))
+                if cosine >= threshold:
+                    duplicate_index = index
+                    break
+
+            if duplicate_index is not None:
+                kept[duplicate_index].entry.metadata.usage_count += 1
+                continue
+
+            kept.append(result)
+            kept_vectors.append(vector)
+        return kept
 
     async def embed(self, text: str) -> EmbeddingVector | None:
         """
@@ -188,9 +243,7 @@ class RAGMemory:
                     return await self._local_embeddings.embed_query(text)
                 return await self._local_embeddings.embed_document(text)
             except RuntimeError as exc:
-                self._complain_once(
-                    "rag: local embedding failed (%s), falling back to LLMRouter", str(exc)
-                )
+                self._complain_once("rag: local embedding failed (%s), falling back to LLMRouter", str(exc))
 
         try:
             return await self._router.embedding(self._embedding_role, text)

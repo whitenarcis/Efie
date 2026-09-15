@@ -164,14 +164,55 @@ async def test_store_writes_lookup_to_both_layers(tmp_path: Path) -> None:
 
 async def test_lookup_keeps_more_text_than_a_chat_message(tmp_path: Path) -> None:
     """
-    Сниппеты — это фактура (числа, названия, ссылки), ради которой запись и
-    делается. Обрезанный до пары фраз результат поиска в дневнике бесполезен.
+    Разделение слоёв: SQLite-журнал хранит выдачу ЦЕЛИКОМ (фактура — числа,
+    названия, ссылки, — ради которой запись и делается), а в дневник уходит
+    короткая сжатая строка без обрубков.
+
+    Раньше в дневник шёл весь ~1.2 КБ дайджест целиком: превью-лимит резал
+    его на полуслове («...может отличаться от реа (https://...»), и корпус
+    забивался обрубками, которые потом подмешивались в промпт как
+    «воспоминания».
     """
+    from efi.memory.social_memory import _MAX_LOOKUP_DIGEST
+
+    rag = _RecordingRAG()
+    store = SocialInteractionStore(Database(tmp_path / "test.db", migrations=MIGRATIONS), rag=rag)  # type: ignore[arg-type]
+
     digest = "деталь " * 200
-    body = SocialInteraction(
-        kind=SocialInteractionKind.WEB_LOOKUP, text=f"запрос — {digest}"
-    ).render_for_prompt()
-    assert len(body) > 1000
+    await store.record_web_lookup(query="запрос", digest=digest, chat_id=42)
+
+    # Журнал — полный текст: новеллизация эпизода доберёт детали отсюда.
+    recorded = await store.recent()
+    assert digest.strip() in recorded[0].text
+
+    # Дневник — сжатая законченная фраза, а не простыня сниппетов.
+    assert len(rag.remembered) == 1
+    assert len(rag.remembered[0]) < _MAX_LOOKUP_DIGEST
+    assert TAG_WEB_LOOKUP in rag.remembered[0]
+
+    # Контекст для новеллизации — по-прежнему полный.
+    lines = await store.context_lines_for_chat(42, since=datetime.now(UTC) - timedelta(minutes=5))
+    assert len(lines) == 1
+    assert len(lines[0]) > 1000
+
+
+async def test_lookup_diary_summary_is_a_finished_sentence(tmp_path: Path) -> None:
+    """В дневник не должен уходить обрубок с висячим URL — только целая фраза."""
+    from efi.utils.text import looks_unfinished
+
+    rag = _RecordingRAG()
+    store = SocialInteractionStore(Database(tmp_path / "test.db", migrations=MIGRATIONS), rag=rag)  # type: ignore[arg-type]
+
+    await store.record_web_lookup(
+        query="отношения",
+        digest="- Отношения - это эксклюзивная связь между двумя людьми. "
+        "Это то, что вы разделяете. (https://reddit.com/x)\n- второе (https://y)",
+        chat_id=42,
+    )
+
+    assert len(rag.remembered) == 1
+    assert "https://" not in rag.remembered[0]
+    assert looks_unfinished(rag.remembered[0]) is False
 
 
 async def test_context_lines_gather_the_episode_in_chronological_order(tmp_path: Path) -> None:
@@ -189,9 +230,7 @@ async def test_context_lines_gather_the_episode_in_chronological_order(tmp_path:
         )
     )
     await store.record(
-        SocialInteraction(
-            kind=SocialInteractionKind.WEB_LOOKUP, text="в другом чате", chat_id=99, created_at=now
-        )
+        SocialInteraction(kind=SocialInteractionKind.WEB_LOOKUP, text="в другом чате", chat_id=99, created_at=now)
     )
 
     lines = await store.context_lines_for_chat(42, since=now - timedelta(minutes=30))
@@ -222,9 +261,7 @@ def test_overflowing_conversation_keeps_the_end_not_the_beginning() -> None:
     разу не осмысленная часть разговора — а на следующем проходе она уже была
     за отметкой last_novelized_at, то есть терялась навсегда.
     """
-    session = Session(
-        messages=[Message(role=Role.USER, content=f"реплика номер {index}") for index in range(200)]
-    )
+    session = Session(messages=[Message(role=Role.USER, content=f"реплика номер {index}") for index in range(200)])
     rendered = render_transcript(session, self_name="Эфи", char_limit=200)
 
     assert "реплика номер 199" in rendered

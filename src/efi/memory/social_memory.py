@@ -39,6 +39,7 @@ from enum import StrEnum
 
 from efi.db.core import Database
 from efi.memory.rag import RAGMemory
+from efi.utils.text import trim_to_last_sentence
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,15 @@ logger = logging.getLogger(__name__)
 #: за проверенными фактами, чтобы ночная консолидация не считала эти записи
 #: неприкосновенными (см. efi.memory.consolidation.summarize_stale_entries).
 _SOCIAL_CONFIDENCE = 0.6
+
+#: Сырой дайджест веб-поиска в дневник целиком не идёт: пять сниппетов с URL
+#: (~1.2 КБ) режутся превью-лимитом на полуслове и лежат потом в корпусе как
+#: обрубок вида «...может отличаться от реа (https://mip...». Полный текст
+#: уже надёжно лежит в SQLite-журнале (колонка `text`, гарантия сохранения),
+#: а в векторную память уходит только короткая человеческая строка: что искала
+#: и что из этого вышло. Детали (числа, ссылки) доберёт новеллизация эпизода
+#: из того же SQLite через `context_lines_for_chat` — у неё лимит в разы шире.
+_WEB_LOOKUP_DIARY_CHARS = 280
 
 _MAX_TEXT_PREVIEW = 400
 
@@ -222,8 +232,11 @@ class SocialInteractionStore:
         await self._index_in_vector_memory(interaction)
         logger.info(
             "social_memory: recorded %s (chat_id=%s, thread_id=%s, peer=%s) as #%s",
-            interaction.kind.value, interaction.chat_id, interaction.thread_id,
-            interaction.peer_user_id, interaction_id,
+            interaction.kind.value,
+            interaction.chat_id,
+            interaction.thread_id,
+            interaction.peer_user_id,
+            interaction_id,
         )
         return interaction_id
 
@@ -258,9 +271,7 @@ class SocialInteractionStore:
             )
         )
 
-    async def context_lines_for_chat(
-        self, chat_id: int, *, since: datetime, limit: int = 30
-    ) -> list[str]:
+    async def context_lines_for_chat(self, chat_id: int, *, since: datetime, limit: int = 30) -> list[str]:
         """
         Что произошло во внешнем мире в рамках ЭТОГО чата начиная с `since`,
         живыми фразами от первого лица — вход для новеллизации эпизода
@@ -287,7 +298,18 @@ class SocialInteractionStore:
         if self._rag is None:
             return
         try:
-            await self._rag.remember(interaction.render_for_diary(), confidence=_SOCIAL_CONFIDENCE)
+            body = interaction.render_for_diary()
+            if interaction.kind is SocialInteractionKind.WEB_LOOKUP:
+                # Веб-поиск — особый случай: полный дайджест со сниппетами и
+                # ссылками остаётся в SQLite (там гарантия хранения), а в
+                # дневник идёт сжатая строка без обрубков. Иначе корпус
+                # забивается полуторакилобайтными «вычитала: ...отреа
+                # (https://...», которые и глазами не прочитать, и RAG-поиск
+                # потом подмешивает в промпт как воспоминание.
+                body = _summarize_lookup_for_diary(interaction)
+                if not body:
+                    return
+            await self._rag.remember(body, confidence=_SOCIAL_CONFIDENCE)
         except Exception:
             # Журнал уже записан — это главное. Векторный слой отвечает лишь
             # за то, всплывёт ли эпизод в разговоре сам собой.
@@ -373,6 +395,69 @@ def _row_to_interaction(row: object) -> SocialInteraction:
         text=row["text"],  # type: ignore[index]
         created_at=datetime.fromisoformat(row["created_at"]),  # type: ignore[index]
     )
+
+
+def _summarize_lookup_for_diary(interaction: SocialInteraction) -> str:
+    """
+    Сжимает сырую запись о веб-поиске до одной законченной фразы вида
+    «Гуглила <запрос>: <первый осмысленный кусок выдачи>».
+
+    На входе — пара (query, digest): запрос отделён от выдачи разделителем
+    `record_web_lookup()` (`f"{query} — {digest}"`), поэтому резать начинаем
+    не по угаданным маркерам, а по известной границе. Дальше берём первый
+    результат выдачи до первого URL и доводим до последнего законченного
+    предложения через `trim_to_last_sentence` — чтобы в дневник не уходили
+    висячие «(https://...» и оборванные «отреа».
+
+    Пустая строка означает «в дневник такое лучше не класть вовсе»: вызывающая
+    сторона в этом случае пропускает индексацию, полный текст всё равно
+    остаётся в SQLite-журнале.
+    """
+    query = (interaction.text or "").strip()
+    # record_web_lookup склеивает "query — digest": запрос — до первого
+    # длинного тире, всё остальное — выдача. Короткое тире внутри запроса
+    # (например "что-то") под разделитель не подходит — ищем именно " — ".
+    query_part, separator, digest_part = query.partition(" — ")
+    if not separator:
+        query_part, separator, digest_part = query.partition(" - ")
+    digest_part = digest_part.strip() if separator else ""
+    query_part = query_part.strip()
+
+    first_result = digest_part
+    # Выдача — это "- заголовок: сниппет (url)" построчно: берём первую строку
+    # до первого URL, остальное (2-5 результаты) для дневника не нужно.
+    newline = first_result.find("\n")
+    if newline != -1:
+        first_result = first_result[:newline]
+    for marker in ("https://", "http://"):
+        position = first_result.find(marker)
+        if position != -1:
+            first_result = first_result[:position]
+    first_result = first_result.strip().lstrip("-–—• ").strip("«»\"'() ").strip()
+    # trim_to_last_sentence режет по последней точке — поэтому тег добавляется
+    # ПОСЛЕ него: иначе "#web_lookup" оказывается последним «словом» фразы и
+    # улетает вместе с оборванным хвостом.
+    trimmed = trim_to_last_sentence(first_result[:_WEB_LOOKUP_DIARY_CHARS])
+    if not trimmed:
+        # trim вернул пустоту в двух случаях: либо там одни обрывки без единой
+        # точки, либо фрагмент — законченная мысль без точки на конце («PEP 690
+        # отклонён»). Второй случай — нормальный дайджест, его сохраняем,
+        # нормализуя точку; первый (мусор короче осмысленного минимума) —
+        # сводим к факту поиска.
+        cleaned = first_result[:_WEB_LOOKUP_DIARY_CHARS].strip().rstrip("«»\"'() ").strip()
+        if len(cleaned) >= 10:
+            if cleaned[-1] not in ".!?…":
+                cleaned += "."
+            first_result = cleaned
+        elif len(query_part) >= 3:
+            return f"Гуглила {query_part}. {TAG_WEB_LOOKUP}"
+        else:
+            return ""
+    else:
+        first_result = trimmed
+    if query_part:
+        return f"Гуглила {query_part}: {first_result} {TAG_WEB_LOOKUP}"
+    return f"{first_result} {TAG_WEB_LOOKUP}"
 
 
 __all__ = [

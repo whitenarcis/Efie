@@ -108,6 +108,20 @@ def looks_unfinished(text: str) -> bool:
     stripped = (text or "").rstrip()
     if not stripped:
         return True
+    # Хвостовые метатеги дневника на вердикт не влияют: они дописываются
+    # ПОСЛЕ точки программно, и запись вида "...разделяете. #web_lookup"
+    # законченная, а не оборванная.
+    without_tags = stripped
+    for _ in range(3):
+        hashed = without_tags.rfind("#")
+        if hashed == -1:
+            break
+        tail = without_tags[hashed:]
+        if tail.split() != [tail] or not tail[1:].replace("_", "").isalnum():
+            break
+        without_tags = without_tags[:hashed].rstrip()
+    if without_tags:
+        stripped = without_tags
     return stripped[-1] not in '.!?…"»)]:;'
 
 

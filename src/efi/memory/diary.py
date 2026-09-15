@@ -1,9 +1,17 @@
 """
 efi/memory/diary.py
 
-Дневник — долгосрочная память Эфи, хранящаяся как markdown-файлы с JSON
-front-matter метаданными (score/confidence/last_used/usage_count/embedding).
-Каждая запись — отдельный файл `<id>.md` в `paths.diary_dir`.
+Дневник — долгосрочная память Эфи, хранящаяся как markdown-файлы.
+Каждая запись — отдельный файл `<id>.md` в `paths.diary_dir` с компактным
+JSON front-matter (score/confidence/last_used/usage_count/domain/created_at)
+и свободным текстом-телом.
+
+Эмбеддинг НЕ лежит в `.md`: он хранится рядом в sidecar-файле `<id>.vec.json`.
+Причина — именно та, что видна глазами: вектор из сотен чисел раздувал
+каждый файл до ~25 КБ при теле в ~1 КБ, файл становился нечитаемым, а
+`git diff` — шумом. Чтение умеет и старый формат (эмбеддинг внутри
+front-matter) — такие файлы подхватываются как есть и сжимаются при первом
+же `save()` или явной миграцией `migrate_embeddings_to_sidecars()`.
 
 Прямой аналог класса Diary из C++-референса: ленивый кэш в памяти процесса,
 асинхронный поиск по косинусному сходству эмбеддингов.
@@ -26,6 +34,7 @@ LLMRouter) и передан в готовом виде. Это разделен
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from collections.abc import Callable
@@ -81,9 +90,15 @@ class Diary:
         await aiofiles.os.makedirs(self._diary_dir, exist_ok=True)
         # Листинг каталога — блокирующий синхронный вызов; уводим в поток,
         # чтобы не подвесить event loop при большом числе файлов.
+        # Sidecar-файлы эмбеддингов (`*.vec.json`) — не записи, их пропускаем.
         paths = await asyncio.to_thread(lambda: sorted(self._diary_dir.glob("*.md")))
         entries = await asyncio.gather(*(self._read_entry(path) for path in paths))
         return {entry.id: entry for entry in entries if entry is not None}
+
+    def _sidecar_path(self, entry_id: str) -> Path:
+        # Валидация id уже гарантирует отсутствие слешей (см. DiaryEntry),
+        # так что склейка имени здесь безопасна.
+        return self._diary_dir / f"{entry_id}.vec.json"
 
     async def _read_entry(self, path: Path) -> DiaryEntry | None:
         try:
@@ -93,10 +108,27 @@ class Diary:
             logger.warning("diary: failed to read %s: %s", path, exc)
             return None
         try:
-            return _parse_entry(entry_id=path.stem, raw=raw)
+            entry = _parse_entry(entry_id=path.stem, raw=raw)
         except ValueError as exc:
             logger.warning("diary: failed to parse %s: %s", path, exc)
             return None
+        # Старый формат хранил эмбеддинг прямо в front-matter нового
+        # формата его там уже нет — добираем из sidecar-файла рядом.
+        if not entry.metadata.embedding:
+            sidecar = self._sidecar_path(entry.id)
+            try:
+                async with aiofiles.open(sidecar, encoding="utf-8") as f:
+                    payload = json.loads(await f.read())
+            except FileNotFoundError:
+                payload = None
+            except (OSError, ValueError) as exc:
+                logger.warning("diary: failed to read sidecar %s: %s", sidecar, exc)
+                payload = None
+            if isinstance(payload, dict):
+                vector = payload.get("embedding", [])
+                if isinstance(vector, list) and all(isinstance(x, (int, float)) for x in vector):
+                    entry.metadata.embedding = [float(x) for x in vector]
+        return entry
 
     def reload(self) -> None:
         """Инвалидирует кэш. Следующий async-вызов перечитает каталог с диска."""
@@ -166,12 +198,26 @@ class Diary:
 
         Не проверяет на дубли сама — эта проверка (`is_duplicate_of`) требует
         эмбеддинга запроса и явно вызывается на уровне memory/rag.py ДО save().
+
+        `.md`-файл — компактный и читаемый глазами (без вектора), вектор
+        уходит в sidecar `<id>.vec.json`. Старый `.md` с вектором внутри
+        при пересохранении тоже сжимается: `_serialize_entry` вектор не пишет.
         """
         path = self._diary_dir / entry.filename
         # Атомарно: запись дневника — это прожитый вечер, и терять его из-за
         # того, что телефон выключился посреди сохранения, нельзя
         # (см. efi/utils/atomic.py).
         await write_text_atomic(path, _serialize_entry(entry))
+        if entry.metadata.embedding:
+            await write_text_atomic(
+                self._sidecar_path(entry.id),
+                json.dumps({"embedding": entry.metadata.embedding}),
+            )
+        else:
+            # Вектора нет (запись без эмбеддинга) — залежавшийся sidecar от
+            # прошлой версии записи не должен врать, что вектор есть.
+            with contextlib.suppress(OSError):
+                await aiofiles.os.remove(self._sidecar_path(entry.id))
         cache = await self._ensure_loaded()
         cache[entry.id] = entry
 
@@ -205,6 +251,34 @@ class Diary:
             await aiofiles.os.remove(self._diary_dir / entry.filename)
         except FileNotFoundError:
             pass
+        with contextlib.suppress(OSError):
+            await aiofiles.os.remove(self._sidecar_path(entry_id))
+
+    async def migrate_embeddings_to_sidecars(self) -> int:
+        """
+        Разовая чистка корпуса: выносит векторы из старых `.md` в sidecar-файлы.
+
+        Чтению миграция не нужна (старый формат подхватывается сам), но
+        файлам — да: без неё каждый старый файл так и останется нечитаемой
+        простынёй на ~25 КБ, пока его не перезапишет `touch()`/`save()`.
+        Возвращает число ужатых файлов.
+        """
+        cache = await self._ensure_loaded()
+        migrated = 0
+        for entry in list(cache.values()):
+            raw_path = self._diary_dir / entry.filename
+            try:
+                async with aiofiles.open(raw_path, encoding="utf-8") as f:
+                    raw = await f.read()
+            except OSError:
+                continue
+            if '"embedding"' not in raw and '"embedding":' not in raw:
+                continue
+            await self.save(entry)
+            migrated += 1
+        if migrated:
+            logger.info("diary: migrated %d entries to sidecar embeddings", migrated)
+        return migrated
 
 
 def _score_entries(
@@ -267,9 +341,126 @@ def _parse_entry(*, entry_id: str, raw: str) -> DiaryEntry:
 
 
 def _serialize_entry(entry: DiaryEntry) -> str:
-    """Сериализует запись обратно в markdown: JSON front-matter + свободный текст."""
-    front_matter = entry.metadata.model_dump_json(indent=2)
+    """
+    Сериализует запись в компактный читаемый markdown: JSON front-matter
+    БЕЗ эмбеддинга + свободный текст.
+
+    Вектор уходит в sidecar `<id>.vec.json` (см. `Diary.save`): иначе файл
+    раздувается до ~25 КБ при теле в ~1 КБ и перестаёт читаться ни глазами,
+    ни `git diff`. Старые файлы с вектором внутри читаются как раньше
+    (`_parse_entry` их понимает), а при пересохранении сжимаются сами.
+    """
+    slim = entry.metadata.model_copy(update={"embedding": []})
+    front_matter = slim.model_dump_json(indent=2)
     return f"{_FRONT_MATTER_DELIMITER}\n{front_matter}\n{_FRONT_MATTER_DELIMITER}\n{entry.body}"
 
 
-__all__ = ["Diary"]
+async def migrate_diary_corpus(diary: Diary) -> int:
+    """
+    Ужимает весь корпус: выносит векторы из старых `.md` в sidecar-файлы.
+
+    Тонкая обёртка над `Diary.migrate_embeddings_to_sidecars` — чтобы
+    скриптам обслуживания не нужно было знать про внутренности класса.
+    """
+    return await diary.migrate_embeddings_to_sidecars()
+
+
+async def prune_unfinished_entries(diary: Diary, *, dry_run: bool = True) -> list[str]:
+    """
+    Находит в корпусе записи-обрубки (тело кончается на полуслове) и — если
+    `dry_run=False` — удаляет их.
+
+    Проверяется и честный `finish_reason` провайдера, и вид текста:
+    `looks_unfinished` ловит старые записи, сохранённые до появления
+    `salvage_truncated` (они так и остались вида «...вернулся с»,
+    «...может отличаться от реа (https://...»). Половина мысли хуже, чем её
+    отсутствие: обрубок притворяется целым и потом подмешивается RAG-поиском
+    в промпт как воспоминание (см. efi/utils/text.py).
+
+    Возвращает id затронутых записей (в dry-run — кандидатов, иначе —
+    удалённых). Удаление — только явное: за спиной у владельца память
+    не трогаем.
+    """
+    from efi.utils.text import looks_unfinished
+
+    doomed = [entry.id for entry in await diary.all_entries() if looks_unfinished(entry.body)]
+    if not dry_run:
+        for entry_id in doomed:
+            await diary.delete(entry_id)
+        if doomed:
+            logger.info("diary: pruned %d unfinished entries", len(doomed))
+    return doomed
+
+
+async def dedup_diary_corpus(diary: Diary, *, dry_run: bool = True, threshold: float = 0.95) -> list[tuple[str, str]]:
+    """
+    Находит и (при dry_run=False) удаляет семантические дубли в корпусе.
+
+    Сравнивает попарно ВСЕ записи с эмбеддингами; если косинус >= threshold —
+    пара считается дублем. Из пары удаляется более короткая (при равенстве —
+    более старая), а у оставшейся растёт usage_count. Это аналог
+    Deduplicate из efi/memory/consolidation.py, но для ручного запуска из
+    скрипта и только по семантике (без слияния в мемуары).
+
+    Возвращает список (удалённый_id, оставшийся_id). При dry_run=True записи
+    не удаляются, только отчёт.
+    """
+    entries = [entry for entry in await diary.all_entries() if entry.metadata.embedding]
+    pairs: list[tuple[str, str]] = []
+
+    # Попарное сравнение O(n^2) — приемлемо для дневника в сотни записей
+    # (десятки миллисекунд). Для тысяч записей стоит перейти на FAISS/Annoy.
+    for index, candidate in enumerate(entries):
+        candidate_vector = np.asarray(candidate.metadata.embedding, dtype=np.float64)
+        candidate_norm = float(np.linalg.norm(candidate_vector))
+        if candidate_norm <= 0.0:
+            continue
+        for other in entries[index + 1 :]:
+            other_vector = np.asarray(other.metadata.embedding, dtype=np.float64)
+            other_norm = float(np.linalg.norm(other_vector))
+            if other_norm <= 0.0:
+                continue
+            cosine = float(np.dot(candidate_vector, other_vector) / (candidate_norm * other_norm))
+            if cosine >= threshold:
+                # Удаляем более короткую, при равенстве — более старую.
+                if len(candidate.body) > len(other.body):
+                    keep, remove = candidate, other
+                elif len(other.body) > len(candidate.body):
+                    keep, remove = other, candidate
+                else:
+                    if candidate.metadata.created_at >= other.metadata.created_at:
+                        keep, remove = candidate, other
+                    else:
+                        keep, remove = other, candidate
+                if keep.id != remove.id:
+                    pairs.append((remove.id, keep.id))
+
+    if dry_run:
+        if pairs:
+            logger.info("diary: dedup candidates %d pairs (dry-run)", len(pairs))
+        return pairs
+
+    seen: set[str] = set()
+    removed = 0
+    for remove_id, keep_id in pairs:
+        if remove_id in seen or keep_id in seen:
+            continue
+        seen.add(remove_id)
+        seen.add(keep_id)
+        keep_entry = await diary.get(keep_id)
+        if keep_entry is not None:
+            keep_entry.metadata.usage_count += 1
+            await diary.save(keep_entry)
+        await diary.delete(remove_id)
+        removed += 1
+    if removed:
+        logger.info("diary: dedup removed %d entries", removed)
+    return pairs
+
+
+__all__ = [
+    "Diary",
+    "dedup_diary_corpus",
+    "migrate_diary_corpus",
+    "prune_unfinished_entries",
+]
