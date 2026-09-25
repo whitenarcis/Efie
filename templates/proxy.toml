@@ -1,0 +1,68 @@
+# efie-router: встроенный sing-box + ключи VLESS.
+#
+# Этот файл — обычный конфиг sing-box, в который роутер добавляет своё:
+# socks-инбаунд (127.0.0.1:20818) и правило loopback → direct. Всё
+# остальное — outbounds, route, dns — уходит в sing-box без изменений, так
+# что здесь работает ровно тот синтаксис, что и в обычном sing-box.json.
+#
+# Зачем встроенный sing-box. Часть провайдеров (Qwen Cloud с зарубежного
+# адреса, например) недоступна напрямую. Роутер поднимает sing-box у себя
+# в процессе и гонит трафик к помеченным в router.toml провайдерам
+# (proxy = true) через локальный socks5. Никакого отдельного демона и
+# ручной настройки системы — конфиг целиком здесь.
+#
+# ВАЖНО: секция [proxy] принадлежит роутеру. Остальные секции — sing-box.
+
+[proxy]
+# Выключить, если провайдеры доступны напрямую: тогда файл можно не
+# держать вовсе, роутер стартует без прокси.
+enabled = true
+# socks5-инбаунд внутри процесса роутера. Меняйте, если порт занят.
+socks_addr = "127.0.0.1:20818"
+# trace|debug|info|warn|error|fatal. Логи sing-box идут в stderr роутера.
+log_level = "warn"
+
+# --- Outbounds sing-box -----------------------------------------------------
+# Порядок важен: sing-box берёт первый по умолчанию, если правила route
+# не сказали иного. Последний должен быть direct — это страховка, чтобы
+# трафик не ушёл в пустоту.
+
+[[outbounds]]
+type = "vless"
+tag = "vless-primary"
+server = "vless.example.com"
+server_port = 443
+uuid = "00000000-0000-0000-0000-000000000000"
+flow = "xtls-rprx-vision"
+tls = { enabled = true, server_name = "vless.example.com" }
+# Отпечаток или reality:
+# tls = { enabled = true, server_name = "www.microsoft.com", reality = { enabled = true,
+#        public_key = "..." , short_id = "..." } }
+# Простой пароль, если сервер его требует:
+# password = "пароль"
+
+# Второй ключ/сервер — резервный выход: пока первый живой, трафик идёт в
+# первый (см. липкую ротацию в router.toml).
+[[outbounds]]
+type = "vless"
+tag = "vless-backup"
+server = "vless-backup.example.com"
+server_port = 443
+uuid = "11111111-1111-1111-1111-111111111111"
+flow = "xtls-rprx-vision"
+tls = { enabled = true, server_name = "vless-backup.example.com" }
+
+[[outbounds]]
+type = "direct"
+tag = "direct"
+
+# --- Маршрутизация ----------------------------------------------------------
+# Роутер сам добавляет первым правилом loopback → direct, чтобы локальные
+# адреса (например, свой ollama на 127.0.0.1) не вылезали в VLESS.
+# Свои правила можно дописывать здесь — они попадут в конец списка.
+
+# [route]
+# rules = [
+#   { domain = ["api.ollama.com"], outbound = "direct" },
+# ]
+пример vless ссылки vless://[ВАШ_UUID]@[IP_АДРЕС_СЕРВЕРА]:[ПОРТ]?encryption=none&flow=xtls-rprx-vision&security=reality&sni=[ИМЯ_САЙТА_SNI]&pbk=[ПУБЛИЧНЫЙ_КЛЮЧ]&sid=[SHORT_ID]#[НАЗВАНИЕ_СЕРВЕРА]

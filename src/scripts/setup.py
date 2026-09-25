@@ -256,7 +256,17 @@ topic_match_min_score = 0.34
 
     if templates_dir.exists():
         # Список файлов, которые нужно перенести «как есть», если их еще нет в config
-        extra_configs = ["behaviour.toml", "dashboard.toml", "experemental.toml", "web_search.toml"]
+        # router.toml/proxy.toml — конфиги efie-router (ротация ключей, алиасы,
+        # sing-box). Их читает Go-роутер, а не Efie, поэтому в KNOWN_CONFIG_FILES
+        # в schema.py их нет: своей схемой валидации они не описываются.
+        extra_configs = [
+            "behaviour.toml",
+            "dashboard.toml",
+            "experemental.toml",
+            "web_search.toml",
+            "router.toml",
+            "proxy.toml",
+        ]
 
         for config_file in extra_configs:
             src_file = templates_dir / config_file
@@ -287,6 +297,8 @@ topic_match_min_score = 0.34
     print(f"  • Поведение:    {CONFIG_DIR / 'behaviour.toml'}")
     print(f"  • Панель:       {CONFIG_DIR / 'dashboard.toml'}")
     print(f"  • Экспер-ты:    {CONFIG_DIR / 'experemental.toml'}")
+    print(f"  • Роутер:      {CONFIG_DIR / 'router.toml'}")
+    print(f"  • Прокси:      {CONFIG_DIR / 'proxy.toml'}")
     print(f"  • База:         {DATA_DIR / 'efi.db'}")
     print(f"  • Сессия:       {DATA_DIR / 'efi_session.session'}")
     print("")
