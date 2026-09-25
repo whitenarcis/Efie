@@ -1,0 +1,431 @@
+{
+  "generated_by": "internal/parity/gen_goldens.py",
+  "python_version": "3.14.7",
+  "tokenize": [
+    {
+      "text": "Привет, как дела? Мама_мыла раму 123 test",
+      "tokens": [
+        "привет",
+        "как",
+        "дела",
+        "мама",
+        "мыла",
+        "раму",
+        "test"
+      ]
+    },
+    {
+      "text": "naïve café",
+      "tokens": [
+        "naïve",
+        "café"
+      ]
+    },
+    {
+      "text": "² ³ ½ ⅓ ٣ Ⅷ ① 5",
+      "tokens": [
+        "²",
+        "³",
+        "½",
+        "⅓",
+        "ⅷ",
+        "①"
+      ]
+    },
+    {
+      "text": "ЁЖИК ёжик",
+      "tokens": [
+        "ёжик",
+        "ёжик"
+      ]
+    },
+    {
+      "text": "привет́ 测试 emoji👍",
+      "tokens": [
+        "привет",
+        "测试",
+        "emoji"
+      ]
+    },
+    {
+      "text": "«Вот» — сказала она…",
+      "tokens": [
+        "вот",
+        "сказала",
+        "она"
+      ]
+    },
+    {
+      "text": "",
+      "tokens": []
+    },
+    {
+      "text": "   ",
+      "tokens": []
+    },
+    {
+      "text": "test123и  foo_bar",
+      "tokens": [
+        "test",
+        "и",
+        "foo",
+        "bar"
+      ]
+    }
+  ],
+  "shortcut": [
+    {
+      "text": "привет",
+      "shortcut": true
+    },
+    {
+      "text": "ок да",
+      "shortcut": true
+    },
+    {
+      "text": "привет как дела",
+      "shortcut": false
+    },
+    {
+      "text": "Привет!",
+      "shortcut": true
+    },
+    {
+      "text": "",
+      "shortcut": true
+    },
+    {
+      "text": "   ",
+      "shortcut": true
+    },
+    {
+      "text": "?!!",
+      "shortcut": true
+    },
+    {
+      "text": "12",
+      "shortcut": true
+    },
+    {
+      "text": "спасибо большое за вчерашнее",
+      "shortcut": false
+    }
+  ],
+  "tfidf": {
+    "corpus": [
+      {
+        "id": "2026-01-01_aaaaaa",
+        "body": "Сегодня мы говорили про монтаж звука, и он оказался сложнее, чем я думала."
+      },
+      {
+        "id": "2026-01-02_bbbbbb",
+        "body": "Утром обсуждали SQLite и WAL: почему база данных не теряет данные при выключении."
+      },
+      {
+        "id": "2026-01-03_cccccc",
+        "body": "Вечером перебирала дорожки в редакторе, звук стал ровнее, мне понравилось."
+      },
+      {
+        "id": "2026-01-04_dddddd",
+        "body": "Он спросил про промпты, я объяснила, что память важнее размера контекста."
+      },
+      {
+        "id": "2026-01-05_eeeeee",
+        "body": "Гуляли под дождём, промокли, но было смешно."
+      }
+    ],
+    "queries": [
+      {
+        "text": "монтаж звука",
+        "max_entry_count": 4,
+        "results": [
+          {
+            "id": "2026-01-01_aaaaaa",
+            "relatedness": 0.4151618317832409
+          }
+        ]
+      },
+      {
+        "text": "sqlite база данных",
+        "max_entry_count": 4,
+        "results": [
+          {
+            "id": "2026-01-02_bbbbbb",
+            "relatedness": 0.4869671214328275
+          }
+        ]
+      },
+      {
+        "text": "память контекст промпты",
+        "max_entry_count": 4,
+        "results": [
+          {
+            "id": "2026-01-04_dddddd",
+            "relatedness": 0.3265178948435005
+          }
+        ]
+      },
+      {
+        "text": "дождь",
+        "max_entry_count": 4,
+        "results": []
+      },
+      {
+        "text": "привет",
+        "max_entry_count": 4,
+        "results": []
+      }
+    ]
+  },
+  "diary_query": {
+    "entries": [
+      {
+        "id": "vec-1",
+        "confidence": 0.7,
+        "embedding": [
+          1.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "body": "Первая запись."
+      },
+      {
+        "id": "vec-2",
+        "confidence": -0.5,
+        "embedding": [
+          0.9,
+          0.1,
+          0.0,
+          0.0
+        ],
+        "body": "Почти дубль первой."
+      },
+      {
+        "id": "vec-3",
+        "confidence": 1.0,
+        "embedding": [
+          0.0,
+          0.0,
+          1.0,
+          0.0
+        ],
+        "body": "Перпендикулярная запись."
+      },
+      {
+        "id": "vec-4",
+        "confidence": 0.0,
+        "embedding": [
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "body": "Нулевой вектор."
+      },
+      {
+        "id": "vec-5",
+        "confidence": 0.2,
+        "embedding": [
+          0.5,
+          0.5,
+          0.5,
+          0.5
+        ],
+        "body": "Полное совпадение с запросом."
+      }
+    ],
+    "query": [
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ],
+    "options": {
+      "confidence_factor": 0.01,
+      "max_entry_count": 3,
+      "min_relatedness": 0.5
+    },
+    "results": [
+      {
+        "id": "vec-5",
+        "relatedness": 1.0
+      },
+      {
+        "id": "vec-2",
+        "relatedness": 0.7710788151871163
+      },
+      {
+        "id": "vec-3",
+        "relatedness": 0.76
+      }
+    ],
+    "files": [
+      "vec-1.md",
+      "vec-1.vec.json",
+      "vec-2.md",
+      "vec-2.vec.json",
+      "vec-3.md",
+      "vec-3.vec.json",
+      "vec-4.md",
+      "vec-4.vec.json",
+      "vec-5.md",
+      "vec-5.vec.json"
+    ]
+  },
+  "serialize": [
+    {
+      "case": {
+        "id": "2026-01-02_abc123",
+        "score": 0.0,
+        "confidence": 0.7,
+        "usage_count": 3,
+        "domain": "H",
+        "created_at": "2026-01-02T03:04:05.123456Z",
+        "last_used": null,
+        "body": "Прожитый вечер.\n\nВторая строка."
+      },
+      "expected": "---\n{\n  \"score\": 0.0,\n  \"confidence\": 0.7,\n  \"last_used\": null,\n  \"usage_count\": 3,\n  \"embedding\": [],\n  \"domain\": \"H\",\n  \"created_at\": \"2026-01-02T03:04:05.123456Z\"\n}\n---\nПрожитый вечер.\n\nВторая строка."
+    },
+    {
+      "case": {
+        "id": "2026-02-03_def456",
+        "score": 0.42,
+        "confidence": 1.0,
+        "usage_count": 0,
+        "domain": "C",
+        "created_at": "2026-02-03T04:05:06Z",
+        "last_used": "2026-02-04T05:06:07Z",
+        "body": "Тело без перевода строки в конце"
+      },
+      "expected": "---\n{\n  \"score\": 0.42,\n  \"confidence\": 1.0,\n  \"last_used\": \"2026-02-04T05:06:07Z\",\n  \"usage_count\": 0,\n  \"embedding\": [],\n  \"domain\": \"C\",\n  \"created_at\": \"2026-02-03T04:05:06Z\"\n}\n---\nТело без перевода строки в конце"
+    }
+  ],
+  "parse": [
+    {
+      "case": {
+        "id": "plain",
+        "raw": "no front matter\nbody"
+      },
+      "expected": {
+        "body": "no front matter\nbody",
+        "confidence": 0.0,
+        "domain": "H",
+        "usage_count": 0,
+        "score": 0.0,
+        "created_at_defaulted": true,
+        "created_at": null,
+        "embedding": []
+      }
+    },
+    {
+      "case": {
+        "id": "with-front-matter",
+        "raw": "---\n{\"confidence\": 0.5, \"domain\": \"P\", \"usage_count\": 2}\n---\n\n\nТело записи "
+      },
+      "expected": {
+        "body": "Тело записи ",
+        "confidence": 0.5,
+        "domain": "P",
+        "usage_count": 2,
+        "score": 0.0,
+        "created_at_defaulted": true,
+        "created_at": null,
+        "embedding": []
+      }
+    },
+    {
+      "case": {
+        "id": "empty-front-matter",
+        "raw": "---\n{}\n---\nТело"
+      },
+      "expected": {
+        "body": "Тело",
+        "confidence": 0.0,
+        "domain": "H",
+        "usage_count": 0,
+        "score": 0.0,
+        "created_at_defaulted": true,
+        "created_at": null,
+        "embedding": []
+      }
+    },
+    {
+      "case": {
+        "id": "leading-whitespace",
+        "raw": "  \n\n---\n{\"confidence\": -1.0}\n---\nТело после пробелов"
+      },
+      "expected": {
+        "body": "Тело после пробелов",
+        "confidence": -1.0,
+        "domain": "H",
+        "usage_count": 0,
+        "score": 0.0,
+        "created_at_defaulted": true,
+        "created_at": null,
+        "embedding": []
+      }
+    },
+    {
+      "case": {
+        "id": "unterminated",
+        "raw": "---\n{\"confidence\": 0.5}\nбез закрывающего разделителя"
+      },
+      "expected": {
+        "body": "---\n{\"confidence\": 0.5}\nбез закрывающего разделителя",
+        "confidence": 0.0,
+        "domain": "H",
+        "usage_count": 0,
+        "score": 0.0,
+        "created_at_defaulted": true,
+        "created_at": null,
+        "embedding": []
+      }
+    },
+    {
+      "case": {
+        "id": "old-format-embedding",
+        "raw": "---\n{\"confidence\": 0.5, \"embedding\": [0.1, 0.2, 0.3]}\n---\nСтарый формат: вектор внутри front-matter"
+      },
+      "expected": {
+        "body": "Старый формат: вектор внутри front-matter",
+        "confidence": 0.5,
+        "domain": "H",
+        "usage_count": 0,
+        "score": 0.0,
+        "created_at_defaulted": true,
+        "created_at": null,
+        "embedding": [
+          0.1,
+          0.2,
+          0.3
+        ]
+      }
+    },
+    {
+      "case": {
+        "id": "explicit-created-at",
+        "raw": "---\n{\"confidence\": 0.25, \"created_at\": \"2026-05-06T07:08:09.123456Z\"}\n---\nЗапись с явной датой"
+      },
+      "expected": {
+        "body": "Запись с явной датой",
+        "confidence": 0.25,
+        "domain": "H",
+        "usage_count": 0,
+        "score": 0.0,
+        "created_at_defaulted": false,
+        "created_at": "2026-05-06T07:08:09.123456+00:00",
+        "embedding": []
+      }
+    }
+  ],
+  "sidecar": {
+    "embedding": [
+      1.0,
+      -0.5,
+      0.0,
+      0.125
+    ],
+    "expected": "{\"embedding\": [1.0, -0.5, 0.0, 0.125]}"
+  }
+}
