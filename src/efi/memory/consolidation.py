@@ -58,9 +58,22 @@ logger = logging.getLogger(__name__)
 _DEDUP_NEIGHBOR_CHECK_COUNT = 3
 
 _CONSOLIDATION_SYSTEM_PROMPT = (
-    "Ты помогаешь сжать несколько отдельных дневниковых записей в одну связную "
-    "заметку, сохраняя все важные факты и детали, но убирая повторы и лишние слова. "
-    "Пиши от первого лица, коротко и по существу. Не придумывай ничего нового."
+    "Ты сжимаешь несколько дневниковых записей в одну связную заметку. "
+    "Главная цель — сохранить всё ВАЖНОЕ, убрав повторы и лишние слова.\n"
+    "\n"
+    "ВАЖНОЕ — это:\n"
+    "• Факты о людях: имена, занятия, вкусы, обстоятельства\n"
+    "• Договорённости: сроки, обещания, планы\n"
+    "• Эмоциональные моменты: что зацепило, обидело, обрадовало\n"
+    "• Конфликты и их разрешение\n"
+    "\n"
+    "НЕ ВАЖНОЕ (можно опустить):\n"
+    "• Рутина без нового смысла\n"
+    "• Повторы одного и того же в разных формулировках\n"
+    "• Технические детали без отношения к людям\n"
+    "\n"
+    "Пиши от первого лица, коротко и по существу. Не придумывай ничего нового. "
+    "Если в записях есть конкретные имена, числа, даты — сохрани их дословно."
 )
 
 _NOVELIZATION_SYSTEM_PROMPT = (
@@ -68,8 +81,22 @@ _NOVELIZATION_SYSTEM_PROMPT = (
     "делала параллельно — что гуглила, где комментировала, кому отвечала. Это ОДИН непрерывный "
     "опыт одного человека, а не отдельные логи разных систем: если ты полезла что-то искать "
     "посреди разговора, это часть того же эпизода, и вспоминать надо вместе.\n"
-    "Твоя задача — записать это в личный дневник так, чтобы через месяц ты по записи могла "
-    "восстановить не только факт, но и суть, детали и своё отношение.\n"
+    "Твоя задача — записать в дневник ТОЛЬКО то, что действительно стоит помнить. Не каждое "
+    "сообщение, не каждую мысль — память конечна, и забивать её мусором значит терять важное.\n"
+    "\n"
+    "ЧТО СТОИТ ЗАПОМНИТЬ:\n"
+    "• Факты о человеке: имя, чем занимается, вкусы, привычки, важные обстоятельства жизни.\n"
+    "• Договорённости: сроки, обещания, планы, к чему пришли в споре.\n"
+    "• Сильные эмоции: что зацепило, обидело, обрадовало, взбесило — твоё или собеседника.\n"
+    "• Неожиданное: человек сказал что-то, что изменило твоё мнение о нём или теме.\n"
+    "• Конфликты и их разрешение: о чём спорили, кто прав, к чему пришли.\n"
+    "\n"
+    "ЧТО НЕ СТОИТ ЗАПОМИНАТЬ:\n"
+    "• Рутина без нового смысла: 'опять работал до трёх', 'как обычно пообедал'.\n"
+    "• Чистая фатика: 'привет', 'ок', 'спасибо', 'спокойной ночи' — без контекста.\n"
+    "• Повторы: если ты уже записывала про это раньше, не пиши снова — просто отметь, что было.\n"
+    "• Случайные мелочи без связи с человеком: 'интересная статья' — не записывай, если она не "
+    "меняет отношения или не содержит важного факта.\n"
     "\n"
     "КАЖДОЕ ВОСПОМИНАНИЕ ПИШИ В ТРИ СЛОЯ, слитно, одним абзацем без заголовков:\n"
     "1. ЧТО БЫЛО — конкретно и подробно. Имена, названия, числа, версии, ссылки, точные "
@@ -103,10 +130,9 @@ _NOVELIZATION_SYSTEM_PROMPT = (
     "внимательнее, чем показывает.'\n"
     "\n"
     "Разделяй отдельные воспоминания строкой из трёх дефисов (---) на отдельной строке. Лучше "
-    "несколько отдельных записей про разные темы, чем одна свалка. Не бойся писать подробно: "
-    "потерянная сейчас деталь не восстановится никогда.\n"
-    "Игнорируй только совсем пустое: чистую фатику ('привет', 'ок', 'спокойной ночи') и "
-    "техническую рутину без смысла. Если запоминать реально нечего — ответь ровно одним словом: ПУСТО."
+    "несколько отдельных записей про разные темы, чем одна свалка. Не бойся писать подробно, "
+    "НО будь избирательной: меньше записей — острее память. "
+    "Если запоминать реально нечего — ответь ровно одним словом: ПУСТО."
 )
 
 #: Заголовок блока «а ещё параллельно со мной было вот что» в промпте
@@ -282,6 +308,7 @@ class DiaryConsolidator:
         *,
         older_than: timedelta = timedelta(days=30),
         batch_size: int = 10,
+        importance_threshold: float = 0.6,
     ) -> DiaryEntry | None:
         """
         Берёт до `batch_size` самых старых записей, которым больше
@@ -291,6 +318,11 @@ class DiaryConsolidator:
         сохраняет результат как новую запись с confidence, усреднённым по
         исходным. Исходные записи после этого удаляются — их смысл теперь
         живёт в сводной записи.
+
+        ВАЖНОЕ ИЗМЕНЕНИЕ: записи с importance >= importance_threshold
+        НЕ сжимаются — они сохраняются как есть, даже если старые.
+        Важные воспоминания (факты о людях, договорённости, сильные эмоции)
+        живут дольше рутины.
 
         Возвращает None, если подходящих записей меньше двух (сжимать нечего)
         или если LLM-запрос не удался (в этом случае ничего не удаляется —
@@ -308,8 +340,14 @@ class DiaryConsolidator:
         # На практике это означало, что весь день переписки мог в ту же
         # ночь схлопнуться в один сжатый "мемуар" — свежие записи выглядели
         # как самые старые кандидаты на сжатие.
+        #
+        # НОВОЕ: исключаем важные записи из сжатия — они заслуживают
+        # долгой жизни без пересказа.
         candidates = [
-            entry for entry in entries if not entry.metadata.is_ground_truth and entry.metadata.created_at < cutoff
+            entry for entry in entries
+            if not entry.metadata.is_ground_truth
+            and entry.metadata.created_at < cutoff
+            and not _is_important(entry, threshold=importance_threshold)
         ]
         if len(candidates) < 2:
             return None
@@ -320,9 +358,11 @@ class DiaryConsolidator:
             return None
 
         average_confidence = sum(entry.metadata.confidence for entry in batch) / len(batch)
+        # Важность мемуара — среднее по исходным, но не ниже 0.5
+        average_importance = max(0.5, sum(_score_importance(e) for e in batch) / len(batch))
         merged_entry = DiaryEntry(
             id=f"memoir_{int(datetime.now(UTC).timestamp())}",
-            metadata=DiaryEntryMetadata(confidence=average_confidence),
+            metadata=DiaryEntryMetadata(confidence=average_confidence, importance=average_importance),
             body=summary_text,
         )
         await self._diary.save(merged_entry)
@@ -330,8 +370,61 @@ class DiaryConsolidator:
         for entry in batch:
             await self._diary.delete(entry.id)
 
-        logger.info("consolidation: merged %d stale entries into %s", len(batch), merged_entry.id)
+        logger.info("consolidation: merged %d stale entries into %s (avg importance=%.2f)", len(batch), merged_entry.id, average_importance)
         return merged_entry
+
+    async def prune_low_importance(
+        self,
+        *,
+        older_than: timedelta = timedelta(days=60),
+        importance_threshold: float = 0.35,
+        max_removals: int = 20,
+    ) -> int:
+        """
+        Удаляет записи с очень низкой важностью, которые старше `older_than`.
+
+        Это последняя линия обороны от мусора: если запись прожила 2 месяца,
+        ни разу не использовалась, не содержит эмоций, фактов или договорённостей —
+        она не нужна в памяти.
+
+        НЕ удаляет:
+        - Ground truth (confidence=1.0)
+        - Записи с importance >= importance_threshold
+        - Записи, которые использовались недавно (usage_count > 0 за последние 30 дней)
+
+        Возвращает число удалённых записей.
+        """
+        entries = await self._diary.all_entries()
+        cutoff = datetime.now(UTC) - older_than
+
+        candidates = [
+            entry for entry in entries
+            if not entry.metadata.is_ground_truth
+            and entry.metadata.created_at < cutoff
+            and _score_importance(entry) < importance_threshold
+            and entry.metadata.usage_count == 0  # никто ни разу не искал
+        ]
+
+        # Удаляем самые неважные и старые
+        candidates.sort(key=lambda e: (_score_importance(e), e.metadata.created_at))
+        to_remove = candidates[:max_removals]
+
+        removed = 0
+        for entry in to_remove:
+            try:
+                await self._diary.delete(entry.id)
+                removed += 1
+                logger.debug(
+                    "consolidation: pruned low-importance entry %s (importance=%.2f, age=%d days)",
+                    entry.id, _score_importance(entry),
+                    (datetime.now(UTC) - entry.metadata.created_at).days
+                )
+            except Exception as e:
+                logger.warning("consolidation: failed to delete entry %s: %s", entry.id, e)
+
+        if removed:
+            logger.info("consolidation: pruned %d low-importance entries (threshold=%.2f)", removed, importance_threshold)
+        return removed
 
     async def novelize_chat(
         self,
@@ -390,7 +483,7 @@ class DiaryConsolidator:
         await self._ingest_knowledge(episode_text, chat_id=chat_id)
         saved = 0
         for memory_text in memories:
-            entry = await self._rag.remember(memory_text, confidence=0.5)
+            entry = await self._rag.remember(memory_text, confidence=0.5, chat_id=chat_id)
             if entry is not None:
                 saved += 1
 
@@ -669,4 +762,97 @@ def _pick_duplicate_to_remove(a: DiaryEntry, b: DiaryEntry) -> str:
     return a.id if a.metadata.usage_count <= b.metadata.usage_count else b.id
 
 
-__all__ = ["DiaryConsolidator", "ExperienceSource", "HistorySource"]
+# ---------------------------------------------------------------------------
+# Оценка важности записи
+# ---------------------------------------------------------------------------
+
+#: Маркеры эмоциональной окраски в тексте записи
+_EMOTIONAL_MARKERS = frozenset({
+    # Позитивные
+    "рад", "рада", "приятно", "классно", "здорово", "супер", "обожаю", "обожала",
+    "нравится", "понравилось", "счастлив", "счастлива", "повезло", "удача",
+    # Негативные
+    "бесит", "бесила", "раздражает", "раздражало", "злит", "злило",
+    "обидно", "обидела", "обижен", "обижена", "больно", "ранит",
+    "стыдно", "неловко", "ужас", "кошмар", "ненавижу", "противно",
+    # Сильные
+    "взбесило", "взорвало", "зацепило", "пробило", "проняло",
+    "удивил", "удивила", "шокировал", "шокировала", "ошарашил",
+    # Отношения
+    "полюбил", "полюбила", "разлюбил", "разлюбила", "скучаю", "скучала",
+    "люблю", "любила", "ненавижу", "ненавидела",
+})
+
+#: Маркеры договорённостей и планов
+_AGREEMENT_MARKERS = frozenset({
+    "договорились", "договорилась", "договорился", "обещал", "обещала",
+    "пообещал", "пообещала", "условились", "условилась",
+    "надо", "нужно", "не забыть", "напомни", "напомню",
+    "встретимся", "встретимся", "позвоню", "позвонит", "скину", "пришлю",
+    "до пятницы", "к понедельнику", "завтра", "послезавтра", "на следующей",
+    "в следующий", "через неделю", "через месяц",
+})
+
+#: Маркеры фактов о человеке
+_PERSON_FACT_MARKERS = frozenset({
+    "работает", "работал", "учится", "учился", "живёт", "жил", "жила",
+    "родом", "из москвы", "из питера", "из санкт", "из киев",
+    "любим", "нравится", "обожает", "ненавидит",
+    "женат", "замужем", "холост", "не замужем", "встречается",
+    "кошка", "кот", "собака", "пёс", "питомец",
+    "аллергия", "болеет", "болел", "заболел",
+})
+
+
+def estimate_importance(entry: DiaryEntry) -> float:
+    """
+    Оценивает важность записи для личности и отношений.
+
+    Критерии (накапливаются):
+    - Эмоциональная окраска: +0.2 за каждый маркер (до 0.4)
+    - Договорённости и планы: +0.25
+    - Факты о человеке: +0.15 за каждый маркер (до 0.3)
+    - Использование (usage_count): +0.1 за каждые 3 использования (до 0.3)
+    - Ground truth (confidence=1.0): +0.3
+
+    Возвращает значение от 0.0 до 1.0.
+    """
+    text = entry.body.lower()
+    base = 0.3  # Базовая важность — нейтральная запись
+
+    # Эмоциональные маркеры
+    emotional_hits = sum(1 for marker in _EMOTIONAL_MARKERS if marker in text)
+    base += min(0.4, emotional_hits * 0.2)
+
+    # Договорённости
+    if any(marker in text for marker in _AGREEMENT_MARKERS):
+        base += 0.25
+
+    # Факты о человеке
+    person_hits = sum(1 for marker in _PERSON_FACT_MARKERS if marker in text)
+    base += min(0.3, person_hits * 0.15)
+
+    # Использование — часто вспоминаемое = важное
+    usage_bonus = min(0.3, (entry.metadata.usage_count // 3) * 0.1)
+    base += usage_bonus
+
+    # Ground truth — проверенные факты важнее
+    if entry.metadata.is_ground_truth:
+        base += 0.3
+
+    return min(1.0, base)
+
+
+def _is_important(entry: DiaryEntry, threshold: float = 0.6) -> bool:
+    """Быстрая проверка: запись достаточно важна, чтобы сохранять надолго."""
+    return entry.metadata.importance >= threshold or estimate_importance(entry) >= threshold
+
+
+def _score_importance(entry: DiaryEntry) -> float:
+    """Возвращает важность из метаданных или оценивает заново."""
+    if entry.metadata.importance > 0.5:
+        return entry.metadata.importance
+    return estimate_importance(entry)
+
+
+__all__ = ["DiaryConsolidator", "ExperienceSource", "HistorySource", "estimate_importance"]

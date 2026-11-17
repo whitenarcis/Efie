@@ -91,6 +91,7 @@ class RAGMemory:
         options: DiaryQueryOptions | None = None,
         *,
         domains: Iterable[MemoryDomain] | None = None,
+        chat_id: int | None = None,
     ) -> list[DiaryQueryResult]:
         """
         Критический путь: короткие/фатические сообщения уходят в дешёвый
@@ -105,6 +106,9 @@ class RAGMemory:
         после: иначе десять релевантных записей чужого домена вытеснили бы
         своим сходством единственную нужную, и до неё бы просто не дошло.
         None — без фильтрации (обратная совместимость и явный «ищи везде»).
+
+        `chat_id` даёт буст записям, связанным с этим чатом — Эфи лучше
+        помнит контекст разговора с конкретным собеседником.
         """
         filter_fn = _MEMORY_ROUTER.diary_filter(domains) if domains is not None else None
 
@@ -115,7 +119,7 @@ class RAGMemory:
         if query_embedding is None:
             return await self._tfidf.search(query_text, options, filter_fn=filter_fn)
 
-        results = await self._diary.query(query_embedding, options, filter_fn=filter_fn)
+        results = await self._diary.query(query_embedding, options, filter_fn=filter_fn, chat_id=chat_id)
         return self._dedup_by_embedding(results, query_embedding)
 
     @staticmethod
@@ -180,7 +184,7 @@ class RAGMemory:
         return await self._compute_embedding(text, is_query=False)
 
     async def remember(
-        self, body: str, *, confidence: float = 0.0, domain: MemoryDomain = MemoryDomain.HISTORY
+        self, body: str, *, confidence: float = 0.0, domain: MemoryDomain = MemoryDomain.HISTORY, importance: float | None = None, chat_id: int | None = None
     ) -> DiaryEntry | None:
         """
         Добавляет новую запись в долгосрочную память: считает эмбеддинг,
@@ -188,6 +192,14 @@ class RAGMemory:
         diaryPlagiarismThreshold), и при отсутствии дубля сохраняет запись
         (в т.ч. индексирует её в TF-IDF fallback-индексе, чтобы он не отставал
         от Diary).
+
+        `importance` — важность записи (0.0-1.0). Если не передана, оценивается
+        автоматически по содержимому (эмоции, факты, договорённости).
+        Важные записи живут дольше и всплывают выше в поиске.
+
+        `chat_id` — ID чата, к которому относится запись. Записи с chat_id
+        получают буст при поиске в этом чате — Эфи лучше помнит контекст
+        разговора с конкретным собеседником.
 
         Если эмбеддинг получить не удалось никаким путём (локальный движок
         не установлен И облачный запрос упал) — запись всё равно сохраняется,
@@ -197,6 +209,15 @@ class RAGMemory:
         Возвращает сохранённую запись, либо None, если она отбракована как
         дубль существующей.
         """
+        # Оценка важности, если не передана явно
+        if importance is None:
+            from efi.memory.consolidation import estimate_importance
+            temp_entry = DiaryEntry(id="temp", body=body)
+            importance = estimate_importance(temp_entry)
+
+        # Связь с чатом для контекстной актуальности
+        chat_ids = [chat_id] if chat_id is not None else []
+
         embedding = await self._compute_embedding(body, is_query=False)
 
         if embedding is None:
@@ -205,7 +226,7 @@ class RAGMemory:
             )
             entry = DiaryEntry(
                 id=_generate_entry_id(),
-                metadata=DiaryEntryMetadata(confidence=confidence, domain=domain.value),
+                metadata=DiaryEntryMetadata(confidence=confidence, domain=domain.value, importance=importance, chat_ids=chat_ids),
                 body=body,
             )
             await self._diary.save(entry)
@@ -223,7 +244,7 @@ class RAGMemory:
 
         entry = DiaryEntry(
             id=_generate_entry_id(),
-            metadata=DiaryEntryMetadata(confidence=confidence, embedding=embedding, domain=domain.value),
+            metadata=DiaryEntryMetadata(confidence=confidence, embedding=embedding, domain=domain.value, importance=importance, chat_ids=chat_ids),
             body=body,
         )
         await self._diary.save(entry)

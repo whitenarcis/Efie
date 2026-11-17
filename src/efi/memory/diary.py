@@ -152,6 +152,7 @@ class Diary:
         options: DiaryQueryOptions | None = None,
         *,
         filter_fn: Callable[[DiaryEntry], bool] | None = None,
+        chat_id: int | None = None,
     ) -> list[DiaryQueryResult]:
         """
         Асинхронный поиск по дневнику: косинусное сходство `query_embedding`
@@ -161,6 +162,9 @@ class Diary:
         Записи без эмбеддинга в выборку не попадают — подразумевается, что
         эмбеддинг проставляется при сохранении (memory/rag.py), а не
         досчитывается на лету в критическом пути чтения.
+
+        Если передан `chat_id`, записи с этим chat_id в метаданных получают
+        буст — Эфи лучше помнит то, что обсуждалось с конкретным собеседником.
         """
         options = options or DiaryQueryOptions()
         cache = await self._ensure_loaded()
@@ -173,7 +177,9 @@ class Diary:
         # Векторная математика — CPU-bound, уводим в поток. На небольших
         # дневниках (десятки-сотни записей) это доли миллисекунды, но принцип
         # "не блокировать event loop numpy-вычислениями" соблюдаем всегда.
-        results = await asyncio.to_thread(_score_entries, query_embedding, candidates, options.confidence_factor)
+        results = await asyncio.to_thread(
+            _score_entries, query_embedding, candidates, options.confidence_factor, 0.1, chat_id
+        )
         results.sort(key=lambda r: r.relatedness, reverse=True)
         if options.min_relatedness > 0.0:
             results = [r for r in results if r.relatedness >= options.min_relatedness]
@@ -285,10 +291,18 @@ def _score_entries(
     query_embedding: EmbeddingVector,
     entries: list[DiaryEntry],
     confidence_factor: float,
+    importance_factor: float = 0.1,
+    chat_id: int | None = None,
 ) -> list[DiaryQueryResult]:
     """
     Синхронная CPU-bound часть запроса: векторизованное косинусное сходство
     через numpy. Вызывается исключительно через asyncio.to_thread.
+
+    Ранжирование учитывает четыре фактора:
+    1. Семантическое сходство (cosine similarity) — основной критерий
+    2. Confidence (confidence_factor * confidence) — проверенные факты выше
+    3. Importance (importance_factor * importance) — важные записи выше
+    4. Chat context (+0.15 для записей с текущим chat_id) — контекстная актуальность
     """
     dimension = len(query_embedding)
     same_dimension_entries = [entry for entry in entries if len(entry.metadata.embedding) == dimension]
@@ -312,7 +326,14 @@ def _score_entries(
 
     results: list[DiaryQueryResult] = []
     for entry, relatedness in zip(same_dimension_entries, normalized, strict=True):
-        adjusted = float(np.clip(relatedness + confidence_factor * entry.metadata.confidence, 0.0, 1.0))
+        # Буст важности: важные записи поднимаются выше при равном сходстве
+        importance_boost = importance_factor * entry.metadata.importance
+        # Буст для записей из текущего чата — контекстная актуальность
+        chat_boost = 0.15 if (chat_id is not None and chat_id in entry.metadata.chat_ids) else 0.0
+        adjusted = float(np.clip(
+            relatedness + confidence_factor * entry.metadata.confidence + importance_boost + chat_boost,
+            0.0, 1.0
+        ))
         results.append(DiaryQueryResult(entry=entry, relatedness=adjusted))
     return results
 
